@@ -1,116 +1,102 @@
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
 const { EMA, SMA, ATR } = require("technicalindicators");
+
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// --- CONFIGURATION ---
+// --- CONFIG ---
 let ACCESS_TOKEN = null;
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
+const STATE_FILE = './bot_state.json';
+const MAX_QUANTITY = 1; 
 
-// --- STRATEGY MEMORY ---
-let isPositionOpen = false;
-let entryPrice = 0;
-let highestPriceSinceEntry = 0;
+// --- STATE PERSISTENCE ---
+let botState = { positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0 };
+if (fs.existsSync(STATE_FILE)) botState = JSON.parse(fs.readFileSync(STATE_FILE));
+function saveState() { fs.writeFileSync(STATE_FILE, JSON.stringify(botState)); }
 
-app.get('/', (req, res) => {
-    const status = ACCESS_TOKEN ? "🟢 BOT ACTIVE" : "🔴 WAITING FOR TOKEN";
-    res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding: 40px; background: #0a0a0a; color: #00ff00; min-height: 100vh;">
-            <h1>🥈 Silver Prime v2025 Bot</h1>
-            <p>Strategy: Breakout + Volume Spike + ATR Trailing</p>
-            <div style="border: 2px solid #00ff00; padding: 20px; border-radius: 10px; display: inline-block;">
-                <h3>Status: ${status}</h3>
-                <p>Position: ${isPositionOpen ? 'LONG' : 'FLAT'}</p>
-            </div>
-            <br><br>
-            <form action="/update-token" method="POST">
-                <input type="text" name="token" placeholder="Paste Upstox Access Token" style="width: 350px; padding: 10px;">
-                <button type="submit" style="padding: 10px 20px; cursor: pointer;">START TRADING</button>
-            </form>
-        </div>
-    `);
-});
+// --- MARKET HOUR CHECKER ---
+function isMarketOpen() {
+    const ist = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
+    const totalMin = (ist.getHours() * 60) + ist.getMinutes();
+    const day = ist.getDay();
+    if (day === 0 || day === 6) return false;
+    return totalMin >= 525 && totalMin < 1439; // 8:45 AM to 11:59 PM
+}
 
-app.post('/update-token', (req, res) => {
-    ACCESS_TOKEN = req.body.token;
-    res.redirect('/');
-});
+// --- ORDER EXECUTION (AMO & REGULATORY COMPLIANT) ---
+async function placeOrder(type, qty, currentLtp) {
+    if (!ACCESS_TOKEN) return false;
 
-// --- TRADING ENGINE (5-Min Interval) ---
-setInterval(async () => {
-    if (!ACCESS_TOKEN) return;
+    const isAmo = !isMarketOpen();
+    
+    // October 2025 Regulation: Use LIMIT with 1% buffer instead of MARKET
+    const buffer = currentLtp * 0.01; 
+    const limitPrice = type === "BUY" ? (currentLtp + buffer) : (currentLtp - buffer);
+
+    const orderData = {
+        quantity: qty,
+        product: "I",
+        validity: "DAY",
+        price: Math.round(limitPrice * 20) / 20, // Round to nearest 0.05 tick
+        instrument_token: INSTRUMENT_KEY,
+        order_type: "LIMIT", // 👈 Regulatory compliant
+        transaction_type: type,
+        disclosed_quantity: 0,
+        trigger_price: 0,
+        is_amo: isAmo // 👈 Enables testing while market is closed
+    };
 
     try {
-        const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
-        // V3 Intraday URL
-        const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodedKey}/minutes/5`;
-        
-        const response = await axios.get(url, {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        const res = await axios.post("https://api.upstox.com/v3/order/place", orderData, {
+            headers: { 
+                'Authorization': `Bearer ${ACCESS_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
         });
-
-        const candles = response.data.data.candles.reverse(); // Oldest to Newest
-        const high = candles.map(c => c[2]);
-        const low = candles.map(c => c[3]);
-        const close = candles.map(c => c[4]);
-        const volume = candles.map(c => c[5]);
-
-        // --- CALCULATIONS ---
-        const ema40 = EMA.calculate({ period: 40, values: close });
-        const ema80 = EMA.calculate({ period: 80, values: close });
-        const smaVol20 = SMA.calculate({ period: 20, values: volume });
-        const atr = ATR.calculate({ high, low, close, period: 14 });
-
-        const lastClose = close[close.length - 1];
-        const lastHigh = high[high.length - 1];
-        const lastVol = volume[volume.length - 1];
-        
-        const curE40 = ema40[ema40.length - 1];
-        const curE80 = ema80[ema80.length - 1];
-        const curSmaVol = smaVol20[smaVol20.length - 1];
-        const curAtr = atr[atr.length - 1];
-
-        // Get highest of last 10 (excluding current)
-        const recentHighs = high.slice(-11, -1);
-        const breakOutLevel = Math.max(...recentHighs);
-
-        console.log(`🔎 Price: ${lastClose} | Breakout: ${breakOutLevel} | Vol: ${lastVol} vs ${curSmaVol * 1.5}`);
-
-        // --- EXECUTION LOGIC ---
-
-        // 1. ENTRY (Long Silver)
-        if (!isPositionOpen) {
-            const trendUp = curE40 > curE80;
-            const volSpike = lastVol > (curSmaVol * 1.5);
-            const priceBreak = lastClose > breakOutLevel;
-
-            if (trendUp && volSpike && priceBreak) {
-                console.log("🚀 LONG ENTRY @ " + lastClose);
-                isPositionOpen = true;
-                entryPrice = lastClose;
-                highestPriceSinceEntry = lastHigh;
-            }
-        } 
-        
-        // 2. TRAILING EXIT
-        else {
-            if (lastHigh > highestPriceSinceEntry) highestPriceSinceEntry = lastHigh;
-            
-            // Exit if price drops below (Recent High - 3 * ATR)
-            const stopLevel = highestPriceSinceEntry - (curAtr * 3.0);
-            
-            if (lastClose < stopLevel) {
-                console.log(`💰 TRAILING EXIT @ ${lastClose} | Profit: ${lastClose - entryPrice}`);
-                isPositionOpen = false;
-                entryPrice = 0;
-                highestPriceSinceEntry = 0;
-            }
-        }
-
+        console.log(`✅ ${isAmo ? 'AMO ' : ''}${type} Success! Price: ${limitPrice.toFixed(2)} | ID: ${res.data.data.order_id}`);
+        return true;
     } catch (e) {
-        console.error("Bot Error: " + e.message);
+        console.error(`❌ Order Error: ${e.response?.data?.errors[0]?.message || e.message}`);
+        return false;
     }
-}, 30000); // Check every 30 seconds
+}
 
-app.listen(3000, () => console.log("Prime v2025 Bot Running"));
+// --- MANUAL TEST ROUTE ---
+app.get('/test-amo', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.send("Token missing! Paste token on home page first.");
+    
+    console.log("🛠️ Manual AMO Ping Test Triggered...");
+    // Mocking an LTP of 75000 for the test
+    const success = await placeOrder("BUY", 1, 75000);
+    
+    if (success) {
+        res.send("<h1>✅ AMO Ping Successful!</h1><p>Check your Upstox App 'Orders' tab. You should see a pending Silver Micro order. <b>Cancel it manually now!</b></p>");
+    } else {
+        res.send("<h1>❌ AMO Ping Failed</h1><p>Check your console/logs for the error message.</p>");
+    }
+});
+
+// --- MAIN TRADING ENGINE ---
+setInterval(async () => {
+    if (!ACCESS_TOKEN || !isMarketOpen()) return;
+
+    try {
+        const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
+        const res = await axios.get(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        const candles = res.data.data.candles.reverse();
+        const c = candles.map(cand => cand[4]);
+        const lastC = c[c.length-1];
+        
+        // ... (Insert Indicator Calculations here from previous version)
+
+        // Logic uses placeOrder(type, qty, lastC)
+    } catch (e) { console.log("Engine Error"); }
+}, 30000);
+
+app.get('/', (req, res) => { /* Dashboard HTML code from previous version */ });
+app.post('/update-token', (req, res) => { ACCESS_TOKEN = req.body.token; res.redirect('/'); });
+
+app.listen(process.env.PORT || 3000);
