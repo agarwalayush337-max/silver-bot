@@ -12,7 +12,7 @@ let ACCESS_TOKEN = null;
 // Format: MCX_FO|{instrument_token}
 // You can find the correct key in the Upstox dashboard or instrument list.
 // For now, we will use a placeholder that you must verify.
-const INSTRUMENT_KEY = "MCX_FO|SILVERMIC24NOV"; 
+const INSTRUMENT_KEY = "MCX_FO|SILVERMIC26FEB"; 
 
 // --- 1. WEB DASHBOARD ---
 app.get('/', (req, res) => {
