@@ -15,11 +15,11 @@ const MAX_QUANTITY = 1;
 // --- PERSISTENCE ---
 let botState = { positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0 };
 if (fs.existsSync(STATE_FILE)) {
-    try { botState = JSON.parse(fs.readFileSync(STATE_FILE)); } catch(e) { console.log("State file reset"); }
+    try { botState = JSON.parse(fs.readFileSync(STATE_FILE)); } catch(e) { console.log("State reset"); }
 }
 function saveState() { fs.writeFileSync(STATE_FILE, JSON.stringify(botState)); }
 
-// --- TIMER (8:45 AM - 11:59 PM IST) ---
+// --- TIMER ---
 function isMarketOpen() {
     const ist = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
     const totalMin = (ist.getHours() * 60) + ist.getMinutes();
@@ -28,7 +28,7 @@ function isMarketOpen() {
     return totalMin >= 525 && totalMin < 1439; 
 }
 
-// --- ORDERS (Regulatory Compliant LIMIT-MARKET) ---
+// --- ORDERS ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN) return false;
     const isAmo = !isMarketOpen();
@@ -42,22 +42,13 @@ async function placeOrder(type, qty, ltp) {
             instrument_token: INSTRUMENT_KEY, order_type: "LIMIT",
             transaction_type: type, is_amo: isAmo
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
-        console.log(`✅ ${type} Order Placed: ID ${res.data.data.order_id}`);
         return true;
-    } catch (e) {
-        console.error(`❌ Order Error: ${e.response?.data?.errors[0]?.message || e.message}`);
-        return false;
-    }
+    } catch (e) { return false; }
 }
 
 // --- TRADING ENGINE ---
 setInterval(async () => {
-    if (!ACCESS_TOKEN) return;
-    if (!isMarketOpen()) {
-        console.log("😴 Market Closed. Bot Idle.");
-        return;
-    }
-
+    if (!ACCESS_TOKEN || !isMarketOpen()) return;
     try {
         const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
         const res = await axios.get(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
@@ -83,7 +74,6 @@ setInterval(async () => {
                 }
             }
         } else {
-            // Trailing Stop logic
             if (botState.positionType === 'LONG') {
                 botState.currentStop = Math.max(lastC - (curA * 3), botState.currentStop);
                 if (lastC < botState.currentStop && await placeOrder("SELL", botState.quantity, lastC)) {
@@ -98,13 +88,60 @@ setInterval(async () => {
                 }
             }
         }
-    } catch (e) { console.log("Data Fetch Error"); }
+    } catch (e) { console.log("Interval logic standby"); }
 }, 30000);
 
-// Dashboard routes
-app.get('/', (req, res) => { res.send(`<h1>Silver Bot Live</h1><p>PnL: ${botState.totalPnL}</p>`); });
-app.post('/update-token', (req, res) => { ACCESS_TOKEN = req.body.token; res.redirect('/'); });
+// --- UPDATED DASHBOARD HTML ---
+app.get('/', (req, res) => {
+    res.send(`
+        <div style="font-family: 'Segoe UI', sans-serif; text-align: center; padding: 60px; background: #0f172a; color: white; min-height: 100vh;">
+            <div style="max-width: 600px; margin: auto; background: #1e293b; padding: 30px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
+                <h1 style="color: #38bdf8; margin-bottom: 10px;">🥈 Silver Prime Bot</h1>
+                <p style="color: #94a3b8;">v2025 Optimized Momentum Engine</p>
+                <hr style="border: 0.5px solid #334155; margin: 20px 0;">
+                
+                <div style="display: flex; justify-content: space-around; margin-bottom: 25px;">
+                    <div>
+                        <small style="color: #64748b; display: block;">STATUS</small>
+                        <b style="color: ${ACCESS_TOKEN ? '#4ade80' : '#f87171'};">${ACCESS_TOKEN ? 'ACTIVE' : 'OFFLINE'}</b>
+                    </div>
+                    <div>
+                        <small style="color: #64748b; display: block;">POSITION</small>
+                        <b style="color: #fbbf24;">${botState.positionType || 'FLAT'}</b>
+                    </div>
+                    <div>
+                        <small style="color: #64748b; display: block;">TOTAL PNL</small>
+                        <b style="font-size: 1.2em;">₹${botState.totalPnL.toFixed(2)}</b>
+                    </div>
+                </div>
 
-// 🔥 RENDER PORT FIX
+                <form action="/update-token" method="POST" style="margin-top: 30px;">
+                    <label style="display: block; text-align: left; margin-bottom: 8px; color: #94a3b8;">Enter Upstox Access Token:</label>
+                    <input name="token" type="text" placeholder="Paste your v3 token here" required 
+                        style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white; margin-bottom: 15px;">
+                    <button type="submit" 
+                        style="width: 100%; padding: 12px; border-radius: 8px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; cursor: pointer;">
+                        START TRADING ENGINE
+                    </button>
+                </form>
+
+                <div style="margin-top: 25px; font-size: 0.9em; color: #64748b;">
+                    <a href="/test-amo" style="color: #38bdf8; text-decoration: none;">🛠️ Send Test AMO Order</a>
+                </div>
+            </div>
+        </div>
+    `);
+});
+
+app.post('/update-token', (req, res) => {
+    ACCESS_TOKEN = req.body.token;
+    res.redirect('/');
+});
+
+app.get('/test-amo', async (req, res) => {
+    const success = await placeOrder("BUY", 1, 75000);
+    res.send(success ? "<h1>✅ AMO Sent! Check App.</h1><a href='/'>Back</a>" : "<h1>❌ Failed. Enter Token first.</h1><a href='/'>Back</a>");
+});
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Dashboard active on port ${PORT}`));
