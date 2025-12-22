@@ -6,141 +6,124 @@ app.use(express.urlencoded({ extended: true }));
 
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
 
-// --- 1. WEB DASHBOARD ---
+// --- 1. WEB INTERFACE ---
 app.get('/', (req, res) => {
     res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding: 40px; background: #f4f7f6; min-height: 100vh;">
-            <h1 style="color: #2c3e50;">📊 Silver Aggressive Backtester</h1>
-            <p><strong>Strategy:</strong> 5-Min | RSI(7) | EMA 9 & 21 | Target: 300 | SL: 150</p>
+        <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: white; min-height: 100vh;">
+            <h1 style="color: #38bdf8;">📊 Silver Turbo Backtester (V3)</h1>
+            <p style="color: #94a3b8;">Strategy: 5-Min | RSI(7) | EMA 9 & 21 | Target: 300 Pts</p>
             
-            <div style="background: white; padding: 30px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
+            <div style="background: #1e293b; padding: 30px; border-radius: 12px; display: inline-block; border: 1px solid #334155;">
                 <form action="/backtest" method="POST">
-                    <p>Paste Access Token to Start:</p>
-                    <input type="text" name="token" placeholder="Paste Access Token here" required style="width: 350px; padding: 12px; border: 1px solid #ddd; border-radius: 6px;">
+                    <p>Paste Access Token to Analyze Last 15 Days:</p>
+                    <input type="text" name="token" placeholder="Paste Access Token here" required style="width: 350px; padding: 12px; border-radius: 6px; border: none;">
                     <br><br>
-                    <button type="submit" style="padding: 15px 30px; background: #e91e63; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px;">🔥 RUN AGGRESSIVE BACKTEST</button>
+                    <button type="submit" style="padding: 15px 35px; background: #38bdf8; color: #0f172a; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px;">RUN BACKTEST</button>
                 </form>
             </div>
-            <p style="color: #666; margin-top: 20px;">This will analyze the last 15 days of 5-minute data (~1500 candles).</p>
+            <p style="color: #64748b; margin-top: 20px;">Analyzing ~1,500 candles for high-frequency patterns.</p>
         </div>
     `);
 });
 
-// --- 2. BACKTEST ENGINE ---
+// --- 2. THE ANALYTICS ENGINE ---
 app.post('/backtest', async (req, res) => {
     const token = req.body.token;
-    if (!token) return res.send("Error: Token is missing.");
+    if (!token) return res.send("Error: Token required.");
 
     try {
         const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
         const today = new Date();
         const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-        const past = new Date(today); past.setDate(today.getDate() - 15); // 15 Days History
+        const past = new Date(today); past.setDate(today.getDate() - 15);
 
         const toDate = tomorrow.toISOString().split('T')[0];
         const fromDate = past.toISOString().split('T')[0];
 
-        // Fetch 5-Minute Historical Data (V3)
+        // Fetching 5-Min Data
         const url = `https://api.upstox.com/v3/historical-candle/${encodedKey}/minutes/5/${toDate}/${fromDate}`;
         const response = await axios.get(url, {
             headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
         });
 
-        const candles = response.data.data.candles.reverse(); // Oldest to Newest
+        const candles = response.data.data.candles.reverse(); 
         const closes = candles.map(c => c[4]);
 
-        // --- CALCULATE AGGRESSIVE INDICATORS ---
+        // Indicators
         const rsi7 = RSI.calculate({ period: 7, values: closes });
         const ema9 = EMA.calculate({ period: 9, values: closes });
         const ema21 = EMA.calculate({ period: 21, values: closes });
 
-        // Offsets to align indicators with candles
-        const rOffset = candles.length - rsi7.length;
-        const e9Offset = candles.length - ema9.length;
-        const e21Offset = candles.length - ema21.length;
+        const rOff = candles.length - rsi7.length;
+        const e9Off = candles.length - ema9.length;
+        const e21Off = candles.length - ema21.length;
 
         let trades = [];
         let inPosition = false;
         let entryPrice = 0;
         let netProfit = 0;
-        let winCount = 0;
+        let wins = 0;
 
-        // --- SIMULATION LOOP ---
+        // Simulation Loop
         for (let i = 30; i < candles.length; i++) {
             const price = closes[i];
-            const time = candles[i][0];
-            const curRSI = rsi7[i - rOffset];
-            const curE9 = ema9[i - e9Offset];
-            const curE21 = ema21[i - e21Offset];
+            const cRSI = rsi7[i - rOff];
+            const cE9 = ema9[i - e9Off];
+            const cE21 = ema21[i - e21Off];
 
-            // 1. BUY LOGIC
-            // - Price above EMA 21 (Uptrend)
-            // - RSI 7 is oversold (< 25)
-            // - Price crosses above EMA 9
-            if (!inPosition && curRSI < 25 && price > curE21 && price > curE9) {
+            // Entry Logic (Long)
+            if (!inPosition && cRSI < 25 && price > cE21 && price > cE9) {
                 inPosition = true;
                 entryPrice = price;
-                trades.push({ type: 'BUY', price: entryPrice, time: time });
+                trades.push({ type: 'BUY', price: entryPrice, time: candles[i][0] });
             } 
-            
-            // 2. SELL LOGIC
+            // Exit Logic
             else if (inPosition) {
-                const pnl = price - entryPrice;
-
-                // EXIT CONDITIONS:
-                // - Target 300 pts OR RSI peaked > 75 OR Trailing SL (Price below EMA 9) OR Stop Loss -150
-                if (pnl >= 300 || curRSI > 75 || price < curE9 || pnl <= -150) {
-                    netProfit += pnl;
-                    if (pnl > 0) winCount++;
+                const diff = price - entryPrice;
+                // Exit on Target 300, Stop Loss 150, or Trend Reversal (Price < E9)
+                if (diff >= 300 || diff <= -150 || price < cE9 || cRSI > 75) {
+                    netProfit += diff;
+                    if (diff > 0) wins++;
                     inPosition = false;
-                    trades.push({ type: 'SELL', price: price, time: time, pnl: pnl });
+                    trades.push({ type: 'SELL', price: price, time: candles[i][0], pnl: diff });
                 }
             }
         }
 
-        // --- GENERATE RESULTS TABLE ---
-        let winRate = ((winCount / (trades.length / 2)) * 100).toFixed(1);
-        let summaryColor = netProfit > 0 ? '#4CAF50' : '#f44336';
+        const winRate = ((wins / (trades.length / 2)) * 100).toFixed(1);
 
-        let html = `
-            <div style="font-family: sans-serif; padding: 20px;">
-                <h1>Backtest Summary</h1>
-                <div style="display: flex; gap: 20px; margin-bottom: 30px;">
-                    <div style="padding: 20px; background: ${summaryColor}; color: white; border-radius: 8px; flex: 1;">
-                        <small>NET PROFIT</small><br><b style="font-size: 32px;">₹${netProfit.toFixed(2)}</b>
+        res.send(`
+            <div style="font-family: sans-serif; padding: 30px; background: #f8fafc; min-height: 100vh;">
+                <h2 style="color: #1e293b;">Performance Report (15 Days)</h2>
+                <div style="display: flex; gap: 15px; margin-bottom: 25px;">
+                    <div style="background: ${netProfit > 0 ? '#10b981' : '#ef4444'}; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+                        Total Profit: <b>₹${netProfit.toFixed(2)}</b>
                     </div>
-                    <div style="padding: 20px; background: #2196F3; color: white; border-radius: 8px; flex: 1;">
-                        <small>TOTAL TRADES</small><br><b style="font-size: 32px;">${trades.length / 2}</b>
+                    <div style="background: #3b82f6; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+                        Total Trades: <b>${trades.length / 2}</b>
                     </div>
-                    <div style="padding: 20px; background: #9c27b0; color: white; border-radius: 8px; flex: 1;">
-                        <small>WIN RATE</small><br><b style="font-size: 32px;">${winRate}%</b>
+                    <div style="background: #6366f1; color: white; padding: 20px; border-radius: 8px; flex: 1;">
+                        Win Rate: <b>${winRate}%</b>
                     </div>
                 </div>
-                
-                <h3>Trade Log (Detailed)</h3>
-                <table border="1" style="width: 100%; border-collapse: collapse; text-align: left;">
-                    <tr style="background: #eee;"><th>Type</th><th>Price</th><th>Time</th><th>Result (Pts)</th></tr>
-        `;
-
-        trades.forEach(t => {
-            const pnlColor = t.pnl > 0 ? 'green' : (t.pnl < 0 ? 'red' : 'black');
-            html += `
-                <tr>
-                    <td><b>${t.type}</b></td>
-                    <td>${t.price}</td>
-                    <td>${new Date(t.time).toLocaleString()}</td>
-                    <td style="color: ${pnlColor}; font-weight: bold;">${t.pnl ? t.pnl.toFixed(2) : '-'}</td>
-                </tr>
-            `;
-        });
-
-        html += `</table><br><a href="/" style="text-decoration: none; background: #333; color: white; padding: 10px 20px; border-radius: 4px;">Back to Menu</a></div>`;
-        
-        res.send(html);
-
-    } catch (error) {
-        res.send(`<h2>Backtest Failed</h2><p>${error.message}</p><pre>${JSON.stringify(error.response?.data)}</pre>`);
+                <table border="1" style="width: 100%; border-collapse: collapse; background: white;">
+                    <tr style="background: #f1f5f9;"><th>Type</th><th>Price</th><th>Time</th><th>Result</th></tr>
+                    ${trades.map(t => `
+                        <tr>
+                            <td>${t.type}</td>
+                            <td>${t.price}</td>
+                            <td>${new Date(t.time).toLocaleString()}</td>
+                            <td style="color: ${t.pnl > 0 ? 'green' : (t.pnl < 0 ? 'red' : 'black')}; font-weight: bold;">
+                                ${t.pnl ? t.pnl.toFixed(2) : '-'}
+                            </td>
+                        </tr>`).join('')}
+                </table>
+                <br><a href="/" style="display: inline-block; padding: 10px 20px; background: #1e293b; color: white; text-decoration: none; border-radius: 5px;">Return to Tester</a>
+            </div>
+        `);
+    } catch (e) {
+        res.send(`<h3>Error Processing Data</h3><p>${e.message}</p>`);
     }
 });
 
-app.listen(3000, () => console.log("Backtester running on port 3000"));
+app.listen(3000);
