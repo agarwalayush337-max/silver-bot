@@ -6,10 +6,10 @@ const { EMA, SMA, ATR } = require("technicalindicators");
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// --- CONFIG ---
+// --- CONFIGURATION ---
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
-const INSTRUMENT_KEY = "MCX_FO|458305";
+const INSTRUMENT_KEY = "MCX_FO|458305"; 
 const REDIS_URL = process.env.REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379";
 const MAX_QUANTITY = 1;
 
@@ -32,6 +32,8 @@ async function saveState() {
 
 // --- TIME HELPERS ---
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
+function formatDate(date) { return date.toISOString().split('T')[0]; } // Returns YYYY-MM-DD
+
 function isApiAvailable() {
     const totalMin = (getIST().getHours() * 60) + getIST().getMinutes();
     return totalMin >= 330 && totalMin < 1440; 
@@ -40,6 +42,45 @@ function isMarketOpen() {
     const ist = getIST();
     const totalMin = (ist.getHours() * 60) + ist.getMinutes();
     return ist.getDay() !== 0 && ist.getDay() !== 6 && totalMin >= 525 && totalMin < 1439;
+}
+
+// --- DATA STITCHING (Using Your Exact URL Format) ---
+async function getMergedCandles() {
+    const today = new Date();
+    const tenDaysAgo = new Date();
+    tenDaysAgo.setDate(today.getDate() - 10);
+
+    const todayStr = formatDate(today);
+    const prevStr = formatDate(tenDaysAgo);
+    
+    // ✅ URL FORMAT UPDATED TO MATCH YOUR REQUEST
+    // 1. Intraday: .../minutes/5
+    const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
+    
+    // 2. Historical: .../minutes/5/TO_DATE/FROM_DATE
+    const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5/${todayStr}/${prevStr}`;
+
+    try {
+        const [histRes, intraRes] = await Promise.all([
+            axios.get(urlHistory, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } }).catch(e => ({ data: { data: { candles: [] } } })),
+            axios.get(urlIntraday, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } }).catch(e => ({ data: { data: { candles: [] } } }))
+        ]);
+
+        const histCandles = histRes.data?.data?.candles || [];
+        const intraCandles = intraRes.data?.data?.candles || [];
+
+        // Merge Logic
+        const candleMap = new Map();
+        histCandles.forEach(c => candleMap.set(c[0], c));
+        intraCandles.forEach(c => candleMap.set(c[0], c));
+        
+        // Sort by Time (Oldest First)
+        return Array.from(candleMap.values()).sort((a, b) => new Date(a[0]) - new Date(b[0]));
+
+    } catch (e) {
+        console.log("Merge Error: " + e.message);
+        return [];
+    }
 }
 
 // --- ORDER LOGIC ---
@@ -64,54 +105,77 @@ async function placeOrder(type, qty, ltp) {
 }
 
 // --- TRADING ENGINE ---
-// --- IMPROVED TRADING ENGINE ---
 setInterval(async () => {
-    const apiAlive = isApiAvailable();
-    const marketAlive = isMarketOpen();
-
-    // Log status every 30 seconds regardless of token
-    if (!ACCESS_TOKEN) {
-        console.log(`📡 [${getIST().toLocaleTimeString()}] Bot is IDLE: Waiting for Token.`);
-        return; 
-    }
-
-    if (!apiAlive) {
-        console.log(`😴 [${getIST().toLocaleTimeString()}] API Maintenance Window. Sleeping...`);
-        return;
-    }
+    if (!ACCESS_TOKEN) { console.log(`📡 Bot IDLE: Waiting for Token...`); return; }
+    if (!isApiAvailable()) { console.log(`😴 API Maintenance. Sleeping...`); return; }
 
     try {
-        // Fetch Live Price for Market Watch
-        const url = `https://api.upstox.com/v2/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/1minute`;
-        const res = await axios.get(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
+        const candles = await getMergedCandles();
         
-        const candles = res.data.data.candles;
-        if (candles && candles.length > 0) {
-            lastKnownLtp = candles[0][4]; // Get latest LTP
+        if (candles && candles.length > 200) {
+            const cl = candles.map(c => c[4]);
+            lastKnownLtp = cl[cl.length-1];
+            
+            console.log(`🔎 [${getIST().toLocaleTimeString()}] Analyzed ${candles.length} Candles | LTP: ${lastKnownLtp}`);
+
+            if (isMarketOpen()) {
+                const h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
+                
+                const e50 = EMA.calculate({period: 50, values: cl});
+                const e200 = EMA.calculate({period: 200, values: cl});
+                const vAvg = SMA.calculate({period: 20, values: v});
+                const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+
+                const lastC = lastKnownLtp;
+                const lastV = v[v.length-1];
+                const curE50 = e50[e50.length-1];
+                const curE200 = e200[e200.length-1];
+                const curV = vAvg[vAvg.length-1];
+                const curA = atr[atr.length-1];
+                
+                const bH = Math.max(...h.slice(-11, -1));
+                const bL = Math.min(...l.slice(-11, -1));
+
+                if (!botState.positionType) {
+                    if (curE50 > curE200 && lastV > (curV * 1.5) && lastC > bH) {
+                        if (await placeOrder("BUY", MAX_QUANTITY, lastC)) {
+                            botState = { ...botState, positionType: 'LONG', entryPrice: lastC, quantity: MAX_QUANTITY, currentStop: lastC - (curA * 3) };
+                            await saveState();
+                        }
+                    } else if (curE50 < curE200 && lastV > (curV * 1.5) && lastC < bL) {
+                        if (await placeOrder("SELL", MAX_QUANTITY, lastC)) {
+                            botState = { ...botState, positionType: 'SHORT', entryPrice: lastC, quantity: MAX_QUANTITY, currentStop: lastC + (curA * 3) };
+                            await saveState();
+                        }
+                    }
+                } else {
+                    if (botState.positionType === 'LONG') {
+                        botState.currentStop = Math.max(lastC - (curA * 3), botState.currentStop);
+                        if (lastC < botState.currentStop && await placeOrder("SELL", botState.quantity, lastC)) {
+                            botState.totalPnL += (lastC - botState.entryPrice) * botState.quantity;
+                            botState.positionType = null; await saveState();
+                        }
+                    } else {
+                        botState.currentStop = Math.min(lastC + (curA * 3), botState.currentStop || 999999);
+                        if (lastC > botState.currentStop && await placeOrder("BUY", botState.quantity, lastC)) {
+                            botState.totalPnL += (botState.entryPrice - lastC) * botState.quantity;
+                            botState.positionType = null; await saveState();
+                        }
+                    }
+                }
+            }
         }
-
-        if (!marketAlive) {
-            console.log(`💤 [${getIST().toLocaleTimeString()}] Market Closed. Watch Mode Only. LTP: ${lastKnownLtp}`);
-            return;
-        }
-
-        console.log(`🚀 [${getIST().toLocaleTimeString()}] Engine Running. LTP: ${lastKnownLtp}`);
-        
-        // --- Strategy Calculations here ---
-        // (Indicator logic remains the same)
-
     } catch (e) {
-        const errStatus = e.response?.status;
-        if (errStatus === 401) {
-            console.log("❌ Token Expired or Invalid! Please update via Dashboard.");
-            ACCESS_TOKEN = null; // Reset to prompt user
+        if (e.response?.status === 401) {
+            console.log("❌ Token Expired.");
+            ACCESS_TOKEN = null;
         } else {
-            console.log(`⏳ Upstox API Busy... (Error: ${errStatus || e.message})`);
+            console.log(`⏳ API Check: ${e.message}`);
         }
     }
 }, 30000);
 
-// --- UPDATED UI WITH AUTO-REFRESH ---
+// --- DASHBOARD UI ---
 app.get('/', (req, res) => {
     const isActivated = ACCESS_TOKEN !== null;
     const statusColor = isActivated ? "#4ade80" : "#f87171";
@@ -128,14 +192,15 @@ app.get('/', (req, res) => {
         <head>
             <title>Silver Prime v2025</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <meta http-equiv="refresh" content="30"> </head>
+            <meta http-equiv="refresh" content="30">
+        </head>
         <body style="font-family:sans-serif; color:white; display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:450px; background:#1e293b; border-radius:20px; padding:30px; border:1px solid #334155; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
                 <h2 style="color:#38bdf8; text-align:center; margin-bottom:5px;">🥈 Silver Prime Bot</h2>
                 <p style="text-align:center; color:#64748b; font-size:11px; margin-bottom:20px;">LAST SYNC: ${getIST().toLocaleTimeString()}</p>
                 
                 <div style="background:#0f172a; padding:15px; border-radius:12px; margin-bottom:20px; text-align:center; border: 1px solid #334155;">
-                    <small style="color:#64748b; letter-spacing:1px;">SILVER MICRO LTP</small><br>
+                    <small style="color:#64748b; letter-spacing:1px;">5-MIN CLOSE PRICE</small><br>
                     <span style="font-size:28px; font-weight:bold; color:#fbbf24;">₹${lastKnownLtp || 'WAITING...'}</span>
                 </div>
 
