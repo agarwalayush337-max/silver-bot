@@ -8,7 +8,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // --- CONFIGURATION ---
 let ACCESS_TOKEN = null;
-const INSTRUMENT_KEY = "MCX_FO|458305"; // ✅ Silver Mic Feb 2026
+const INSTRUMENT_KEY = "MCX_FO|458305"; // Silver Mic Feb 2026
 
 // --- 1. WEB DASHBOARD ---
 app.get('/', (req, res) => {
@@ -33,11 +33,11 @@ app.post('/update-token', (req, res) => {
     res.send("<h1>Token Updated! 🚀</h1><a href='/'>Go Back</a>");
 });
 
-// --- 2. DATE HELPER (Required for History) ---
+// --- 2. DATE HELPER ---
 function getDates() {
     const today = new Date();
     const past = new Date();
-    past.setDate(today.getDate() - 10); // Fetch last 10 days (plenty for EMA)
+    past.setDate(today.getDate() - 15); // 15 Days of history
     
     return {
         to: today.toISOString().split('T')[0],
@@ -51,8 +51,14 @@ setInterval(async () => {
 
     try {
         const dates = getDates();
-        // SWITCHED TO HISTORY API (Last 10 Days)
-        const url = `https://api.upstox.com/v2/historical-candle/${INSTRUMENT_KEY}/15minute/${dates.to}/${dates.from}`;
+        
+        // 🔥 CRITICAL FIX: URL Encoding the Key
+        // The "|" symbol in MCX_FO|458305 often breaks requests if not encoded
+        const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
+
+        // ✅ URL STRUCTURE: We use '30minute' because '15minute' often fails on Historical
+        // If you strictly need 15min, change '30minute' to '15minute' below
+        const url = `https://api.upstox.com/v2/historical-candle/${encodedKey}/30minute/${dates.to}/${dates.from}`;
         
         const response = await axios.get(url, {
             headers: { 'Accept': 'application/json' }
@@ -70,7 +76,7 @@ setInterval(async () => {
         }
 
         // Calculate Indicators
-        const closes = candles.map(c => c[4]).reverse(); // Oldest first
+        const closes = candles.map(c => c[4]).reverse();
         const lastPrice = closes[closes.length - 1];
 
         const rsi = RSI.calculate({ period: 14, values: closes });
@@ -79,14 +85,19 @@ setInterval(async () => {
         const currentRSI = rsi[rsi.length - 1];
         const currentEMA = ema[ema.length - 1];
 
-        console.log(`🔎 Silver: ₹${lastPrice} | RSI: ${currentRSI.toFixed(2)} | EMA: ${currentEMA ? currentEMA.toFixed(2) : 'Loading...'}`);
+        // LOG OUTPUT
+        console.log(`🔎 Silver: ₹${lastPrice} | RSI: ${currentRSI.toFixed(2)} | EMA: ${currentEMA ? currentEMA.toFixed(2) : 'Calculating...'}`);
 
-        // --- SIGNALS ---
+        // SIGNALS
         if (currentRSI < 30 && lastPrice > currentEMA) console.log("🚀 BUY SIGNAL!");
         if (currentRSI > 70 && lastPrice < currentEMA) console.log("🔻 SELL SIGNAL!");
 
     } catch (error) {
-        console.error("❌ Error:", error.message);
+        // If 400 error happens again, it prints WHY
+        console.error("❌ API Error:", error.response ? error.response.status : error.message);
+        if (error.response && error.response.status === 400) {
+             console.error("👉 Tip: Try changing '30minute' to 'day' or check the Dates.");
+        }
     }
 
 }, 60000);
