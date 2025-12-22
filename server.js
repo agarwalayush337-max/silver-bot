@@ -12,14 +12,17 @@ const INSTRUMENT_KEY = "MCX_FO|458305";
 const STATE_FILE = './bot_state.json';
 const MAX_QUANTITY = 1; 
 
-// --- PERSISTENCE ---
+// --- STATE MANAGEMENT ---
 let botState = { positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0 };
 if (fs.existsSync(STATE_FILE)) {
-    try { botState = JSON.parse(fs.readFileSync(STATE_FILE)); } catch(e) { console.log("State reset"); }
+    try {
+        botState = JSON.parse(fs.readFileSync(STATE_FILE));
+        console.log("📂 State recovered from bot_state.json");
+    } catch (e) { console.log("State file reset due to error"); }
 }
 function saveState() { fs.writeFileSync(STATE_FILE, JSON.stringify(botState)); }
 
-// --- TIMER ---
+// --- MARKET HOURS (8:45 AM - 11:59 PM IST) ---
 function isMarketOpen() {
     const ist = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
     const totalMin = (ist.getHours() * 60) + ist.getMinutes();
@@ -28,7 +31,7 @@ function isMarketOpen() {
     return totalMin >= 525 && totalMin < 1439; 
 }
 
-// --- ORDERS ---
+// --- ORDER EXECUTION ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN) return false;
     const isAmo = !isMarketOpen();
@@ -42,13 +45,22 @@ async function placeOrder(type, qty, ltp) {
             instrument_token: INSTRUMENT_KEY, order_type: "LIMIT",
             transaction_type: type, is_amo: isAmo
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
+        console.log(`✅ Order Success: ${type} ${qty} Lot(s)`);
         return true;
-    } catch (e) { return false; }
+    } catch (e) {
+        console.error(`❌ Order Failed: ${e.response?.data?.errors[0]?.message || e.message}`);
+        return false;
+    }
 }
 
 // --- TRADING ENGINE ---
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isMarketOpen()) return;
+    if (!ACCESS_TOKEN) return;
+    if (!isMarketOpen()) {
+        console.log("😴 Market Closed. Bot is in standby mode.");
+        return;
+    }
+
     try {
         const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
         const res = await axios.get(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
@@ -88,48 +100,36 @@ setInterval(async () => {
                 }
             }
         }
-    } catch (e) { console.log("Interval logic standby"); }
+    } catch (e) { console.log("⏳ Fetching live data..."); }
 }, 30000);
 
-// --- UPDATED DASHBOARD HTML ---
+// --- DASHBOARD UI ---
 app.get('/', (req, res) => {
     res.send(`
-        <div style="font-family: 'Segoe UI', sans-serif; text-align: center; padding: 60px; background: #0f172a; color: white; min-height: 100vh;">
-            <div style="max-width: 600px; margin: auto; background: #1e293b; padding: 30px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
-                <h1 style="color: #38bdf8; margin-bottom: 10px;">🥈 Silver Prime Bot</h1>
-                <p style="color: #94a3b8;">v2025 Optimized Momentum Engine</p>
-                <hr style="border: 0.5px solid #334155; margin: 20px 0;">
-                
-                <div style="display: flex; justify-content: space-around; margin-bottom: 25px;">
-                    <div>
-                        <small style="color: #64748b; display: block;">STATUS</small>
-                        <b style="color: ${ACCESS_TOKEN ? '#4ade80' : '#f87171'};">${ACCESS_TOKEN ? 'ACTIVE' : 'OFFLINE'}</b>
-                    </div>
-                    <div>
-                        <small style="color: #64748b; display: block;">POSITION</small>
-                        <b style="color: #fbbf24;">${botState.positionType || 'FLAT'}</b>
-                    </div>
-                    <div>
-                        <small style="color: #64748b; display: block;">TOTAL PNL</small>
-                        <b style="font-size: 1.2em;">₹${botState.totalPnL.toFixed(2)}</b>
-                    </div>
+        <html>
+        <body style="font-family: sans-serif; background: #0f172a; color: white; text-align: center; padding-top: 50px;">
+            <div style="max-width: 500px; margin: auto; background: #1e293b; padding: 30px; border-radius: 12px; border: 1px solid #334155;">
+                <h1 style="color: #38bdf8;">🥈 Silver Prime v2025</h1>
+                <hr style="border: 0.5px solid #334155;">
+                <div style="margin: 20px 0;">
+                    <p>Status: <b style="color: ${ACCESS_TOKEN ? '#4ade80' : '#f87171'}">${ACCESS_TOKEN ? 'ACTIVE' : 'TOKEN REQUIRED'}</b></p>
+                    <p>Current PnL: <span style="font-size: 1.5em; font-weight: bold;">₹${botState.totalPnL.toFixed(2)}</span></p>
+                    <p>Position: <b>${botState.positionType || 'NONE'}</b></p>
                 </div>
-
+                
                 <form action="/update-token" method="POST" style="margin-top: 30px;">
-                    <label style="display: block; text-align: left; margin-bottom: 8px; color: #94a3b8;">Enter Upstox Access Token:</label>
-                    <input name="token" type="text" placeholder="Paste your v3 token here" required 
-                        style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white; margin-bottom: 15px;">
-                    <button type="submit" 
-                        style="width: 100%; padding: 12px; border-radius: 8px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; cursor: pointer;">
-                        START TRADING ENGINE
+                    <input name="token" type="text" placeholder="Paste Upstox Access Token" required 
+                           style="width: 100%; padding: 12px; border-radius: 6px; border: none; margin-bottom: 10px; background: #0f172a; color: white; border: 1px solid #334155;">
+                    <button type="submit" style="width: 100%; padding: 12px; border-radius: 6px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; cursor: pointer;">
+                        ACTIVATE BOT
                     </button>
                 </form>
-
-                <div style="margin-top: 25px; font-size: 0.9em; color: #64748b;">
-                    <a href="/test-amo" style="color: #38bdf8; text-decoration: none;">🛠️ Send Test AMO Order</a>
+                <div style="margin-top: 20px;">
+                    <a href="/test-amo" style="color: #94a3b8; text-decoration: none; font-size: 0.8em;">🛠️ Trigger Manual AMO Test</a>
                 </div>
             </div>
-        </div>
+        </body>
+        </html>
     `);
 });
 
@@ -140,8 +140,8 @@ app.post('/update-token', (req, res) => {
 
 app.get('/test-amo', async (req, res) => {
     const success = await placeOrder("BUY", 1, 75000);
-    res.send(success ? "<h1>✅ AMO Sent! Check App.</h1><a href='/'>Back</a>" : "<h1>❌ Failed. Enter Token first.</h1><a href='/'>Back</a>");
+    res.send(success ? "<h1>✅ Test Order Sent!</h1><a href='/'>Back</a>" : "<h1>❌ Error. Paste token first.</h1><a href='/'>Back</a>");
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Dashboard active on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Web Interface live on port ${PORT}`));
