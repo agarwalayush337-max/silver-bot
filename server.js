@@ -8,48 +8,47 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // --- CONFIGURATION ---
 let ACCESS_TOKEN = null;
-// Default Key (We will change this using the Search Feature)
-let INSTRUMENT_KEY = "MCX_FO|458305"; 
+let INSTRUMENT_KEY = "MCX_FO|458305"; // Default (Feb 2026)
 
-// --- 1. WEB DASHBOARD (With Search!) ---
+// --- 1. DASHBOARD ---
 app.get('/', (req, res) => {
     const status = ACCESS_TOKEN ? "🟢 ONLINE" : "🔴 WAITING FOR TOKEN";
     
     res.send(`
         <div style="font-family: sans-serif; text-align: center; padding: 20px;">
-            <h1>🤖 Silver Smart Bot</h1>
+            <h1>🤖 Silver Bot (Final Version)</h1>
             <h3>Status: ${status}</h3>
-            <p><strong>Current Contract:</strong> ${INSTRUMENT_KEY}</p>
+            <p><strong>Trading Contract:</strong> ${INSTRUMENT_KEY}</p>
             
-            <div style="background: #f4f4f4; padding: 15px; margin: 10px; border-radius: 8px;">
-                <h3>Step 1: Login</h3>
+            <div style="background: #e8f5e9; padding: 15px; margin: 10px; border-radius: 8px;">
+                <h3>Step 1: Start Bot</h3>
                 <form action="/update-token" method="POST">
                     <input type="text" name="token" placeholder="Paste Access Token" style="width: 300px; padding: 10px;">
-                    <button type="submit" style="padding: 10px 20px; background: #28a745; color: white; border: none;">Start Bot</button>
+                    <button type="submit" style="padding: 10px 20px; background: #4CAF50; color: white; border: none;">Start</button>
                 </form>
             </div>
 
             <div style="background: #e3f2fd; padding: 15px; margin: 10px; border-radius: 8px;">
-                <h3>Step 2: Fix "False Price"</h3>
-                <p>Search for the correct contract (e.g. SILVERMIC, SILVERM)</p>
+                <h3>Step 2: Find Correct Price</h3>
+                <p>If price is wrong, search for "SILVER" or "SILVERM" below:</p>
                 <form action="/search" method="GET">
                     <input type="text" name="q" placeholder="Symbol (e.g. SILVERMIC)" style="width: 200px; padding: 10px;">
-                    <button type="submit" style="padding: 10px 20px; background: #007bff; color: white; border: none;">Search</button>
+                    <button type="submit" style="padding: 10px 20px; background: #2196F3; color: white; border: none;">Search</button>
                 </form>
             </div>
-            
+
             <div style="background: #fff3e0; padding: 15px; margin: 10px; border-radius: 8px;">
-                <h3>Step 3: Update Key</h3>
+                <h3>Step 3: Change Contract</h3>
                 <form action="/set-key" method="POST">
-                    <input type="text" name="key" placeholder="Paste New Key (e.g. MCX_FO|12345)" style="width: 300px; padding: 10px;">
-                    <button type="submit" style="padding: 10px 20px; background: #ff9800; color: white; border: none;">Update Key</button>
+                    <input type="text" name="key" placeholder="Paste Key (e.g. MCX_FO|458305)" style="width: 300px; padding: 10px;">
+                    <button type="submit" style="padding: 10px 20px; background: #ff9800; color: white; border: none;">Update</button>
                 </form>
             </div>
         </div>
     `);
 });
 
-// --- 2. HELPERS ---
+// --- 2. HANDLERS ---
 app.post('/update-token', (req, res) => {
     ACCESS_TOKEN = req.body.token;
     res.redirect('/');
@@ -61,13 +60,14 @@ app.post('/set-key', (req, res) => {
     res.redirect('/');
 });
 
-// --- 3. SEARCH API (Finds the Real Price Key) ---
+// --- 3. FIXED SEARCH API (Solves 404 Error) ---
 app.get('/search', async (req, res) => {
-    if (!ACCESS_TOKEN) return res.send("❌ Please enter Access Token first!");
+    if (!ACCESS_TOKEN) return res.send("❌ Error: Please enter Access Token first!");
     
     try {
         const query = req.query.q || "SILVERMIC";
-        const url = `https://api.upstox.com/v2/market/search/instrument?q=${query}&segment=MCX_FO`;
+        // FIX: Correct parameter is 'search_key', not 'q'
+        const url = `https://api.upstox.com/v2/market/search/instrument?search_key=${query}&segment=MCX_FO`;
         
         const response = await axios.get(url, {
             headers: { 
@@ -77,33 +77,39 @@ app.get('/search', async (req, res) => {
         });
 
         const list = response.data.data;
-        let html = `<h2>Search Results for "${query}"</h2><ul>`;
+        let html = `<h2>Search Results for "${query}"</h2>
+                    <p>Copy the <strong>Key</strong> that matches your broker's Expiry/Name.</p>
+                    <table border="1" cellpadding="10" style="border-collapse: collapse; width: 100%;">
+                    <tr><th>Symbol</th><th>Expiry</th><th>Key (Copy This)</th></tr>`;
         
         list.forEach(item => {
-            // Filter only Futures
+            // Only show Futures
             if(item.instrument_type === "FUTCOM") {
-                html += `<li style="margin: 10px 0;">
-                    <strong>${item.trading_symbol}</strong> (Expiry: ${item.expiry})<br>
-                    Key: <code>${item.instrument_key}</code> <br>
-                    <button onclick="navigator.clipboard.writeText('${item.instrument_key}')">Copy Key</button>
-                </li>`;
+                html += `<tr>
+                    <td>${item.trading_symbol}</td>
+                    <td>${item.expiry}</td>
+                    <td><code>${item.instrument_key}</code></td>
+                </tr>`;
             }
         });
-        html += "</ul><a href='/'>Go Back</a>";
+        html += "</table><br><a href='/'>Go Back</a>";
         res.send(html);
 
     } catch (e) {
-        res.send("Error searching: " + e.message);
+        res.send("Search Error: " + (e.response ? JSON.stringify(e.response.data) : e.message));
     }
 });
 
-// --- 4. TRADING ENGINE (15 MINUTE - INTRADAY) ---
+// --- 4. TRADING LOOP (Solves 400 Error) ---
 setInterval(async () => {
     if (!ACCESS_TOKEN) return;
 
     try {
-        // ✅ We use INTRADAY API because it supports '15minute'
-        const url = `https://api.upstox.com/v2/historical-candle/intraday/${INSTRUMENT_KEY}/15minute`;
+        // FIX: Encode the pipe symbol '|' to '%7C' to prevent 400 Bad Request
+        const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
+        
+        // Use Intraday API for 15minute support
+        const url = `https://api.upstox.com/v2/historical-candle/intraday/${encodedKey}/15minute`;
         
         const response = await axios.get(url, {
             headers: { 
@@ -112,20 +118,20 @@ setInterval(async () => {
             }
         });
 
+        // Smart Data Extraction
         let candles = [];
         if (response.data && response.data.data && Array.isArray(response.data.data.candles)) {
             candles = response.data.data.candles;
         } else if (response.data && Array.isArray(response.data.data)) {
             candles = response.data.data;
         } else {
-            return;
+            return; 
         }
 
-        // Prepare Data
+        // Indicators
         const closes = candles.map(c => c[4]).reverse(); 
         const lastPrice = closes[closes.length - 1];
 
-        // Indicators
         const rsi = RSI.calculate({ period: 14, values: closes });
         const ema = EMA.calculate({ period: 50, values: closes });
 
@@ -134,12 +140,13 @@ setInterval(async () => {
 
         console.log(`🔎 ${INSTRUMENT_KEY}: ₹${lastPrice} | RSI: ${currentRSI ? currentRSI.toFixed(2) : 'N/A'} | EMA: ${currentEMA ? currentEMA.toFixed(2) : 'Loading...'}`);
 
-        // Signals
-        if (currentRSI < 30 && lastPrice > currentEMA) console.log("🚀 BUY SIGNAL!");
-        if (currentRSI > 70 && lastPrice < currentEMA) console.log("🔻 SELL SIGNAL!");
+        // Logic
+        if (currentRSI < 30 && lastPrice > currentEMA) console.log("🚀 BUY SIGNAL");
+        if (currentRSI > 70 && lastPrice < currentEMA) console.log("🔻 SELL SIGNAL");
 
     } catch (error) {
-        console.error("❌ Bot Error:", error.message);
+        // Log clean error message
+        console.error("Bot Error:", error.response ? error.response.status : error.message);
     }
 
 }, 60 * 1000);
