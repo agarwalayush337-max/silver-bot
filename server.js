@@ -1,161 +1,111 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const { RSI, EMA } = require("technicalindicators");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// --- CONFIGURATION ---
 let ACCESS_TOKEN = null;
-const INSTRUMENT_KEY = "MCX_FO|458305"; // Silver Mic (Feb 2026)
+const KEY = "MCX_FO|458305"; 
 
-// --- STATE MANAGEMENT (Paper Trading Memory) ---
-let isPositionOpen = false;
-let entryPrice = 0;
-let totalProfit = 0;
-
-// --- 1. WEB DASHBOARD ---
 app.get('/', (req, res) => {
-    const status = ACCESS_TOKEN ? "🟢 ONLINE (V3 API)" : "🔴 OFFLINE";
-    const posColor = isPositionOpen ? "green" : "grey";
-    
     res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <h1>🤖 Silver Bot (V3 Professional)</h1>
-            <h3>Status: ${status}</h3>
+        <div style="font-family: monospace; text-align: center; padding: 20px;">
+            <h1>🧪 API Link Tester</h1>
+            <p><strong>Target:</strong> ${KEY}</p>
             
-            <div style="border: 1px solid #ddd; padding: 20px; display: inline-block; border-radius: 10px; background: #f9f9f9;">
-                <p><strong>Strategy:</strong> 15-Minute | RSI(14) | EMA(50)</p>
-                <p style="color: ${posColor}; font-weight: bold;">
-                    Position: ${isPositionOpen ? `OPEN @ ₹${entryPrice}` : "WAITING"}
-                </p>
-                <p><strong>Total Simulated Profit:</strong> ₹${totalProfit}</p>
-            </div>
-            
-            <hr/>
-            <form action="/update-token" method="POST">
-                <p>Paste Access Token:</p>
-                <input type="text" name="token" style="width: 300px; padding: 10px;">
-                <br><br>
-                <button type="submit" style="padding: 10px 20px; font-weight: bold; background: #2196F3; color: white; border: none; cursor: pointer;">START V3 BOT</button>
+            <form action="/set-token" method="POST" style="background: #eee; padding: 20px;">
+                <input type="text" name="token" placeholder="Paste Token" style="width: 300px;">
+                <button type="submit">Set Token</button>
             </form>
+
+            <br><hr><br>
+
+            <button onclick="testLink('tomorrow')">Test V3 (Tomorrow Date)</button>
+            
+            <button onclick="testLink('intraday')">Test Intraday (Control)</button>
+
+            <div id="result" style="margin-top: 20px; text-align: left; background: #222; color: #0f0; padding: 20px; white-space: pre;">Waiting for test...</div>
+
+            <script>
+                async function testLink(type) {
+                    document.getElementById('result').innerText = "Testing " + type + "...";
+                    const res = await fetch('/test/' + type);
+                    const data = await res.text();
+                    document.getElementById('result').innerText = data;
+                }
+            </script>
         </div>
     `);
 });
 
-app.post('/update-token', (req, res) => {
-    const newToken = req.body.token;
-    if (newToken && newToken.length > 20) {
-        ACCESS_TOKEN = newToken;
-        console.log("✅ Token Received! Switching to V3 API...");
-        // Reset state on restart
-        isPositionOpen = false;
-        entryPrice = 0;
-        res.send("<h1>Token Updated! 🚀</h1><a href='/'>Go Back</a>");
-    } else {
-        res.send("❌ Invalid Token.");
+app.post('/set-token', (req, res) => {
+    ACCESS_TOKEN = req.body.token;
+    res.redirect('/');
+});
+
+app.get('/test/:type', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.send("❌ NO TOKEN");
+
+    try {
+        let url = "";
+        const encodedKey = encodeURIComponent(KEY);
+        
+        // --- DYNAMIC DATE GENERATION ---
+        const today = new Date();
+        const tomorrow = new Date(today);
+        tomorrow.setDate(today.getDate() + 1); // 🔥 THE FIX: Set date to tomorrow
+        const past = new Date(today);
+        past.setDate(today.getDate() - 10);
+
+        const toDate = tomorrow.toISOString().split('T')[0]; // Format: YYYY-MM-DD
+        const fromDate = past.toISOString().split('T')[0];
+
+        if (req.params.type === 'tomorrow') {
+            // V3 Historical with "Tomorrow" as End Date
+            url = `https://api.upstox.com/v3/historical-candle/${encodedKey}/30minute/${toDate}/${fromDate}`;
+        } else {
+            // Intraday (The one we know works, for comparison)
+            url = `https://api.upstox.com/v2/historical-candle/intraday/${encodedKey}/30minute`;
+        }
+
+        const response = await axios.get(url, {
+            headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+        });
+
+        // Parse Data
+        let candles = [];
+        if (response.data?.data?.candles) candles = response.data.data.candles;
+        else if (Array.isArray(response.data?.data)) candles = response.data.data;
+
+        if (candles.length === 0) return res.send(`❌ URL: ${url}\n\nResult: NO CANDLES FOUND`);
+
+        // Get Latest Candle
+        const latest = candles[0]; // Upstox usually sends newest first? Or last?
+        // Let's print the first and last to be sure
+        const first = candles[0];
+        const last = candles[candles.length - 1];
+
+        res.send(`
+🔗 URL TESTED: 
+${url}
+
+📊 DATA RECEIVED (${candles.length} candles):
+
+---- CANDLE A (Index 0) ----
+Time: ${first[0]}
+Close: ${first[4]}
+
+---- CANDLE B (Index Last) ----
+Time: ${last[0]}
+Close: ${last[4]}
+
+✅ CHECK: One of these should be ~214,000.
+        `);
+
+    } catch (e) {
+        res.send(`❌ ERROR: ${e.message}\n${JSON.stringify(e.response?.data)}`);
     }
 });
 
-// --- 2. HELPER: Get Dates for V3 API ---
-function getDates() {
-    const today = new Date();
-    const past = new Date();
-    past.setDate(today.getDate() - 15); // Fetch 15 days (Plenty for EMA 50)
-    
-    return {
-        to: today.toISOString().split('T')[0],
-        from: past.toISOString().split('T')[0]
-    };
-}
-
-// --- 3. TRADING ENGINE (10s Loop) ---
-setInterval(async () => {
-    if (!ACCESS_TOKEN) return;
-
-    try {
-        const dates = getDates();
-        const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
-
-        // 🔥 UPSTOX V3 API ENDPOINT (The Critical Fix)
-        // Format: /v3/historical-candle/{key}/minutes/15/{to}/{from}
-        const url = `https://api.upstox.com/v3/historical-candle/${encodedKey}/minutes/15/${dates.to}/${dates.from}`;
-        
-        const response = await axios.get(url, {
-            headers: { 
-                'Accept': 'application/json',
-                'Authorization': `Bearer ${ACCESS_TOKEN}`
-            }
-        });
-
-        // --- DATA HANDLING ---
-        let candles = [];
-        if (response.data && response.data.data && Array.isArray(response.data.data.candles)) {
-            candles = response.data.data.candles;
-        } else {
-            // V3 sometimes returns empty data if market is closed/holiday
-            // console.log("Waiting for data..."); 
-            return;
-        }
-
-        // Prepare Data (Reverse: Oldest -> Newest)
-        const closes = candles.map(c => c[4]).reverse(); 
-        const lastPrice = closes[closes.length - 1];
-
-        // --- INDICATORS ---
-        const rsi = RSI.calculate({ period: 14, values: closes });
-        const ema = EMA.calculate({ period: 50, values: closes }); // EMA 50 works now!
-
-        const currentRSI = rsi[rsi.length - 1];
-        const currentEMA = ema[ema.length - 1];
-
-        // Log
-        console.log(`🔎 Silver: ₹${lastPrice} | RSI: ${currentRSI ? currentRSI.toFixed(2) : 'N/A'} | EMA(50): ${currentEMA ? currentEMA.toFixed(2) : 'Loading...'}`);
-
-        // --- LOGIC (Paper Trading) ---
-
-        // 1. BUY SIGNAL
-        if (!isPositionOpen) {
-            if (currentRSI < 30 && lastPrice > currentEMA) {
-                console.log(`🚀 SIMULATED BUY at ₹${lastPrice}`);
-                isPositionOpen = true;
-                entryPrice = lastPrice;
-            }
-        }
-        
-        // 2. SELL SIGNAL (Profit Taking / Stop Loss)
-        else if (isPositionOpen) {
-            const profit = lastPrice - entryPrice;
-
-            // Sell Condition: RSI Overbought OR Good Profit (>200)
-            if (currentRSI > 70 || profit > 200) {
-                console.log(`💰 SIMULATED SELL at ₹${lastPrice} | Profit: ₹${profit}`);
-                totalProfit += profit;
-                isPositionOpen = false;
-                entryPrice = 0;
-            }
-            // Stop Loss Condition (< -150)
-            else if (profit < -150) {
-                console.log(`🛑 STOP LOSS at ₹${lastPrice} | Loss: ₹${profit}`);
-                totalProfit += profit;
-                isPositionOpen = false;
-                entryPrice = 0;
-            }
-        }
-
-    } catch (error) {
-        if (error.response && error.response.status === 401) {
-            console.log("❌ Token Expired. Please update on website.");
-            ACCESS_TOKEN = null;
-        } else {
-            // Suppress minor V3 errors
-            // console.error("API Error:", error.message);
-        }
-    }
-
-}, 10 * 1000); // 10 Seconds Refresh
-
-// --- SERVER START ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(3000, () => console.log("Tester Ready"));
