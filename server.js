@@ -45,7 +45,7 @@ setInterval(async () => {
 
     try {
         // A. Fetch Data directly via API (No SDK needed)
-        const url = `https://api.upstox.com/v2/historical-candle/${INSTRUMENT_KEY}/15minute/${getDateString(0)}/${getDateString(5)}`;
+        const url = `https://api.upstox.com/v2/historical-candle/${INSTRUMENT_KEY}/30minute/${getDateString(0)}/${getDateString(5)}`;
         const response = await axios.get(url, {
             headers: { 'Accept': 'application/json' }
         });
