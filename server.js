@@ -8,99 +8,141 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // --- CONFIGURATION ---
 let ACCESS_TOKEN = null;
-const INSTRUMENT_KEY = "MCX_FO|458305"; // Silver Mic Feb 2026
+// Default Key (We will change this using the Search Feature)
+let INSTRUMENT_KEY = "MCX_FO|458305"; 
 
-// --- 1. WEB DASHBOARD ---
+// --- 1. WEB DASHBOARD (With Search!) ---
 app.get('/', (req, res) => {
     const status = ACCESS_TOKEN ? "🟢 ONLINE" : "🔴 WAITING FOR TOKEN";
+    
     res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <h1>🤖 Silver Bot (Feb 2026)</h1>
-            <h2>Status: ${status}</h2>
-            <p>Contract: ${INSTRUMENT_KEY}</p>
-            <form action="/update-token" method="POST">
-                <p>Paste Upstox Access Token:</p>
-                <input type="text" name="token" style="width: 300px; padding: 10px;">
-                <br><br>
-                <button type="submit" style="padding: 10px 20px;">START TRADING</button>
-            </form>
+        <div style="font-family: sans-serif; text-align: center; padding: 20px;">
+            <h1>🤖 Silver Smart Bot</h1>
+            <h3>Status: ${status}</h3>
+            <p><strong>Current Contract:</strong> ${INSTRUMENT_KEY}</p>
+            
+            <div style="background: #f4f4f4; padding: 15px; margin: 10px; border-radius: 8px;">
+                <h3>Step 1: Login</h3>
+                <form action="/update-token" method="POST">
+                    <input type="text" name="token" placeholder="Paste Access Token" style="width: 300px; padding: 10px;">
+                    <button type="submit" style="padding: 10px 20px; background: #28a745; color: white; border: none;">Start Bot</button>
+                </form>
+            </div>
+
+            <div style="background: #e3f2fd; padding: 15px; margin: 10px; border-radius: 8px;">
+                <h3>Step 2: Fix "False Price"</h3>
+                <p>Search for the correct contract (e.g. SILVERMIC, SILVERM)</p>
+                <form action="/search" method="GET">
+                    <input type="text" name="q" placeholder="Symbol (e.g. SILVERMIC)" style="width: 200px; padding: 10px;">
+                    <button type="submit" style="padding: 10px 20px; background: #007bff; color: white; border: none;">Search</button>
+                </form>
+            </div>
+            
+            <div style="background: #fff3e0; padding: 15px; margin: 10px; border-radius: 8px;">
+                <h3>Step 3: Update Key</h3>
+                <form action="/set-key" method="POST">
+                    <input type="text" name="key" placeholder="Paste New Key (e.g. MCX_FO|12345)" style="width: 300px; padding: 10px;">
+                    <button type="submit" style="padding: 10px 20px; background: #ff9800; color: white; border: none;">Update Key</button>
+                </form>
+            </div>
         </div>
     `);
 });
 
+// --- 2. HELPERS ---
 app.post('/update-token', (req, res) => {
     ACCESS_TOKEN = req.body.token;
-    res.send("<h1>Token Updated! 🚀</h1><a href='/'>Go Back</a>");
+    res.redirect('/');
 });
 
-// --- 2. DATE HELPER ---
-function getDates() {
-    const today = new Date();
-    const past = new Date();
-    past.setDate(today.getDate() - 15); // 15 Days of history
-    
-    return {
-        to: today.toISOString().split('T')[0],
-        from: past.toISOString().split('T')[0]
-    };
-}
+app.post('/set-key', (req, res) => {
+    INSTRUMENT_KEY = req.body.key;
+    console.log("✅ Contract Updated to:", INSTRUMENT_KEY);
+    res.redirect('/');
+});
 
-// --- 3. TRADING ENGINE ---
+// --- 3. SEARCH API (Finds the Real Price Key) ---
+app.get('/search', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.send("❌ Please enter Access Token first!");
+    
+    try {
+        const query = req.query.q || "SILVERMIC";
+        const url = `https://api.upstox.com/v2/market/search/instrument?q=${query}&segment=MCX_FO`;
+        
+        const response = await axios.get(url, {
+            headers: { 
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${ACCESS_TOKEN}`
+            }
+        });
+
+        const list = response.data.data;
+        let html = `<h2>Search Results for "${query}"</h2><ul>`;
+        
+        list.forEach(item => {
+            // Filter only Futures
+            if(item.instrument_type === "FUTCOM") {
+                html += `<li style="margin: 10px 0;">
+                    <strong>${item.trading_symbol}</strong> (Expiry: ${item.expiry})<br>
+                    Key: <code>${item.instrument_key}</code> <br>
+                    <button onclick="navigator.clipboard.writeText('${item.instrument_key}')">Copy Key</button>
+                </li>`;
+            }
+        });
+        html += "</ul><a href='/'>Go Back</a>";
+        res.send(html);
+
+    } catch (e) {
+        res.send("Error searching: " + e.message);
+    }
+});
+
+// --- 4. TRADING ENGINE (15 MINUTE - INTRADAY) ---
 setInterval(async () => {
     if (!ACCESS_TOKEN) return;
 
     try {
-        const dates = getDates();
-        
-        // 🔥 CRITICAL FIX: URL Encoding the Key
-        // The "|" symbol in MCX_FO|458305 often breaks requests if not encoded
-        const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
-
-        // ✅ URL STRUCTURE: We use '30minute' because '15minute' often fails on Historical
-        // If you strictly need 15min, change '30minute' to '15minute' below
-        const url = `https://api.upstox.com/v2/historical-candle/${encodedKey}/30minute/${dates.to}/${dates.from}`;
+        // ✅ We use INTRADAY API because it supports '15minute'
+        const url = `https://api.upstox.com/v2/historical-candle/intraday/${INSTRUMENT_KEY}/15minute`;
         
         const response = await axios.get(url, {
-            headers: { 'Accept': 'application/json' }
+            headers: { 
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${ACCESS_TOKEN}`
+            }
         });
 
-        // Handle Data
         let candles = [];
         if (response.data && response.data.data && Array.isArray(response.data.data.candles)) {
             candles = response.data.data.candles;
         } else if (response.data && Array.isArray(response.data.data)) {
             candles = response.data.data;
         } else {
-            console.log("⚠️ No Data. Market Closed?");
             return;
         }
 
-        // Calculate Indicators
-        const closes = candles.map(c => c[4]).reverse();
+        // Prepare Data
+        const closes = candles.map(c => c[4]).reverse(); 
         const lastPrice = closes[closes.length - 1];
 
+        // Indicators
         const rsi = RSI.calculate({ period: 14, values: closes });
         const ema = EMA.calculate({ period: 50, values: closes });
 
         const currentRSI = rsi[rsi.length - 1];
         const currentEMA = ema[ema.length - 1];
 
-        // LOG OUTPUT
-        console.log(`🔎 Silver: ₹${lastPrice} | RSI: ${currentRSI.toFixed(2)} | EMA: ${currentEMA ? currentEMA.toFixed(2) : 'Calculating...'}`);
+        console.log(`🔎 ${INSTRUMENT_KEY}: ₹${lastPrice} | RSI: ${currentRSI ? currentRSI.toFixed(2) : 'N/A'} | EMA: ${currentEMA ? currentEMA.toFixed(2) : 'Loading...'}`);
 
-        // SIGNALS
+        // Signals
         if (currentRSI < 30 && lastPrice > currentEMA) console.log("🚀 BUY SIGNAL!");
         if (currentRSI > 70 && lastPrice < currentEMA) console.log("🔻 SELL SIGNAL!");
 
     } catch (error) {
-        // If 400 error happens again, it prints WHY
-        console.error("❌ API Error:", error.response ? error.response.status : error.message);
-        if (error.response && error.response.status === 400) {
-             console.error("👉 Tip: Try changing '30minute' to 'day' or check the Dates.");
-        }
+        console.error("❌ Bot Error:", error.message);
     }
 
-}, 60000);
+}, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Running on port ${PORT}`));
