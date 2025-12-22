@@ -6,8 +6,9 @@ const { EMA, SMA, ATR } = require("technicalindicators");
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// --- CONFIGURATION ---
+// --- CONFIG ---
 let ACCESS_TOKEN = null;
+let lastKnownLtp = 0; 
 const INSTRUMENT_KEY = "MCX_FO|458305";
 const REDIS_URL = process.env.REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379";
 const MAX_QUANTITY = 1;
@@ -20,8 +21,8 @@ async function loadState() {
     try {
         const saved = await redis.get('silver_bot_state');
         if (saved) botState = JSON.parse(saved);
-        console.log("📂 Redis: State recovered.");
-    } catch (e) { console.log("Redis load error"); }
+        console.log("📂 Redis memory loaded.");
+    } catch (e) { console.log("Redis sync issue."); }
 }
 loadState();
 
@@ -33,7 +34,7 @@ async function saveState() {
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
 function isApiAvailable() {
     const totalMin = (getIST().getHours() * 60) + getIST().getMinutes();
-    return totalMin >= 330 && totalMin < 1440; // 5:30 AM to 12:00 AM
+    return totalMin >= 330 && totalMin < 1440; 
 }
 function isMarketOpen() {
     const ist = getIST();
@@ -64,69 +65,104 @@ async function placeOrder(type, qty, ltp) {
 
 // --- TRADING ENGINE ---
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isApiAvailable() || !isMarketOpen()) return;
+    if (!ACCESS_TOKEN || !isApiAvailable()) return;
+    
     try {
         const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
         const res = await axios.get(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const candles = res.data.data.candles.reverse();
         const cl = candles.map(c => c[4]);
-        const lastC = cl[cl.length-1];
         
-        // ... (EMA/ATR Calculations & Strategy Logic from previous steps) ...
-    } catch (e) { console.log("Standby..."); }
+        lastKnownLtp = cl[cl.length-1]; 
+
+        if (isMarketOpen()) {
+            const h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
+            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl});
+            const vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+
+            const lastC = lastKnownLtp, lastV = v[v.length-1], curE50 = e50[e50.length-1], curE200 = e200[e200.length-1], curV = vAvg[vAvg.length-1], curA = atr[atr.length-1];
+            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
+
+            if (!botState.positionType) {
+                if (curE50 > curE200 && lastV > (curV * 1.5) && lastC > bH) {
+                    if (await placeOrder("BUY", MAX_QUANTITY, lastC)) {
+                        botState = { ...botState, positionType: 'LONG', entryPrice: lastC, quantity: MAX_QUANTITY, currentStop: lastC - (curA * 3) };
+                        await saveState();
+                    }
+                } else if (curE50 < curE200 && lastV > (curV * 1.5) && lastC < bL) {
+                    if (await placeOrder("SELL", MAX_QUANTITY, lastC)) {
+                        botState = { ...botState, positionType: 'SHORT', entryPrice: lastC, quantity: MAX_QUANTITY, currentStop: lastC + (curA * 3) };
+                        await saveState();
+                    }
+                }
+            } else {
+                if (botState.positionType === 'LONG') {
+                    botState.currentStop = Math.max(lastC - (curA * 3), botState.currentStop);
+                    if (lastC < botState.currentStop && await placeOrder("SELL", botState.quantity, lastC)) {
+                        botState.totalPnL += (lastC - botState.entryPrice) * botState.quantity;
+                        botState.positionType = null; await saveState();
+                    }
+                } else {
+                    botState.currentStop = Math.min(lastC + (curA * 3), botState.currentStop || 999999);
+                    if (lastC > botState.currentStop && await placeOrder("BUY", botState.quantity, lastC)) {
+                        botState.totalPnL += (botState.entryPrice - lastC) * botState.quantity;
+                        botState.positionType = null; await saveState();
+                    }
+                }
+            }
+        }
+    } catch (e) { console.log("Engine sync..."); }
 }, 30000);
 
-// --- IMPROVED DASHBOARD UI ---
+// --- UPDATED UI WITH AUTO-REFRESH ---
 app.get('/', (req, res) => {
     const isActivated = ACCESS_TOKEN !== null;
     const statusColor = isActivated ? "#4ade80" : "#f87171";
-    const statusText = isActivated ? "BOT ACTIVATED" : "BOT WAITING FOR TOKEN";
 
     let historyHTML = botState.history.slice(0, 5).map(t => `
-        <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:8px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
-            <span>${t.time}</span>
-            <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b>
-            <span>₹${t.price}</span>
+        <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:8px; margin-bottom:8px; display:flex; justify-content:space-between; font-size:13px;">
+            <span>${t.time}</span> <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b> <span>₹${t.price}</span>
         </div>
     `).join('');
 
     res.send(`
         <!DOCTYPE html>
-        <html>
-        <head><title>Silver Prime v2025</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: white; display: flex; justify-content: center; padding: 20px;">
-            <div style="width: 100%; max-width: 450px;">
-                <div style="background: #1e293b; border-radius: 20px; padding: 30px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); border: 1px solid #334155;">
-                    <h1 style="margin: 0; color: #38bdf8; font-size: 24px; text-align: center;">🥈 Silver Prime Bot</h1>
-                    <p style="text-align: center; color: #94a3b8; font-size: 14px; margin-top: 5px;">Powered by Redis & Upstox V3</p>
-                    
-                    <div style="margin: 25px 0; padding: 15px; border-radius: 12px; border: 2px solid ${statusColor}; text-align: center;">
-                        <span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: ${statusColor}; margin-right: 8px;"></span>
-                        <b style="color: ${statusColor}; letter-spacing: 1px;">${statusText}</b>
-                    </div>
+        <html style="background:#0f172a;">
+        <head>
+            <title>Silver Prime v2025</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta http-equiv="refresh" content="30"> </head>
+        <body style="font-family:sans-serif; color:white; display:flex; justify-content:center; padding:20px;">
+            <div style="width:100%; max-width:450px; background:#1e293b; border-radius:20px; padding:30px; border:1px solid #334155; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+                <h2 style="color:#38bdf8; text-align:center; margin-bottom:5px;">🥈 Silver Prime Bot</h2>
+                <p style="text-align:center; color:#64748b; font-size:11px; margin-bottom:20px;">LAST SYNC: ${getIST().toLocaleTimeString()}</p>
+                
+                <div style="background:#0f172a; padding:15px; border-radius:12px; margin-bottom:20px; text-align:center; border: 1px solid #334155;">
+                    <small style="color:#64748b; letter-spacing:1px;">SILVER MICRO LTP</small><br>
+                    <span style="font-size:28px; font-weight:bold; color:#fbbf24;">₹${lastKnownLtp || 'WAITING...'}</span>
+                </div>
 
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 25px;">
-                        <div style="background: #0f172a; padding: 15px; border-radius: 12px; text-align: center;">
-                            <small style="color: #64748b; font-weight: bold;">POSITION</small><br>
-                            <b style="color: #fbbf24; font-size: 18px;">${botState.positionType || 'FLAT'}</b>
-                        </div>
-                        <div style="background: #0f172a; padding: 15px; border-radius: 12px; text-align: center;">
-                            <small style="color: #64748b; font-weight: bold;">TOTAL PnL</small><br>
-                            <b style="font-size: 18px;">₹${botState.totalPnL.toFixed(2)}</b>
-                        </div>
-                    </div>
+                <div style="margin:15px 0; text-align:center;">
+                    <b style="color:${statusColor}; font-size:13px; letter-spacing:1px;">● ${isActivated ? 'ACTIVE' : 'TOKEN REQUIRED'}</b>
+                </div>
 
-                    <form action="/update-token" method="POST">
-                        <input name="token" type="text" placeholder="Paste Access Token" required style="width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: white; box-sizing: border-box; margin-bottom: 15px; font-size: 16px;">
-                        <button type="submit" style="width: 100%; padding: 12px; border-radius: 10px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; font-size: 16px; cursor: pointer;">ACTIVATE TRADING ENGINE</button>
-                    </form>
-
-                    <h3 style="margin-top: 30px; font-size: 16px; color: #94a3b8;">Recent History</h3>
-                    ${historyHTML || '<p style="text-align:center; color:#475569;">No trades in this session</p>'}
-                    
-                    <div style="margin-top: 20px; text-align: center;">
-                        <a href="/test-amo" style="color: #64748b; text-decoration: none; font-size: 12px;">🛠️ Trigger Connection Test (AMO)</a>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:25px;">
+                    <div style="background:#0f172a; padding:12px; border-radius:10px; text-align:center;">
+                        <small style="color:#64748b;">TOTAL PNL</small><br><b style="font-size:16px;">₹${botState.totalPnL.toFixed(2)}</b>
                     </div>
+                    <div style="background:#0f172a; padding:12px; border-radius:10px; text-align:center;">
+                        <small style="color:#64748b;">POSITION</small><br><b style="font-size:16px; color:#fbbf24;">${botState.positionType || 'FLAT'}</b>
+                    </div>
+                </div>
+
+                <form action="/update-token" method="POST">
+                    <input name="token" type="text" placeholder="Enter Access Token" style="width:100%; padding:12px; border-radius:8px; background:#0f172a; color:white; border:1px solid #334155; margin-bottom:10px; box-sizing:border-box;">
+                    <button type="submit" style="width:100%; padding:12px; background:#38bdf8; border:none; border-radius:8px; font-weight:bold; color:#0f172a; cursor:pointer;">ACTIVATE ENGINE</button>
+                </form>
+
+                <h4 style="color:#94a3b8; margin-top:30px; border-bottom:1px solid #334155; padding-bottom:5px;">Session History</h4>
+                <div style="margin-top:15px;">
+                    ${historyHTML || '<p style="text-align:center;color:#475569;font-size:13px;">No trade signals detected yet.</p>'}
                 </div>
             </div>
         </body>
@@ -134,15 +170,6 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.post('/update-token', (req, res) => {
-    ACCESS_TOKEN = req.body.token;
-    res.redirect('/');
-});
-
-app.get('/test-amo', async (req, res) => {
-    const success = await placeOrder("BUY", 1, 75000);
-    res.send(success ? "<h1>✅ Test Sent!</h1><a href='/'>Back</a>" : "<h1>❌ Failed. Enter Token.</h1><a href='/'>Back</a>");
-});
-
+app.post('/update-token', (req, res) => { ACCESS_TOKEN = req.body.token; res.redirect('/'); });
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Dashboard Live`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Bot Console live`));
