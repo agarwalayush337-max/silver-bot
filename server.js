@@ -1,129 +1,116 @@
 const express = require('express');
 const axios = require('axios');
-const { RSI, EMA } = require("technicalindicators");
+const { EMA, SMA, ATR } = require("technicalindicators");
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
+// --- CONFIGURATION ---
+let ACCESS_TOKEN = null;
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
 
-// --- 1. WEB INTERFACE ---
+// --- STRATEGY MEMORY ---
+let isPositionOpen = false;
+let entryPrice = 0;
+let highestPriceSinceEntry = 0;
+
 app.get('/', (req, res) => {
+    const status = ACCESS_TOKEN ? "🟢 BOT ACTIVE" : "🔴 WAITING FOR TOKEN";
     res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: white; min-height: 100vh;">
-            <h1 style="color: #38bdf8;">📊 Silver Turbo Backtester (V3)</h1>
-            <p style="color: #94a3b8;">Strategy: 5-Min | RSI(7) | EMA 9 & 21 | Target: 300 Pts</p>
-            
-            <div style="background: #1e293b; padding: 30px; border-radius: 12px; display: inline-block; border: 1px solid #334155;">
-                <form action="/backtest" method="POST">
-                    <p>Paste Access Token to Analyze Last 15 Days:</p>
-                    <input type="text" name="token" placeholder="Paste Access Token here" required style="width: 350px; padding: 12px; border-radius: 6px; border: none;">
-                    <br><br>
-                    <button type="submit" style="padding: 15px 35px; background: #38bdf8; color: #0f172a; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px;">RUN BACKTEST</button>
-                </form>
+        <div style="font-family: sans-serif; text-align: center; padding: 40px; background: #0a0a0a; color: #00ff00; min-height: 100vh;">
+            <h1>🥈 Silver Prime v2025 Bot</h1>
+            <p>Strategy: Breakout + Volume Spike + ATR Trailing</p>
+            <div style="border: 2px solid #00ff00; padding: 20px; border-radius: 10px; display: inline-block;">
+                <h3>Status: ${status}</h3>
+                <p>Position: ${isPositionOpen ? 'LONG' : 'FLAT'}</p>
             </div>
-            <p style="color: #64748b; margin-top: 20px;">Analyzing ~1,500 candles for high-frequency patterns.</p>
+            <br><br>
+            <form action="/update-token" method="POST">
+                <input type="text" name="token" placeholder="Paste Upstox Access Token" style="width: 350px; padding: 10px;">
+                <button type="submit" style="padding: 10px 20px; cursor: pointer;">START TRADING</button>
+            </form>
         </div>
     `);
 });
 
-// --- 2. THE ANALYTICS ENGINE ---
-app.post('/backtest', async (req, res) => {
-    const token = req.body.token;
-    if (!token) return res.send("Error: Token required.");
+app.post('/update-token', (req, res) => {
+    ACCESS_TOKEN = req.body.token;
+    res.redirect('/');
+});
+
+// --- TRADING ENGINE (5-Min Interval) ---
+setInterval(async () => {
+    if (!ACCESS_TOKEN) return;
 
     try {
         const encodedKey = encodeURIComponent(INSTRUMENT_KEY);
-        const today = new Date();
-        const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-        const past = new Date(today); past.setDate(today.getDate() - 15);
-
-        const toDate = tomorrow.toISOString().split('T')[0];
-        const fromDate = past.toISOString().split('T')[0];
-
-        // Fetching 5-Min Data
-        const url = `https://api.upstox.com/v3/historical-candle/${encodedKey}/minutes/5/${toDate}/${fromDate}`;
+        // V3 Intraday URL
+        const url = `https://api.upstox.com/v3/historical-candle/intraday/${encodedKey}/minutes/5`;
+        
         const response = await axios.get(url, {
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
 
-        const candles = response.data.data.candles.reverse(); 
-        const closes = candles.map(c => c[4]);
+        const candles = response.data.data.candles.reverse(); // Oldest to Newest
+        const high = candles.map(c => c[2]);
+        const low = candles.map(c => c[3]);
+        const close = candles.map(c => c[4]);
+        const volume = candles.map(c => c[5]);
 
-        // Indicators
-        const rsi7 = RSI.calculate({ period: 7, values: closes });
-        const ema9 = EMA.calculate({ period: 9, values: closes });
-        const ema21 = EMA.calculate({ period: 21, values: closes });
+        // --- CALCULATIONS ---
+        const ema40 = EMA.calculate({ period: 40, values: close });
+        const ema80 = EMA.calculate({ period: 80, values: close });
+        const smaVol20 = SMA.calculate({ period: 20, values: volume });
+        const atr = ATR.calculate({ high, low, close, period: 14 });
 
-        const rOff = candles.length - rsi7.length;
-        const e9Off = candles.length - ema9.length;
-        const e21Off = candles.length - ema21.length;
+        const lastClose = close[close.length - 1];
+        const lastHigh = high[high.length - 1];
+        const lastVol = volume[volume.length - 1];
+        
+        const curE40 = ema40[ema40.length - 1];
+        const curE80 = ema80[ema80.length - 1];
+        const curSmaVol = smaVol20[smaVol20.length - 1];
+        const curAtr = atr[atr.length - 1];
 
-        let trades = [];
-        let inPosition = false;
-        let entryPrice = 0;
-        let netProfit = 0;
-        let wins = 0;
+        // Get highest of last 10 (excluding current)
+        const recentHighs = high.slice(-11, -1);
+        const breakOutLevel = Math.max(...recentHighs);
 
-        // Simulation Loop
-        for (let i = 30; i < candles.length; i++) {
-            const price = closes[i];
-            const cRSI = rsi7[i - rOff];
-            const cE9 = ema9[i - e9Off];
-            const cE21 = ema21[i - e21Off];
+        console.log(`🔎 Price: ${lastClose} | Breakout: ${breakOutLevel} | Vol: ${lastVol} vs ${curSmaVol * 1.5}`);
 
-            // Entry Logic (Long)
-            if (!inPosition && cRSI < 25 && price > cE21 && price > cE9) {
-                inPosition = true;
-                entryPrice = price;
-                trades.push({ type: 'BUY', price: entryPrice, time: candles[i][0] });
-            } 
-            // Exit Logic
-            else if (inPosition) {
-                const diff = price - entryPrice;
-                // Exit on Target 300, Stop Loss 150, or Trend Reversal (Price < E9)
-                if (diff >= 300 || diff <= -150 || price < cE9 || cRSI > 75) {
-                    netProfit += diff;
-                    if (diff > 0) wins++;
-                    inPosition = false;
-                    trades.push({ type: 'SELL', price: price, time: candles[i][0], pnl: diff });
-                }
+        // --- EXECUTION LOGIC ---
+
+        // 1. ENTRY (Long Silver)
+        if (!isPositionOpen) {
+            const trendUp = curE40 > curE80;
+            const volSpike = lastVol > (curSmaVol * 1.5);
+            const priceBreak = lastClose > breakOutLevel;
+
+            if (trendUp && volSpike && priceBreak) {
+                console.log("🚀 LONG ENTRY @ " + lastClose);
+                isPositionOpen = true;
+                entryPrice = lastClose;
+                highestPriceSinceEntry = lastHigh;
+            }
+        } 
+        
+        // 2. TRAILING EXIT
+        else {
+            if (lastHigh > highestPriceSinceEntry) highestPriceSinceEntry = lastHigh;
+            
+            // Exit if price drops below (Recent High - 3 * ATR)
+            const stopLevel = highestPriceSinceEntry - (curAtr * 3.0);
+            
+            if (lastClose < stopLevel) {
+                console.log(`💰 TRAILING EXIT @ ${lastClose} | Profit: ${lastClose - entryPrice}`);
+                isPositionOpen = false;
+                entryPrice = 0;
+                highestPriceSinceEntry = 0;
             }
         }
 
-        const winRate = ((wins / (trades.length / 2)) * 100).toFixed(1);
-
-        res.send(`
-            <div style="font-family: sans-serif; padding: 30px; background: #f8fafc; min-height: 100vh;">
-                <h2 style="color: #1e293b;">Performance Report (15 Days)</h2>
-                <div style="display: flex; gap: 15px; margin-bottom: 25px;">
-                    <div style="background: ${netProfit > 0 ? '#10b981' : '#ef4444'}; color: white; padding: 20px; border-radius: 8px; flex: 1;">
-                        Total Profit: <b>₹${netProfit.toFixed(2)}</b>
-                    </div>
-                    <div style="background: #3b82f6; color: white; padding: 20px; border-radius: 8px; flex: 1;">
-                        Total Trades: <b>${trades.length / 2}</b>
-                    </div>
-                    <div style="background: #6366f1; color: white; padding: 20px; border-radius: 8px; flex: 1;">
-                        Win Rate: <b>${winRate}%</b>
-                    </div>
-                </div>
-                <table border="1" style="width: 100%; border-collapse: collapse; background: white;">
-                    <tr style="background: #f1f5f9;"><th>Type</th><th>Price</th><th>Time</th><th>Result</th></tr>
-                    ${trades.map(t => `
-                        <tr>
-                            <td>${t.type}</td>
-                            <td>${t.price}</td>
-                            <td>${new Date(t.time).toLocaleString()}</td>
-                            <td style="color: ${t.pnl > 0 ? 'green' : (t.pnl < 0 ? 'red' : 'black')}; font-weight: bold;">
-                                ${t.pnl ? t.pnl.toFixed(2) : '-'}
-                            </td>
-                        </tr>`).join('')}
-                </table>
-                <br><a href="/" style="display: inline-block; padding: 10px 20px; background: #1e293b; color: white; text-decoration: none; border-radius: 5px;">Return to Tester</a>
-            </div>
-        `);
     } catch (e) {
-        res.send(`<h3>Error Processing Data</h3><p>${e.message}</p>`);
+        console.error("Bot Error: " + e.message);
     }
-});
+}, 30000); // Check every 30 seconds
 
-app.listen(3000);
+app.listen(3000, () => console.log("Prime v2025 Bot Running"));
