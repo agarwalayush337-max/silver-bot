@@ -1,4 +1,21 @@
+process.on('uncaughtException', err => {
+  if (err.message?.includes('Redis')) {
+    console.warn("⚠️ Redis error ignored:", err.message);
+  } else {
+    throw err;
+  }
+});
+
+process.on('unhandledRejection', err => {
+  if (err?.message?.includes('Redis')) {
+    console.warn("⚠️ Redis rejection ignored:", err.message);
+  }
+});
+
+
 /***********************
+
+
  * IMPORTS
  ***********************/
 const express = require('express');
