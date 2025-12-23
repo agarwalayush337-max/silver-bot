@@ -59,8 +59,8 @@ async function performAutoLogin() {
         const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
         const codeOTP = totp.generate();
         browser = await puppeteer.launch({
-    // Native Render path for Chrome
-    executablePath: '/usr/bin/google-chrome', 
+    // Path where our build script extracts Chrome
+    executablePath: '/opt/render/project/src/render-chrome/opt/google/chrome/google-chrome',
     headless: "new",
     args: [
         '--no-sandbox',
