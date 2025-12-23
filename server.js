@@ -15,7 +15,7 @@ const INSTRUMENT_KEY = "MCX_FO|458305";
 const MAX_QUANTITY = 1;
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-// Initialize Redis with connection protection for Render
+// Initialize Redis with retry protection for Render
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
@@ -104,9 +104,9 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Order likely already hit */ }
 }
 
-// ... [Keep performAutoLogin and runStrategy logic here] ...
+// ... [Keep your performAutoLogin and runStrategy logic here] ...
 
-// --- 📡 API ROUTES (RESTORED & FIXED) ---
+// --- 📡 API ROUTES ---
 
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -121,7 +121,9 @@ app.get('/price', (req, res) => {
     res.json({ price: lastKnownLtp, pnl: calculateLivePnL() });
 });
 
+// FIXED: Added POST routes for dashboard buttons
 app.post('/trigger-login', async (req, res) => {
+    console.log("🚀 Manual Login Triggered...");
     await performAutoLogin();
     if (ACCESS_TOKEN) initWebSocket();
     res.redirect('/');
@@ -195,5 +197,6 @@ app.get('/', (req, res) => {
         </body></html>`);
 });
 
+// FIXED: Binding to 0.0.0.0 on port 10000 for Render
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server Running on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on port ${PORT}`));
