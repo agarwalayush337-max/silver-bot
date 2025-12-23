@@ -11,7 +11,7 @@
     "axios": "^1.6.0",
     "ioredis": "^5.3.2",
     "technicalindicators": "^3.1.0",
-    "puppeteer": "^21.5.0",
+    "puppeteer": "latest",
     "otpauth": "^9.1.4"
   },
   "engines": {
