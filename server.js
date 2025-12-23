@@ -10,7 +10,7 @@ const WebSocket = require('ws');
 const { EMA, SMA, ATR } = require("technicalindicators");
 
 /***********************
- * APP SETUP
+ * APP
  ***********************/
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -35,9 +35,25 @@ const {
 } = process.env;
 
 /***********************
- * REDIS
+ * REDIS (SAFE MODE)
  ***********************/
-const redis = new Redis(REDIS_URL);
+let redis = null;
+
+if (REDIS_URL) {
+  redis = new Redis(REDIS_URL, {
+    maxRetriesPerRequest: 3,
+    enableReadyCheck: false,
+    retryStrategy(times) {
+      if (times > 5) return null;
+      return Math.min(times * 200, 2000);
+    }
+  });
+
+  redis.on('connect', () => console.log("✅ Redis connected"));
+  redis.on('error', err => console.warn("⚠️ Redis error:", err.message));
+} else {
+  console.warn("⚠️ REDIS_URL not set. Running without persistence.");
+}
 
 /***********************
  * GLOBAL STATE
@@ -62,12 +78,25 @@ let botState = {
  * STATE PERSISTENCE
  ***********************/
 async function loadState() {
-  const saved = await redis.get('silver_bot_state');
-  if (saved) botState = JSON.parse(saved);
+  if (!redis) return;
+  try {
+    const saved = await redis.get('silver_bot_state');
+    if (saved) botState = JSON.parse(saved);
+    console.log("📂 State loaded");
+  } catch {
+    console.warn("⚠️ Redis load skipped");
+  }
 }
+
 async function saveState() {
-  await redis.set('silver_bot_state', JSON.stringify(botState));
+  if (!redis) return;
+  try {
+    await redis.set('silver_bot_state', JSON.stringify(botState));
+  } catch {
+    console.warn("⚠️ Redis save skipped");
+  }
 }
+
 loadState();
 
 /***********************
@@ -75,13 +104,6 @@ loadState();
  ***********************/
 function getIST() {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-}
-function formatDate(d) {
-  return d.toISOString().split('T')[0];
-}
-function isApiAvailable() {
-  const m = getIST().getHours() * 60 + getIST().getMinutes();
-  return m >= 330 && m < 1440;
 }
 function isMarketOpen() {
   const t = getIST();
@@ -95,6 +117,8 @@ function isMarketOpen() {
 async function performAutoLogin() {
   let browser;
   try {
+    console.log("🤖 Auto login started");
+
     const totp = new OTPAuth.TOTP({
       secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET),
       digits: 6,
@@ -123,6 +147,7 @@ async function performAutoLogin() {
     await page.waitForNavigation({ waitUntil: 'networkidle0' });
 
     const code = new URL(page.url()).searchParams.get('code');
+
     const params = new URLSearchParams({
       code,
       client_id: API_KEY,
@@ -137,16 +162,18 @@ async function performAutoLogin() {
     );
 
     ACCESS_TOKEN = res.data.access_token;
+    console.log("✅ Login success");
+
     await startMarketWS();
   } catch (e) {
-    console.error("Login failed:", e.message);
+    console.error("❌ Login failed:", e.message);
   } finally {
     if (browser) await browser.close();
   }
 }
 
 /***********************
- * MARKET DATA WS (REAL-TIME)
+ * MARKET DATA WEBSOCKET
  ***********************/
 async function startMarketWS() {
   try {
@@ -158,6 +185,7 @@ async function startMarketWS() {
     ws = new WebSocket(auth.data.data.authorized_redirect_uri);
 
     ws.on('open', () => {
+      console.log("📡 Market WS connected");
       ws.send(JSON.stringify({
         guid: "silver-feed",
         method: "sub",
@@ -177,10 +205,11 @@ async function startMarketWS() {
 }
 
 /***********************
- * ORDER HELPERS
+ * SL HELPERS
  ***********************/
 async function placeSL(trigger, side) {
   const tx = side === 'LONG' ? 'SELL' : 'BUY';
+
   const res = await axios.post(
     'https://api.upstox.com/v3/order/place',
     {
@@ -194,12 +223,14 @@ async function placeSL(trigger, side) {
     },
     { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
   );
+
   botState.slOrderId = res.data.data.order_id;
   await saveState();
 }
 
 async function modifySL(trigger) {
   if (!botState.slOrderId) return;
+
   await axios.put(
     'https://api.upstox.com/v3/order/modify',
     {
@@ -217,22 +248,21 @@ setInterval(async () => {
   if (!ACCESS_TOKEN || !isMarketOpen()) return;
 
   try {
-    const c = await axios.get(
+    const res = await axios.get(
       `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`,
       { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
     );
 
-    const candles = c.data.data.candles;
+    const candles = res.data.data.candles;
     if (candles.length < 200) return;
 
-    const close = candles.map(x => x[4]);
-    const high = candles.map(x => x[2]);
-    const low = candles.map(x => x[3]);
-    const vol = candles.map(x => x[5]);
+    const close = candles.map(c => c[4]);
+    const high = candles.map(c => c[2]);
+    const low = candles.map(c => c[3]);
+    const vol = candles.map(c => c[5]);
 
     const e50 = EMA.calculate({ period: 50, values: close });
     const e200 = EMA.calculate({ period: 200, values: close });
-    const vAvg = SMA.calculate({ period: 20, values: vol });
     const atr = ATR.calculate({ high, low, close, period: 14 });
 
     const curA = atr.at(-1);
@@ -271,7 +301,9 @@ setInterval(async () => {
     }
 
     await saveState();
-  } catch {}
+  } catch (e) {
+    console.warn("Strategy loop skipped:", e.message);
+  }
 }, 30000);
 
 /***********************
@@ -279,14 +311,12 @@ setInterval(async () => {
  ***********************/
 app.get('/', (req, res) => {
   res.send(`
-  <h2>Silver Prime Bot</h2>
-  <p>Price: ₹${lastKnownLtp}</p>
-  <p>Position: ${botState.positionType || 'NONE'}</p>
-  <p>Entry: ₹${botState.entryPrice}</p>
-  <p>SL: ₹${botState.currentStop}</p>
-  <p>Total PnL: ₹${botState.totalPnL}</p>
-  <h3>Historical PnL</h3>
-  ${botState.pnlHistory.map(p => `<div>${p.date} : ₹${p.pnl}</div>`).join('')}
+    <h2>Silver Prime Bot</h2>
+    <p>Price: ₹${lastKnownLtp}</p>
+    <p>Position: ${botState.positionType || 'NONE'}</p>
+    <p>Entry: ₹${botState.entryPrice}</p>
+    <p>SL: ₹${botState.currentStop}</p>
+    <p>Total PnL: ₹${botState.totalPnL}</p>
   `);
 });
 
@@ -294,23 +324,27 @@ app.get('/', (req, res) => {
  * MANUAL SYNC
  ***********************/
 app.post('/sync-price', async (req, res) => {
-  const pos = await axios.get(
-    'https://api.upstox.com/v2/portfolio/short-term-positions',
-    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-  );
+  try {
+    const pos = await axios.get(
+      'https://api.upstox.com/v2/portfolio/short-term-positions',
+      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+    );
 
-  const p = pos.data.data.find(x => x.instrument_token === INSTRUMENT_KEY);
-  if (p) {
-    botState.positionType = p.quantity > 0 ? 'LONG' : 'SHORT';
-    botState.quantity = Math.abs(p.quantity);
-    botState.entryPrice = parseFloat(p.buy_price);
-    botState.currentStop =
-      botState.positionType === 'LONG'
-        ? botState.entryPrice - 800
-        : botState.entryPrice + 800;
+    const p = pos.data.data.find(x => x.instrument_token === INSTRUMENT_KEY);
+    if (p) {
+      botState.positionType = p.quantity > 0 ? 'LONG' : 'SHORT';
+      botState.quantity = Math.abs(p.quantity);
+      botState.entryPrice = parseFloat(p.buy_price);
+      botState.currentStop =
+        botState.positionType === 'LONG'
+          ? botState.entryPrice - 800
+          : botState.entryPrice + 800;
 
-    await placeSL(botState.currentStop, botState.positionType);
-    await saveState();
+      await placeSL(botState.currentStop, botState.positionType);
+      await saveState();
+    }
+  } catch (e) {
+    console.warn("Manual sync failed:", e.message);
   }
   res.redirect('/');
 });
@@ -319,7 +353,7 @@ app.post('/sync-price', async (req, res) => {
  * SERVER
  ***********************/
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Bot running on", PORT));
+app.listen(PORT, () => console.log(`🚀 Bot running on ${PORT}`));
 
 /***********************
  * AUTO LOGIN CRON
