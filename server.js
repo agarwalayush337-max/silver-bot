@@ -24,7 +24,7 @@ async function loadState() {
         const saved = await redis.get('silver_bot_state');
         if (saved) botState = JSON.parse(saved);
         console.log("📂 Redis: State loaded.");
-    } catch (e) { console.log("Redis sync issue (New Session)."); }
+    } catch (e) { console.log("Redis sync issue."); }
 }
 loadState();
 
@@ -47,7 +47,7 @@ function isMarketOpen() {
     return day !== 0 && day !== 6 && totalMin >= 525 && totalMin < 1439;
 }
 
-// --- DATA ENGINE (History + Intraday) ---
+// --- DATA ENGINE ---
 async function getMergedCandles() {
     const today = new Date();
     const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
@@ -68,14 +68,18 @@ async function getMergedCandles() {
     } catch (e) { return []; }
 }
 
-// --- ID RECOVERY & SYNC ---
+// --- ID RECOVERY & SYNC (FIXED) ---
 async function fetchLatestOrderId() {
     try {
-        const res = await axios.get("https://api.upstox.com/v3/order/history", {
+        // Correct V2 Endpoint to get ALL orders
+        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
+        
         if (res.data && res.data.data && res.data.data.length > 0) {
-            return res.data.data[0].order_id; 
+            // Sort to ensure we get the latest one
+            const sortedOrders = res.data.data.sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp));
+            return sortedOrders[0].order_id; 
         }
     } catch (e) { console.log("ID Recovery Failed: " + e.message); }
     return null;
@@ -87,13 +91,12 @@ async function verifyOrderStatus(orderId, context) {
         if (!orderId) return;
     }
 
-    // Wait 2s for processing if verifying a new order (skip wait for manual sync)
     if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000));
 
     try {
-        const res = await axios.get("https://api.upstox.com/v3/order/history", {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' },
-            params: { order_id: orderId }
+        // Correct V2 Endpoint to check status
+        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
 
         const order = res.data.data.find(o => o.order_id === orderId);
@@ -101,23 +104,20 @@ async function verifyOrderStatus(orderId, context) {
 
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
 
-        // SCENARIO 1: FILLED (Update Price)
+        // SCENARIO 1: FILLED
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
             
-            // Fix Entry Price in Memory if we are in a position
             if (botState.positionType) {
-                console.log(`✅ SYNC: Updating Entry Price to Real Executed Price: ₹${realPrice}`);
+                console.log(`✅ SYNC: Updating Entry Price to ₹${realPrice}`);
                 botState.entryPrice = realPrice;
             }
 
-            // Update History Log
-            // If manual sync, force update top entry. If auto, find by ID.
             if (context === 'MANUAL_SYNC' && botState.history.length > 0) {
                  botState.history[0].price = realPrice;
                  botState.history[0].status = "FILLED";
                  botState.history[0].id = orderId;
-                 console.log("✅ Manual Sync Complete.");
+                 console.log("✅ Manual Sync Done.");
             } else {
                 const logEntry = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
                 if (logEntry) { 
