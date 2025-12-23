@@ -15,6 +15,7 @@ const INSTRUMENT_KEY = "MCX_FO|458305";
 const MAX_QUANTITY = 1;
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
+// Initialize Redis with retry protection
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
@@ -25,32 +26,18 @@ let botState = {
     quantity: 0, history: [], slOrderId: null 
 };
 
-// --- STATE & HELPERS ---
-async function loadState() {
-    const saved = await redis.get('silver_bot_state');
-    if (saved) botState = JSON.parse(saved);
-    console.log("📂 System State Loaded.");
-}
-loadState();
-async function saveState() { await redis.set('silver_bot_state', JSON.stringify(botState)); }
+// --- 🛠️ HELPER FUNCTIONS (Placed first to avoid ReferenceErrors) ---
+
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
+function formatDate(date) { return date.toISOString().split('T')[0]; }
+function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; }
 function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; }
 
-// --- 📈 WEBSOCKET ENGINE ---
-async function initWebSocket() {
-    if (!ACCESS_TOKEN) return;
-    try {
-        const streamer = new MarketDataStreamerV3();
-        await streamer.connect(ACCESS_TOKEN);
-        streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
-        streamer.on('data', (data) => {
-            if (data && data[INSTRUMENT_KEY]) {
-                lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                console.log(`Live Price: ${lastKnownLtp}`); // Restored Console Log
-                pushToDashboard();
-            }
-        });
-    } catch (e) { console.log("WebSocket Connection Error"); }
+function calculateLivePnL() {
+    let uPnL = 0;
+    if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
+    if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
+    return (parseFloat(botState.totalPnL) + uPnL).toFixed(2);
 }
 
 function pushToDashboard() {
@@ -58,24 +45,33 @@ function pushToDashboard() {
     sseClients.forEach(c => c.res.write(`data: ${data}\n\n`));
 }
 
-// --- 🛡️ EXCHANGE SL ORDER LOGIC ---
+async function saveState() { await redis.set('silver_bot_state', JSON.stringify(botState)); }
+
+async function loadState() {
+    try {
+        const saved = await redis.get('silver_bot_state');
+        if (saved) botState = JSON.parse(saved);
+        console.log("📂 System State Loaded.");
+    } catch (e) { console.log("Redis sync issue (first run?)"); }
+}
+loadState();
+
+// --- 🛡️ ORDER & SL MANAGEMENT ---
+
 async function manageExchangeSL(side, qty, triggerPrice) {
     try {
-        // Cancel old SL if exists
         if (botState.slOrderId) {
             await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         }
-        // Place new SL-M (Opposite side of entry)
         const res = await axios.post("https://api.upstox.com/v2/order/place", {
             quantity: qty, product: "I", validity: "DAY", price: 0, 
             instrument_token: INSTRUMENT_KEY, order_type: "SL-M", 
             transaction_type: side === "BUY" ? "SELL" : "BUY", 
             trigger_price: Math.round(triggerPrice), is_amo: false
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        
         botState.slOrderId = res.data.data.order_id;
         await saveState();
-    } catch (e) { console.log("Exchange SL Failed"); }
+    } catch (e) { console.log("Exchange SL Placement Failed"); }
 }
 
 async function modifyExchangeSL(newTrigger) {
@@ -87,12 +83,30 @@ async function modifyExchangeSL(newTrigger) {
             quantity: botState.quantity,
             order_type: "SL-M"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-    } catch (e) { /* Order likely already triggered */ }
+    } catch (e) { /* Likely filled */ }
 }
 
-// ... [Keep your performAutoLogin and Strategy logic as before] ...
+// ... [Include your existing performAutoLogin and Strategy Logic here] ...
 
-// --- 📡 SSE FOR REAL-TIME DASHBOARD ---
+// --- 📉 WEBSOCKET REAL-TIME ENGINE ---
+async function initWebSocket() {
+    if (!ACCESS_TOKEN) return;
+    try {
+        const streamer = new MarketDataStreamerV3();
+        await streamer.connect(ACCESS_TOKEN);
+        streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+        streamer.on('data', (data) => {
+            if (data && data[INSTRUMENT_KEY]) {
+                lastKnownLtp = data[INSTRUMENT_KEY].ltp;
+                console.log(`Live Price: ${lastKnownLtp}`);
+                pushToDashboard();
+            }
+        });
+    } catch (e) { console.error("WS Error:", e.message); }
+}
+
+// --- 📡 API ROUTES ---
+
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -102,38 +116,37 @@ app.get('/live-updates', (req, res) => {
     req.on('close', () => sseClients = sseClients.filter(c => c.id !== id));
 });
 
-// --- 📊 RESTORED DASHBOARD HTML (BASED ON SCREENSHOT) ---
+app.get('/price', (req, res) => {
+    res.json({ price: lastKnownLtp, pnl: calculateLivePnL() });
+});
+
 app.get('/', (req, res) => {
     let historyHTML = botState.history.slice(0, 10).map(t => 
-        `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-            <span style="width:20%; color:#94a3b8;">${t.time}</span> 
-            <b style="width:15%; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="width:20%; font-weight:bold;">₹${t.price}</span> 
-            <div style="width:45%; text-align:right;">
-                <span style="display:block; color:${t.status=='FILLED'?'#4ade80':t.status=='SENT'?'#fbbf24':'#f472b6'}">${t.status}</span>
-                <span style="display:block; color:#64748b; font-size:10px;">${t.id || '-'}</span>
-            </div>
+        `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px;">
+            <span style="color:#94a3b8;">${t.time}</span> 
+            <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b> 
+            <b>₹${t.price}</b> 
+            <span style="color:#fbbf24;">${t.status}</span>
         </div>`
     ).join('');
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
         <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
             <script>
-                // ⚡ SSE Real-time Listener
                 const source = new EventSource('/live-updates');
                 source.onmessage = (e) => {
                     const d = JSON.parse(e.data);
                     document.getElementById('live-price').innerText = '₹' + d.price;
-                    document.getElementById('live-pnl').innerText = '₹' + d.pnl;
-                    document.getElementById('live-pnl').parentElement.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                    const pnlEl = document.getElementById('live-pnl');
+                    pnlEl.innerText = '₹' + d.pnl;
+                    pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                 };
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
@@ -148,22 +161,15 @@ app.get('/', (req, res) => {
                     </div>
                 </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
-                    <div style="flex:1; background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
-                    </div>
-                    <div style="flex:1; background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                         <small style="color:#94a3b8;">STATUS</small><br><b style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
-                    </div>
-                </div>
-                <div style="display:flex; gap:10px; margin-bottom:20px;">
-                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
-                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
+                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px;">🤖 AUTO-LOGIN</button></form>
+                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px;">🔄 SYNC PRICE</button></form>
                 </div>
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
-                <div id="logContent">${historyHTML || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}</div>
+                <div>${historyHTML || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}</div>
             </div>
         </body></html>
     `);
 });
 
-app.listen(process.env.PORT || 10000);
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Bot Live on ${PORT}`));
