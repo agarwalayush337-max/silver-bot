@@ -68,16 +68,13 @@ async function getMergedCandles() {
     } catch (e) { return []; }
 }
 
-// --- ID RECOVERY & SYNC (FIXED) ---
+// --- ID RECOVERY & SYNC ---
 async function fetchLatestOrderId() {
     try {
-        // Correct V2 Endpoint to get ALL orders
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
-        
         if (res.data && res.data.data && res.data.data.length > 0) {
-            // Sort to ensure we get the latest one
             const sortedOrders = res.data.data.sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp));
             return sortedOrders[0].order_id; 
         }
@@ -94,7 +91,6 @@ async function verifyOrderStatus(orderId, context) {
     if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000));
 
     try {
-        // Correct V2 Endpoint to check status
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
@@ -104,7 +100,6 @@ async function verifyOrderStatus(orderId, context) {
 
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
 
-        // SCENARIO 1: FILLED
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
             
@@ -117,24 +112,17 @@ async function verifyOrderStatus(orderId, context) {
                  botState.history[0].price = realPrice;
                  botState.history[0].status = "FILLED";
                  botState.history[0].id = orderId;
-                 console.log("✅ Manual Sync Done.");
             } else {
                 const logEntry = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
-                if (logEntry) { 
-                    logEntry.price = realPrice; 
-                    logEntry.status = "FILLED"; 
-                    logEntry.id = orderId; 
-                }
+                if (logEntry) { logEntry.price = realPrice; logEntry.status = "FILLED"; logEntry.id = orderId; }
             }
             await saveState();
         } 
-        // SCENARIO 2: FAILED
         else if (order.status === 'rejected' || order.status === 'cancelled') {
             if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null;
                 botState.entryPrice = 0;
                 botState.quantity = 0;
-                console.log("🔄 Auto-Reset: Order Failed.");
             }
             await saveState();
         }
@@ -222,6 +210,7 @@ setInterval(async () => {
                     }
                 } else {
                     if (botState.positionType === 'LONG') {
+                        // Trailing Stop Logic
                         botState.currentStop = Math.max(lastC - (curA * 3), botState.currentStop);
                         if (lastC < botState.currentStop) {
                             console.log("🛑 STOP HIT (LONG)");
@@ -245,9 +234,21 @@ setInterval(async () => {
     }
 }, 30000);
 
-// --- DASHBOARD UI ---
+// --- DASHBOARD UI (NOW WITH LIVE PNL & STOP LOSS) ---
 app.get('/', (req, res) => {
     const isActivated = ACCESS_TOKEN !== null;
+    
+    // --- CALCULATE LIVE PNL ---
+    let unrealizedPnL = 0;
+    if (botState.positionType === 'LONG' && lastKnownLtp > 0 && botState.entryPrice > 0) {
+        unrealizedPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
+    } else if (botState.positionType === 'SHORT' && lastKnownLtp > 0 && botState.entryPrice > 0) {
+        unrealizedPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
+    }
+    const totalDisplayPnL = botState.totalPnL + unrealizedPnL;
+    const pnlColor = totalDisplayPnL >= 0 ? '#4ade80' : '#f87171';
+    
+    // --- FORMAT HISTORY ---
     let historyRows = botState.history.slice(0, 10).map(t => {
         const color = t.type === 'BUY' ? '#4ade80' : (t.type === 'SELL' ? '#f87171' : '#fbbf24');
         const statusIcon = t.status === 'FILLED' ? '✅' : (t.status === 'REJECTED' || t.status === 'FAILED' ? '❌' : '⏳');
@@ -263,9 +264,22 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Control</h2>
+                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:20px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br><b style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
+
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
+                    <div style="background:#0f172a; padding:10px; border-radius:8px; text-align:center;">
+                        <small style="color:#94a3b8;">TOTAL PNL</small><br>
+                        <b style="color:${pnlColor}; font-size:18px;">₹${totalDisplayPnL.toFixed(2)}</b>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; border-radius:8px; text-align:center;">
+                        <small style="color:#94a3b8;">TRAILING SL</small><br>
+                        <b style="color:#f472b6; font-size:18px;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
+                    </div>
+                </div>
+
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                     <div style="flex:1; background:#0f172a; padding:10px; border-radius:8px; text-align:center;">
                         <small style="color:#94a3b8;">STATUS</small><br><b style="color:${isActivated?'#4ade80':'#ef4444'}">${isActivated?'ONLINE':'OFFLINE'}</b>
@@ -274,14 +288,17 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
                     </div>
                 </div>
+
                 <form action="/update-token" method="POST" style="margin-bottom:15px;">
                     <input name="token" type="text" placeholder="Access Token" style="width:100%; padding:12px; border-radius:8px; border:none; margin-bottom:10px;">
                     <button type="submit" style="width:100%; padding:12px; background:#38bdf8; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">✅ ACTIVATE</button>
                 </form>
+
                 <div style="display:flex; gap:10px;">
                     <form action="/sync-price" method="POST" style="flex:1;"><button type="submit" style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">🔄 SYNC PRICE</button></form>
                     <form action="/reset-state" method="POST" style="flex:1;"><button type="submit" style="width:100%; padding:10px; background:#ef4444; color:white; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">⚠️ RESET</button></form>
                 </div>
+
                 <h4 style="color:#94a3b8; margin-top:25px; border-bottom:1px solid #334155;">Trade Log</h4>
                 ${historyRows || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}
             </div>
