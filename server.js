@@ -15,7 +15,7 @@ const INSTRUMENT_KEY = "MCX_FO|458305";
 const MAX_QUANTITY = 1;
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-// Initialize Redis with retry protection
+// Initialize Redis with connection protection for Render
 const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
@@ -26,7 +26,7 @@ let botState = {
     quantity: 0, history: [], slOrderId: null 
 };
 
-// --- 🛠️ HELPER FUNCTIONS (Placed first to avoid ReferenceErrors) ---
+// --- 🛠️ HELPER FUNCTIONS (Defined first to avoid ReferenceErrors) ---
 
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
 function formatDate(date) { return date.toISOString().split('T')[0]; }
@@ -56,39 +56,8 @@ async function loadState() {
 }
 loadState();
 
-// --- 🛡️ ORDER & SL MANAGEMENT ---
+// --- 📈 WEBSOCKET REAL-TIME ENGINE ---
 
-async function manageExchangeSL(side, qty, triggerPrice) {
-    try {
-        if (botState.slOrderId) {
-            await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        }
-        const res = await axios.post("https://api.upstox.com/v2/order/place", {
-            quantity: qty, product: "I", validity: "DAY", price: 0, 
-            instrument_token: INSTRUMENT_KEY, order_type: "SL-M", 
-            transaction_type: side === "BUY" ? "SELL" : "BUY", 
-            trigger_price: Math.round(triggerPrice), is_amo: false
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        botState.slOrderId = res.data.data.order_id;
-        await saveState();
-    } catch (e) { console.log("Exchange SL Placement Failed"); }
-}
-
-async function modifyExchangeSL(newTrigger) {
-    if (!botState.slOrderId) return;
-    try {
-        await axios.put("https://api.upstox.com/v2/order/modify", {
-            order_id: botState.slOrderId,
-            trigger_price: Math.round(newTrigger),
-            quantity: botState.quantity,
-            order_type: "SL-M"
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-    } catch (e) { /* Likely filled */ }
-}
-
-// ... [Include your existing performAutoLogin and Strategy Logic here] ...
-
-// --- 📉 WEBSOCKET REAL-TIME ENGINE ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN) return;
     try {
@@ -105,7 +74,39 @@ async function initWebSocket() {
     } catch (e) { console.error("WS Error:", e.message); }
 }
 
-// --- 📡 API ROUTES ---
+// --- 🛡️ EXCHANGE SL MANAGEMENT ---
+
+async function manageExchangeSL(side, qty, triggerPrice) {
+    try {
+        if (botState.slOrderId) {
+            await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        }
+        const res = await axios.post("https://api.upstox.com/v2/order/place", {
+            quantity: qty, product: "I", validity: "DAY", price: 0, 
+            instrument_token: INSTRUMENT_KEY, order_type: "SL-M", 
+            transaction_type: side === "BUY" ? "SELL" : "BUY", 
+            trigger_price: Math.round(triggerPrice), is_amo: false
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        botState.slOrderId = res.data.data.order_id;
+        await saveState();
+    } catch (e) { console.log("Exchange SL Failed"); }
+}
+
+async function modifyExchangeSL(newTrigger) {
+    if (!botState.slOrderId) return;
+    try {
+        await axios.put("https://api.upstox.com/v2/order/modify", {
+            order_id: botState.slOrderId,
+            trigger_price: Math.round(newTrigger),
+            quantity: botState.quantity,
+            order_type: "SL-M"
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+    } catch (e) { /* Order likely already hit */ }
+}
+
+// ... [Keep performAutoLogin and runStrategy logic here] ...
+
+// --- 📡 API ROUTES (RESTORED & FIXED) ---
 
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -120,15 +121,39 @@ app.get('/price', (req, res) => {
     res.json({ price: lastKnownLtp, pnl: calculateLivePnL() });
 });
 
+app.post('/trigger-login', async (req, res) => {
+    await performAutoLogin();
+    if (ACCESS_TOKEN) initWebSocket();
+    res.redirect('/');
+});
+
+app.post('/sync-price', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.redirect('/');
+    try {
+        const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+        });
+        const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
+        if (pos && parseInt(pos.quantity) !== 0) {
+            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = Math.abs(parseInt(pos.quantity));
+            botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
+            botState.totalPnL = 0;
+            console.log(`✅ SYNCED: Tracking ${botState.positionType} @ ₹${botState.entryPrice}`);
+        } else {
+            botState.positionType = null;
+        }
+        await saveState();
+    } catch (e) { console.error("Sync Error", e.message); }
+    res.redirect('/');
+});
+
 app.get('/', (req, res) => {
-    let historyHTML = botState.history.slice(0, 10).map(t => 
+    const historyHTML = botState.history.slice(0, 10).map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px;">
-            <span style="color:#94a3b8;">${t.time}</span> 
-            <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b> 
-            <b>₹${t.price}</b> 
-            <span style="color:#fbbf24;">${t.status}</span>
-        </div>`
-    ).join('');
+            <span>${t.time}</span> <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b> 
+            <b>₹${t.price}</b> <span style="color:#fbbf24;">${t.status}</span>
+        </div>`).join('');
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
@@ -146,7 +171,7 @@ app.get('/', (req, res) => {
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
+            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
@@ -161,15 +186,14 @@ app.get('/', (req, res) => {
                     </div>
                 </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
-                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px;">🤖 AUTO-LOGIN</button></form>
-                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px;">🔄 SYNC PRICE</button></form>
+                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
+                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
-                <div>${historyHTML || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}</div>
+                <div id="logContent">${historyHTML || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}</div>
             </div>
-        </body></html>
-    `);
+        </body></html>`);
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Bot Live on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Server Running on ${PORT}`));
