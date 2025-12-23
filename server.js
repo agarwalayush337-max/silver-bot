@@ -15,7 +15,6 @@ const MAX_QUANTITY = 1;
 // --- 🔒 ENVIRONMENT VARIABLES ---
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-// Connect to Database
 const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379");
 
 let ACCESS_TOKEN = null;
@@ -37,10 +36,10 @@ async function saveState() { await redis.set('silver_bot_state', JSON.stringify(
 // --- TIME HELPERS ---
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
 function formatDate(date) { return date.toISOString().split('T')[0]; }
-function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; } // 5:30 AM to Midnight
-function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; } // 9:00 AM to 11:50 PM
+function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; }
+function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; }
 
-// --- 🤖 ROBUST AUTO-LOGIN SYSTEM ---
+// --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
     let browser = null;
@@ -59,36 +58,31 @@ async function performAutoLogin() {
         console.log("🌍 Navigating to Upstox...");
         await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Check if page loaded correctly
         const mobileInput = await page.$('#mobileNum');
         if (!mobileInput) {
             const pageText = await page.evaluate(() => document.body.innerText); 
             console.error("📄 PAGE CONTENT:", pageText);
-            throw new Error("Login Page Not Loaded (Check API Key/Redirect URI)");
+            throw new Error("Login Page Not Loaded");
         }
 
         console.log("📱 Detected Login Screen. Typing Credentials...");
         await page.type('#mobileNum', UPSTOX_USER_ID);
         await page.click('#getOtp');
-
-        console.log("🔢 Entering TOTP...");
+        
         await page.waitForSelector('#otpNum', { visible: true, timeout: 30000 });
         await page.type('#otpNum', codeOTP);
         await page.click('#continueBtn');
 
-        console.log("🔒 Entering PIN...");
         await page.waitForSelector('#pinCode', { visible: true, timeout: 30000 });
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        console.log("⏳ Waiting for Auth Code...");
         await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 });
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
-        if (!authCode) throw new Error("No Auth Code in URL after redirect");
+        if (!authCode) throw new Error("No Auth Code found");
 
-        // Exchange Code for Token
         const params = new URLSearchParams();
         params.append('code', authCode);
         params.append('client_id', API_KEY);
@@ -111,8 +105,6 @@ async function performAutoLogin() {
 async function getMergedCandles() {
     const today = new Date();
     const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
-    
-    // Fetch History + Intraday
     const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
     const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
 
@@ -124,12 +116,11 @@ async function getMergedCandles() {
         const mergedMap = new Map();
         (histRes.data?.data?.candles || []).forEach(c => mergedMap.set(c[0], c));
         (intraRes.data?.data?.candles || []).forEach(c => mergedMap.set(c[0], c));
-        // Sort by Time
         return Array.from(mergedMap.values()).sort((a, b) => new Date(a[0]) - new Date(b[0]));
     } catch (e) { return []; }
 }
 
-// --- ORDER EXECUTION & SYNC ---
+// --- ORDER EXECUTION ---
 async function fetchLatestOrderId() {
     try {
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
@@ -140,7 +131,7 @@ async function fetchLatestOrderId() {
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
-    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); // Wait for broker
+    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); 
 
     try {
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
@@ -151,8 +142,6 @@ async function verifyOrderStatus(orderId, context) {
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
             if (botState.positionType) botState.entryPrice = realPrice;
-            
-            // Log Update
             if (context === 'MANUAL_SYNC' && botState.history.length > 0) {
                  botState.history[0].price = realPrice; botState.history[0].status = "FILLED"; botState.history[0].id = orderId;
             } else {
@@ -161,7 +150,6 @@ async function verifyOrderStatus(orderId, context) {
             }
             await saveState();
         } else if (['rejected', 'cancelled'].includes(order.status)) {
-            // Reset if entry failed
             if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
             }
@@ -173,7 +161,7 @@ async function verifyOrderStatus(orderId, context) {
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
-    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); // 0.3% buffer
+    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); 
 
     try {
         console.log(`🚀 Sending ${type}: ${qty} Lot @ ₹${limitPrice}`);
@@ -204,102 +192,93 @@ setInterval(() => {
     if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
 }, 60000);
 
+// TRADING LOOP (Runs every 30s)
 setInterval(async () => {
     if (!ACCESS_TOKEN || !isApiAvailable()) { console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping"); return; }
-    
     try {
         const candles = await getMergedCandles();
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]);
-            const h = candles.map(c => c[2]);
-            const l = candles.map(c => c[3]);
-            const v = candles.map(c => c[5]);
+            const h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
+            
+            lastKnownLtp = cl[cl.length-1]; // Update Global Price
 
-            lastKnownLtp = cl[cl.length-1];
-
-            // Calculate Indicators
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            // Current Values
-            const curE50 = e50[e50.length-1];
-            const curE200 = e200[e200.length-1];
-            const curV = v[v.length-1];
-            const curAvgV = vAvg[vAvg.length-1];
-
-            // Strategy Values (Using Previous Candle for Setup)
+            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1];
             const idx = cl.length - 2; 
-            const prevE50 = e50[idx];
-            const prevE200 = e200[idx];
-            const prevVol = v[idx];
-            const prevAvgVol = vAvg[idx];
-            const curA = atr[atr.length-1];
-            
-            // 10-Candle Breakout Levels
-            const bH = Math.max(...h.slice(-11, -1));
-            const bL = Math.min(...l.slice(-11, -1));
-            
-            // --- 🛑 FORCE LOG PRINTING (Always visible) ---
+            const prevE50=e50[idx], prevE200=e200[idx], prevVol=v[idx], prevAvgVol=vAvg[idx], curA=atr[atr.length-1];
+            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
+
             const isOpen = isMarketOpen();
             console.log(`Time:${getIST().toLocaleTimeString()} | P:₹${lastKnownLtp} | E50:${curE50.toFixed(0)} | E200:${curE200.toFixed(0)} | Vol:${curV} | AvgVol:${curAvgV.toFixed(0)} | MarketOpen:${isOpen}`);
 
             if (isOpen) {
                 if (!botState.positionType) {
-                    // ENTRY LOGIC:
-                    // 1. Trend: EMA50 > EMA200 (on prev candle)
-                    // 2. Volume: Prev Volume > 1.5x Avg Volume
-                    // 3. Trigger: Live Price Breaks 10-candle High/Low
-                    
                     if (prevE50 > prevE200 && prevVol > (prevAvgVol * 1.5) && lastKnownLtp > bH) {
-                        console.log("⚡ LONG SIGNAL DETECTED");
-                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp - (curA * 3);
+                        console.log("⚡ LONG SIGNAL");
+                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
                         await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
                     else if (prevE50 < prevE200 && prevVol > (prevAvgVol * 1.5) && lastKnownLtp < bL) {
-                        console.log("⚡ SHORT SIGNAL DETECTED");
-                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp + (curA * 3);
+                        console.log("⚡ SHORT SIGNAL");
+                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
                         await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
-                    // EXIT LOGIC (Trailing SL)
                     if (botState.positionType === 'LONG') {
                         botState.currentStop = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (lastKnownLtp < botState.currentStop) {
                             console.log("🛑 STOP HIT (LONG)");
-                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; 
-                            botState.positionType = null;
+                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
                             await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
                         }
                     } else {
                         botState.currentStop = Math.min(lastKnownLtp + (curA * 3), botState.currentStop || 999999);
                         if (lastKnownLtp > botState.currentStop) {
                             console.log("🛑 STOP HIT (SHORT)");
-                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; 
-                            botState.positionType = null;
+                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
                             await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
                         }
                     }
                 }
             }
-        } else {
-             console.log(`💓 Heartbeat: Found ${candles.length} candles (Need >200).`);
         }
-    } catch (e) { 
-        if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); }
-    }
+    } catch (e) { if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } }
 }, 30000);
 
-// --- DASHBOARD UI ---
-app.get('/', (req, res) => {
+// --- NEW FAST PRICE LOOP (Runs every 2s for Dashboard only) ---
+// This keeps the dashboard live without overloading the heavy calculation engine
+setInterval(async () => {
+    if (!ACCESS_TOKEN || !isMarketOpen()) return;
+    try {
+        // Fetch just the lightweight Quote data
+        const res = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        });
+        if(res.data?.data?.[INSTRUMENT_KEY]?.last_price) {
+            lastKnownLtp = res.data.data[INSTRUMENT_KEY].last_price;
+        }
+    } catch(e) {}
+}, 2000); // Check price every 2 seconds
+
+// --- API FOR FRONTEND ---
+app.get('/price', (req, res) => {
+    res.json({ price: lastKnownLtp, pnl: calculateLivePnL() });
+});
+
+function calculateLivePnL() {
     let uPnL = 0;
     if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
     if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
-    const totalPnL = botState.totalPnL + uPnL;
+    return (botState.totalPnL + uPnL).toFixed(2);
+}
 
+// --- LIVE DASHBOARD ---
+app.get('/', (req, res) => {
     let historyHTML = botState.history.slice(0, 10).map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="width:20%; color:#94a3b8;">${t.time}</span> 
@@ -314,18 +293,36 @@ app.get('/', (req, res) => {
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
-        <head><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30"></head>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <script>
+                // ⚡ LIVE PRICE UPDATER SCRIPT
+                setInterval(() => {
+                    fetch('/price')
+                        .then(r => r.json())
+                        .then(d => {
+                            document.getElementById('live-price').innerText = '₹' + d.price;
+                            const pnlEl = document.getElementById('live-pnl');
+                            pnlEl.innerText = '₹' + d.pnl;
+                            pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                        })
+                        .catch(e => console.log('Connection lost'));
+                }, 1000); // 1 Second Refresh Rate
+            </script>
+        </head>
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
-                    <small style="color:#94a3b8;">LIVE PRICE</small><br><b style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
+                    <small style="color:#94a3b8;">LIVE PRICE</small><br>
+                    <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TOTAL PNL</small><br><b style="color:${totalPnL>=0?'#4ade80':'#f87171'}">₹${totalPnL.toFixed(2)}</b>
+                        <small style="color:#94a3b8;">TOTAL PNL</small><br>
+                        <b id="live-pnl" style="color:${botState.totalPnL>=0?'#4ade80':'#f87171'}">₹${calculateLivePnL()}</b>
                     </div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">TRAILING SL</small><br><b style="color:#f472b6;">${botState.currentStop ? '₹'+botState.currentStop.toFixed(0) : '---'}</b>
