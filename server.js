@@ -58,7 +58,16 @@ async function performAutoLogin() {
     try {
         const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
         const codeOTP = totp.generate();
-        browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+        browser = await puppeteer.launch({
+    // Native Render path for Chrome
+    executablePath: '/usr/bin/google-chrome', 
+    headless: "new",
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+    ]
+});
         const page = await browser.newPage();
         const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`;
         await page.goto(loginUrl);
