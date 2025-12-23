@@ -356,45 +356,53 @@ app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
 
     try {
-        console.log("🔄 POWER SYNC: FETCHING PORTFOLIO...");
-        // 1. Fetch real positions from Upstox
-        const response = await axios.get("https://api.upstox.com/v2/portfolio/net-positions", {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        console.log("🔄 POWER SYNC: FETCHING SHORT-TERM POSITIONS...");
+        
+        // 1. Updated Endpoint: short-term-positions
+        const url = 'https://api.upstox.com/v2/portfolio/short-term-positions';
+        
+        const response = await axios.get(url, {
+            headers: { 
+                'Accept': 'application/json', // Mandatory
+                'Authorization': `Bearer ${ACCESS_TOKEN}` // Mandatory
+            }
         });
 
         const positions = response.data?.data || [];
-        // Find our Silver contract in the list
+        // Find your Silver contract
         const silverPos = positions.find(p => p.instrument_token === INSTRUMENT_KEY);
 
         if (silverPos && parseInt(silverPos.quantity) !== 0) {
-            // 2. Found an active trade! Force update bot memory
+            // 2. Claim the trade
             const qty = parseInt(silverPos.quantity);
             botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
             botState.entryPrice = parseFloat(silverPos.average_price);
             botState.quantity = Math.abs(qty);
             
-            // 3. Reset the bad PnL history to 0 so only the LIVE trade shows
+            // 3. Clear the bad loss from dashboard
             botState.totalPnL = 0; 
             
-            // 4. Set an immediate safety Stop Loss (3 ATR logic)
-            // This ensures the bot starts trailing immediately
+            // 4. Reset the Trailing Stop to a safe distance
             botState.currentStop = botState.positionType === 'LONG' 
-                ? lastKnownLtp - 1000  // Initial wide stop
-                : lastKnownLtp + 1000;
+                ? lastKnownLtp - 800 
+                : lastKnownLtp + 800;
 
-            console.log(`✅ SYNC SUCCESS: Now tracking ${botState.positionType} from ₹${botState.entryPrice}`);
+            console.log(`✅ SYNC SUCCESS: Tracking ${botState.positionType} from ₹${botState.entryPrice}`);
         } else {
-            console.log("ℹ️ No active position found in Upstox Portfolio.");
+            console.log("ℹ️ No active short-term position found. Resetting state.");
             botState.positionType = null;
             botState.entryPrice = 0;
-            botState.totalPnL = 0; // Clears the -216383 error
+            botState.totalPnL = 0; 
         }
 
         await saveState();
     } catch (e) {
-        console.error("❌ Power Sync Failed:", e.message);
+        // Detailed error for debugging
+        const errorMsg = e.response?.data?.errors?.[0]?.message || e.message;
+        console.error("❌ Power Sync Failed:", errorMsg);
     }
     res.redirect('/');
 });
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Bot Live on ${PORT}`));
