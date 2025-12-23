@@ -40,8 +40,9 @@ function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinut
 function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 525 && m < 1439; }
 
 // --- 🤖 AUTO-LOGIN (MOBILE + TOTP) ---
+// --- 🤖 ROBUST AUTO-LOGIN (Mobile + User ID Support) ---
 async function performAutoLogin() {
-    console.log("🤖 STARTING AUTO-LOGIN (MOBILE FLOW)...");
+    console.log("🤖 STARTING AUTO-LOGIN...");
     let browser = null;
 
     try {
@@ -50,46 +51,76 @@ async function performAutoLogin() {
             algorithm: 'SHA1', digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET)
         });
         const codeOTP = totp.generate();
-        console.log("🔐 Generated TOTP Code.");
+        console.log("🔐 Generated TOTP.");
 
-        // 2. Launch Browser
+        // 2. Launch Browser (Stealth Mode)
         browser = await puppeteer.launch({
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled' // 🕵️‍♂️ Hides that this is a bot
+            ]
         });
         const page = await browser.newPage();
         
-        // Go to Login
+        // Set User Agent (Looks like a real Mac/Windows user)
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+        // 3. Go to Login (Wait up to 60s)
         const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`;
-        await page.goto(loginUrl, { waitUntil: 'networkidle0' });
+        console.log("🌍 Navigating to Upstox...");
+        await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-        // 3. Enter Mobile Number
-        console.log("📱 Entering Mobile Number...");
-        await page.waitForSelector('#mobileNum');
-        await page.type('#mobileNum', UPSTOX_USER_ID); // Ensure this Env Var is your Mobile No
-        await page.click('#getOtp');
+        // 🔍 DIAGNOSTIC: Where are we?
+        const pageTitle = await page.title();
+        console.log(`👀 Page Loaded: "${pageTitle}"`);
 
-        // 4. Enter TOTP (In the OTP field)
-        console.log("🔢 Entering TOTP...");
-        await page.waitForSelector('#otpNum', { visible: true }); // Wait for OTP field to appear
+        // 4. SMART SELECTOR: Check for Mobile OR User ID field
+        // We race two promises to see which field appears first
+        const mobileField = await page.waitForSelector('#mobileNum', { timeout: 10000 }).catch(() => null);
+        const userField = await page.waitForSelector('#userId', { timeout: 1000 }).catch(() => null);
+
+        if (mobileField) {
+            console.log("📱 Detected Mobile Login Screen.");
+            await page.type('#mobileNum', UPSTOX_USER_ID);
+            await page.click('#getOtp');
+        } 
+        else if (userField) {
+            console.log("👤 Detected User ID Login Screen (Unexpected but handling it).");
+            await page.type('#userId', UPSTOX_USER_ID); // Hope UPSTOX_USER_ID is mobile/user compatible
+            // Note: If you are here, the flow might be different, but usually it defaults to Mobile.
+        } 
+        else {
+            // If neither found, print HTML for debugging
+            throw new Error(`Login fields not found! Page Title: ${pageTitle}`);
+        }
+
+        // 5. Enter TOTP (Waiting for OTP field)
+        console.log("🔢 Waiting for OTP field...");
+        await page.waitForSelector('#otpNum', { visible: true, timeout: 30000 });
         await page.type('#otpNum', codeOTP);
         await page.click('#continueBtn');
 
-        // 5. Enter PIN
+        // 6. Enter PIN
         console.log("🔒 Entering PIN...");
-        await page.waitForSelector('#pinCode', { visible: true });
+        await page.waitForSelector('#pinCode', { visible: true, timeout: 30000 });
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        // 6. Capture Auth Code
+        // 7. Capture Auth Code
         console.log("⏳ Waiting for Redirect...");
-        await page.waitForNavigation({ waitUntil: 'networkidle0' });
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 });
         
         const finalUrl = page.url();
+        if (!finalUrl.includes('code=')) {
+            console.log("⚠️ URL at failure: " + finalUrl);
+            throw new Error("Redirected but no Auth Code found!");
+        }
+        
         const authCode = new URL(finalUrl).searchParams.get('code');
 
-        if (!authCode) throw new Error("Login failed. No Auth Code found.");
-
-        // 7. Exchange for Token
+        // 8. Exchange for Token
         console.log("🔄 Exchanging Code for Token...");
         const params = new URLSearchParams();
         params.append('code', authCode);
@@ -115,7 +146,6 @@ async function performAutoLogin() {
         if (browser) await browser.close();
     }
 }
-
 // --- DATA ENGINE ---
 async function getMergedCandles() {
     const today = new Date();
