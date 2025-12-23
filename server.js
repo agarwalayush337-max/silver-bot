@@ -352,7 +352,49 @@ app.get('/', (req, res) => {
 });
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
-app.post('/sync-price', async (req, res) => { if(ACCESS_TOKEN) await verifyOrderStatus(null, 'MANUAL_SYNC'); res.redirect('/'); });
+app.post('/sync-price', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.redirect('/');
 
+    try {
+        console.log("🔄 POWER SYNC: FETCHING PORTFOLIO...");
+        // 1. Fetch real positions from Upstox
+        const response = await axios.get("https://api.upstox.com/v2/portfolio/net-positions", {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        });
+
+        const positions = response.data?.data || [];
+        // Find our Silver contract in the list
+        const silverPos = positions.find(p => p.instrument_token === INSTRUMENT_KEY);
+
+        if (silverPos && parseInt(silverPos.quantity) !== 0) {
+            // 2. Found an active trade! Force update bot memory
+            const qty = parseInt(silverPos.quantity);
+            botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
+            botState.entryPrice = parseFloat(silverPos.average_price);
+            botState.quantity = Math.abs(qty);
+            
+            // 3. Reset the bad PnL history to 0 so only the LIVE trade shows
+            botState.totalPnL = 0; 
+            
+            // 4. Set an immediate safety Stop Loss (3 ATR logic)
+            // This ensures the bot starts trailing immediately
+            botState.currentStop = botState.positionType === 'LONG' 
+                ? lastKnownLtp - 1000  // Initial wide stop
+                : lastKnownLtp + 1000;
+
+            console.log(`✅ SYNC SUCCESS: Now tracking ${botState.positionType} from ₹${botState.entryPrice}`);
+        } else {
+            console.log("ℹ️ No active position found in Upstox Portfolio.");
+            botState.positionType = null;
+            botState.entryPrice = 0;
+            botState.totalPnL = 0; // Clears the -216383 error
+        }
+
+        await saveState();
+    } catch (e) {
+        console.error("❌ Power Sync Failed:", e.message);
+    }
+    res.redirect('/');
+});
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Bot Live on ${PORT}`));
