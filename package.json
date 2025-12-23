@@ -4,7 +4,7 @@
   "description": "Upstox Silver Trading Bot with Real-time Dashboard and V3 TSL",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
     "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
