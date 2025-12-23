@@ -373,21 +373,24 @@ app.post('/sync-price', async (req, res) => {
         const silverPos = positions.find(p => p.instrument_token === INSTRUMENT_KEY);
 
         if (silverPos && parseInt(silverPos.quantity) !== 0) {
-            // 2. Claim the trade
             const qty = parseInt(silverPos.quantity);
             botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
-            botState.entryPrice = parseFloat(silverPos.average_price);
             botState.quantity = Math.abs(qty);
             
-            // 3. Clear the bad loss from dashboard
+            // 🛠️ Updated Pricing Logic: Use buy_price as primary, average_price as fallback
+            const realEntry = parseFloat(silverPos.buy_price) || parseFloat(silverPos.average_price) || 0;
+            botState.entryPrice = realEntry;
+            
+            // Clear the bad loss from dashboard
             botState.totalPnL = 0; 
             
-            // 4. Reset the Trailing Stop to a safe distance
+            // Set Trailing Stop (Ensure it uses the actual LTP)
+            const gap = 800; 
             botState.currentStop = botState.positionType === 'LONG' 
-                ? lastKnownLtp - 800 
-                : lastKnownLtp + 800;
+                ? (lastKnownLtp > 0 ? lastKnownLtp - gap : botState.entryPrice - gap)
+                : (lastKnownLtp > 0 ? lastKnownLtp + gap : botState.entryPrice + gap);
 
-            console.log(`✅ SYNC SUCCESS: Tracking ${botState.positionType} from ₹${botState.entryPrice}`);
+            console.log(`✅ SYNC SUCCESS: Now tracking ${botState.positionType} from ₹${botState.entryPrice}`);
         } else {
             console.log("ℹ️ No active short-term position found. Resetting state.");
             botState.positionType = null;
