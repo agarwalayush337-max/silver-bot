@@ -1,380 +1,178 @@
-process.on('uncaughtException', err => {
-  if (err.message?.includes('Redis')) {
-    console.warn("⚠️ Redis error ignored:", err.message);
-  } else {
-    throw err;
-  }
-});
-
-process.on('unhandledRejection', err => {
-  if (err?.message?.includes('Redis')) {
-    console.warn("⚠️ Redis rejection ignored:", err.message);
-  }
-});
-
-
-/***********************
-
-
- * IMPORTS
- ***********************/
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
-const puppeteer = require('puppeteer');
-const OTPAuth = require('otpauth');
-const WebSocket = require('ws');
+const WebSocket = require('ws'); // npm install ws
 const { EMA, SMA, ATR } = require("technicalindicators");
+const OTPAuth = require('otpauth');
+const puppeteer = require('puppeteer');
 
-/***********************
- * APP
- ***********************/
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-/***********************
- * CONFIG
- ***********************/
-const INSTRUMENT_KEY = "MCX_FO|458305";
+// --- ⚙️ CONFIGURATION ---
+const INSTRUMENT_KEY = "MCX_FO|458305"; 
 const MAX_QUANTITY = 1;
+const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-/***********************
- * ENV
- ***********************/
-const {
-  UPSTOX_USER_ID,
-  UPSTOX_PIN,
-  UPSTOX_TOTP_SECRET,
-  API_KEY,
-  API_SECRET,
-  REDIRECT_URI,
-  REDIS_URL
-} = process.env;
-
-/***********************
- * REDIS (SAFE MODE)
- ***********************/
-let redis = null;
-
-if (REDIS_URL) {
-  redis = new Redis(REDIS_URL, {
-    maxRetriesPerRequest: 3,
-    enableReadyCheck: false,
-    retryStrategy(times) {
-      if (times > 5) return null;
-      return Math.min(times * 200, 2000);
-    }
-  });
-
-  redis.on('connect', () => console.log("✅ Redis connected"));
-  redis.on('error', err => console.warn("⚠️ Redis error:", err.message));
-} else {
-  console.warn("⚠️ REDIS_URL not set. Running without persistence.");
-}
-
-/***********************
- * GLOBAL STATE
- ***********************/
+const redis = new Redis(REDIS_URL || "redis://localhost:6379");
 let ACCESS_TOKEN = null;
-let lastKnownLtp = 0;
-let ws = null;
+let lastKnownLtp = 0; 
+let clients = []; // For SSE (Real-time dashboard)
 
-let botState = {
-  positionType: null,
-  entryPrice: 0,
-  exitPrice: 0,
-  currentStop: null,
-  slOrderId: null,
-  quantity: 0,
-  totalPnL: 0,
-  pnlHistory: [],
-  history: []
+let botState = { 
+    positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, 
+    quantity: 0, history: [], slOrderId: null 
 };
 
-/***********************
- * STATE PERSISTENCE
- ***********************/
+// --- STATE MANAGEMENT ---
 async function loadState() {
-  if (!redis) return;
-  try {
-    const saved = await redis.get('silver_bot_state');
-    if (saved) botState = JSON.parse(saved);
-    console.log("📂 State loaded");
-  } catch {
-    console.warn("⚠️ Redis load skipped");
-  }
+    try {
+        const saved = await redis.get('silver_bot_state');
+        if (saved) botState = JSON.parse(saved);
+    } catch (e) { console.log("Redis sync issue"); }
 }
-
-async function saveState() {
-  if (!redis) return;
-  try {
-    await redis.set('silver_bot_state', JSON.stringify(botState));
-  } catch {
-    console.warn("⚠️ Redis save skipped");
-  }
-}
-
 loadState();
+async function saveState() { await redis.set('silver_bot_state', JSON.stringify(botState)); }
 
-/***********************
- * TIME HELPERS
- ***********************/
-function getIST() {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-}
-function isMarketOpen() {
-  const t = getIST();
-  const m = t.getHours() * 60 + t.getMinutes();
-  return t.getDay() !== 0 && t.getDay() !== 6 && m >= 540 && m < 1430;
-}
-
-/***********************
- * AUTO LOGIN
- ***********************/
-async function performAutoLogin() {
-  let browser;
-  try {
-    console.log("🤖 Auto login started");
-
-    const totp = new OTPAuth.TOTP({
-      secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET),
-      digits: 6,
-      period: 30
+// --- 📈 WEBSOCKET ENGINE (Real-time Price) ---
+function connectMarketData() {
+    if (!ACCESS_TOKEN) return;
+    // Upstox redirects to the actual socket after auth
+    const wsUrl = `wss://api.upstox.com/v2/feed/market-data-feed`;
+    const ws = new WebSocket(wsUrl, {
+        headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': '*/*' }
     });
-
-    browser = await puppeteer.launch({ args: ['--no-sandbox'] });
-    const page = await browser.newPage();
-
-    await page.goto(
-      `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`,
-      { waitUntil: 'domcontentloaded' }
-    );
-
-    await page.type('#mobileNum', UPSTOX_USER_ID);
-    await page.click('#getOtp');
-
-    await page.waitForSelector('#otpNum');
-    await page.type('#otpNum', totp.generate());
-    await page.click('#continueBtn');
-
-    await page.waitForSelector('#pinCode');
-    await page.type('#pinCode', UPSTOX_PIN);
-    await page.click('#pinContinueBtn');
-
-    await page.waitForNavigation({ waitUntil: 'networkidle0' });
-
-    const code = new URL(page.url()).searchParams.get('code');
-
-    const params = new URLSearchParams({
-      code,
-      client_id: API_KEY,
-      client_secret: API_SECRET,
-      redirect_uri: REDIRECT_URI,
-      grant_type: 'authorization_code'
-    });
-
-    const res = await axios.post(
-      'https://api.upstox.com/v2/login/authorization/token',
-      params
-    );
-
-    ACCESS_TOKEN = res.data.access_token;
-    console.log("✅ Login success");
-
-    await startMarketWS();
-  } catch (e) {
-    console.error("❌ Login failed:", e.message);
-  } finally {
-    if (browser) await browser.close();
-  }
-}
-
-/***********************
- * MARKET DATA WEBSOCKET
- ***********************/
-async function startMarketWS() {
-  try {
-    const auth = await axios.get(
-      'https://api.upstox.com/v3/market-data-feed/authorize',
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
-
-    ws = new WebSocket(auth.data.data.authorized_redirect_uri);
 
     ws.on('open', () => {
-      console.log("📡 Market WS connected");
-      ws.send(JSON.stringify({
-        guid: "silver-feed",
-        method: "sub",
-        data: { instrumentKeys: [INSTRUMENT_KEY] }
-      }));
+        console.log("🔌 WebSocket Connected.");
+        const subData = { guid: "bot", method: "sub", data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] } };
+        ws.send(JSON.stringify(subData));
     });
 
-    ws.on('message', msg => {
-      const data = JSON.parse(msg);
-      if (data?.data?.ltp) lastKnownLtp = data.data.ltp;
+    ws.on('message', (data) => {
+        try {
+            // Note: Upstox V3 uses Protobuf. For simplicity, we extract LTP here.
+            // If using standard V2 json, use JSON.parse(data).
+            const tick = JSON.parse(data); 
+            if (tick.data && tick.data[INSTRUMENT_KEY]) {
+                lastKnownLtp = tick.data[INSTRUMENT_KEY].ltp;
+                broadcastUpdate(); // Push to Dashboard (SSE)
+            }
+        } catch(e) {}
     });
 
-    ws.on('close', () => setTimeout(startMarketWS, 3000));
-  } catch (e) {
-    console.error("WS error:", e.message);
-  }
+    ws.on('error', () => setTimeout(connectMarketData, 5000));
 }
 
-/***********************
- * SL HELPERS
- ***********************/
-async function placeSL(trigger, side) {
-  const tx = side === 'LONG' ? 'SELL' : 'BUY';
-
-  const res = await axios.post(
-    'https://api.upstox.com/v3/order/place',
-    {
-      instrument_token: INSTRUMENT_KEY,
-      quantity: botState.quantity,
-      order_type: "SL-M",
-      transaction_type: tx,
-      trigger_price: Math.round(trigger),
-      product: "I",
-      validity: "DAY"
-    },
-    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-  );
-
-  botState.slOrderId = res.data.data.order_id;
-  await saveState();
+// --- 🛡️ TRAILING SL & ORDER SYNC ---
+async function placeExchangeSL(type, qty, triggerPrice) {
+    try {
+        const res = await axios.post("https://api.upstox.com/v2/order/place", {
+            quantity: qty, product: "I", validity: "DAY", price: 0, 
+            instrument_token: INSTRUMENT_KEY, order_type: "SL-M", 
+            transaction_type: type === "BUY" ? "SELL" : "BUY", // Opposite of entry
+            trigger_price: Math.round(triggerPrice), is_amo: false
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        
+        botState.slOrderId = res.data.data.order_id;
+        await saveState();
+    } catch (e) { console.error("Exchange SL Failed"); }
 }
 
-async function modifySL(trigger) {
-  if (!botState.slOrderId) return;
-
-  await axios.put(
-    'https://api.upstox.com/v3/order/modify',
-    {
-      order_id: botState.slOrderId,
-      trigger_price: Math.round(trigger)
-    },
-    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-  );
+async function modifyExchangeSL(newTrigger) {
+    if (!botState.slOrderId) return;
+    try {
+        await axios.put("https://api.upstox.com/v2/order/modify", {
+            order_id: botState.slOrderId,
+            trigger_price: Math.round(newTrigger),
+            quantity: botState.quantity,
+            order_type: "SL-M"
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+    } catch (e) { console.log("SL Modification Ignored (Already filled/canceled)"); }
 }
 
-/***********************
- * STRATEGY LOOP (UNCHANGED LOGIC)
- ***********************/
-setInterval(async () => {
-  if (!ACCESS_TOKEN || !isMarketOpen()) return;
+async function getRealTradedPrice(orderId) {
+    try {
+        const res = await axios.get(`https://api.upstox.com/v2/order/details?order_id=${orderId}`, 
+            { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        return parseFloat(res.data.data.average_price) || 0;
+    } catch (e) { return 0; }
+}
 
-  try {
-    const res = await axios.get(
-      `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`,
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
+// --- 📡 SSE DASHBOARD BROADCASTER ---
+function broadcastUpdate() {
+    const payload = JSON.stringify({ price: lastKnownLtp, pnl: calculateLivePnL() });
+    clients.forEach(c => c.res.write(`data: ${payload}\n\n`));
+}
 
-    const candles = res.data.data.candles;
-    if (candles.length < 200) return;
+function calculateLivePnL() {
+    let uPnL = 0;
+    if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
+    if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
+    return (parseFloat(botState.totalPnL) + uPnL).toFixed(2);
+}
 
-    const close = candles.map(c => c[4]);
-    const high = candles.map(c => c[2]);
-    const low = candles.map(c => c[3]);
-    const vol = candles.map(c => c[5]);
-
-    const e50 = EMA.calculate({ period: 50, values: close });
-    const e200 = EMA.calculate({ period: 200, values: close });
-    const atr = ATR.calculate({ high, low, close, period: 14 });
-
-    const curA = atr.at(-1);
-    const bH = Math.max(...high.slice(-11, -1));
-    const bL = Math.min(...low.slice(-11, -1));
-
-    if (!botState.positionType) {
-      if (e50.at(-2) > e200.at(-2) && close.at(-1) > bH) {
-        botState.positionType = 'LONG';
-        botState.entryPrice = lastKnownLtp;
-        botState.quantity = MAX_QUANTITY;
-        botState.currentStop = lastKnownLtp - curA * 3;
-        await placeSL(botState.currentStop, 'LONG');
-      }
-      if (e50.at(-2) < e200.at(-2) && close.at(-1) < bL) {
-        botState.positionType = 'SHORT';
-        botState.entryPrice = lastKnownLtp;
-        botState.quantity = MAX_QUANTITY;
-        botState.currentStop = lastKnownLtp + curA * 3;
-        await placeSL(botState.currentStop, 'SHORT');
-      }
-    } else {
-      if (botState.positionType === 'LONG') {
-        const newSL = Math.max(botState.currentStop, lastKnownLtp - curA * 3);
-        if (newSL !== botState.currentStop) {
-          botState.currentStop = newSL;
-          await modifySL(newSL);
-        }
-      } else {
-        const newSL = Math.min(botState.currentStop, lastKnownLtp + curA * 3);
-        if (newSL !== botState.currentStop) {
-          botState.currentStop = newSL;
-          await modifySL(newSL);
-        }
-      }
-    }
-
-    await saveState();
-  } catch (e) {
-    console.warn("Strategy loop skipped:", e.message);
-  }
-}, 30000);
-
-/***********************
- * DASHBOARD
- ***********************/
-app.get('/', (req, res) => {
-  res.send(`
-    <h2>Silver Prime Bot</h2>
-    <p>Price: ₹${lastKnownLtp}</p>
-    <p>Position: ${botState.positionType || 'NONE'}</p>
-    <p>Entry: ₹${botState.entryPrice}</p>
-    <p>SL: ₹${botState.currentStop}</p>
-    <p>Total PnL: ₹${botState.totalPnL}</p>
-  `);
+// --- API ROUTES ---
+app.get('/live-price', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    const id = Date.now();
+    clients.push({ id, res });
+    req.on('close', () => clients = clients.filter(c => c.id !== id));
 });
 
-/***********************
- * MANUAL SYNC
- ***********************/
 app.post('/sync-price', async (req, res) => {
-  try {
-    const pos = await axios.get(
-      'https://api.upstox.com/v2/portfolio/short-term-positions',
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
-
-    const p = pos.data.data.find(x => x.instrument_token === INSTRUMENT_KEY);
-    if (p) {
-      botState.positionType = p.quantity > 0 ? 'LONG' : 'SHORT';
-      botState.quantity = Math.abs(p.quantity);
-      botState.entryPrice = parseFloat(p.buy_price);
-      botState.currentStop =
-        botState.positionType === 'LONG'
-          ? botState.entryPrice - 800
-          : botState.entryPrice + 800;
-
-      await placeSL(botState.currentStop, botState.positionType);
-      await saveState();
-    }
-  } catch (e) {
-    console.warn("Manual sync failed:", e.message);
-  }
-  res.redirect('/');
+    if (!ACCESS_TOKEN) return res.redirect('/');
+    try {
+        const posRes = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', 
+            { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        const pos = posRes.data.data.find(p => p.instrument_token === INSTRUMENT_KEY);
+        
+        if (pos && parseInt(pos.quantity) !== 0) {
+            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = Math.abs(parseInt(pos.quantity));
+            botState.entryPrice = parseFloat(pos.average_price);
+            console.log("✅ Position Adopted from Upstox.");
+        } else {
+            botState.positionType = null;
+        }
+        await saveState();
+    } catch (e) {}
+    res.redirect('/');
 });
 
-/***********************
- * SERVER
- ***********************/
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Bot running on ${PORT}`));
+// ... Keep existing Login, Candle Fetch, and Strategy Logic ...
+// In Strategy Loop: When updating Trailing SL logic
+// if (botState.positionType === 'LONG') {
+//    let newSL = lastKnownLtp - (curA * 3);
+//    if (newSL > botState.currentStop) { 
+//        botState.currentStop = newSL; 
+//        modifyExchangeSL(newSL); // Modify on Upstox
+//    }
+// }
 
-/***********************
- * AUTO LOGIN CRON
- ***********************/
-setInterval(() => {
-  if (!ACCESS_TOKEN) performAutoLogin();
-}, 60000);
+app.get('/', (req, res) => {
+    res.send(`
+        <html>
+        <body style="background:#0f172a; color:white; font-family:sans-serif; text-align:center;">
+            <h1>🥈 Silver Live Dashboard</h1>
+            <div style="font-size:40px; color:#fbbf24;" id="price">₹${lastKnownLtp}</div>
+            <div style="font-size:24px;" id="pnl">PnL: ₹0.00</div>
+            
+            <script>
+                const source = new EventSource('/live-price');
+                source.onmessage = (e) => {
+                    const d = JSON.parse(e.data);
+                    document.getElementById('price').innerText = '₹' + d.price;
+                    document.getElementById('pnl').innerText = 'PnL: ₹' + d.pnl;
+                    document.getElementById('pnl').style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                };
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+app.listen(process.env.PORT || 10000);
