@@ -230,18 +230,46 @@ setInterval(async () => {
                         await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
+                    // Helper to modify SL on exchange
+                    async function syncExchangeSL(newTrigger) {
+                        if (!botState.slOrderId) return;
+                        try {
+                            await axios.put("https://api.upstox.com/v2/order/modify", {
+                                order_id: botState.slOrderId,
+                                trigger_price: Math.round(newTrigger),
+                                quantity: botState.quantity,
+                                order_type: "SL-M"
+                            }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } });
+                        } catch (e) { console.log("SL Sync Failed or Order filled"); }
+                    }
+                    
+                    // Inside your loop
                     if (botState.positionType === 'LONG') {
-                        botState.currentStop = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
-                        if (lastKnownLtp < botState.currentStop) {
-                            console.log("🛑 STOP HIT (LONG)");
-                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
-                            await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                        let newStop = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
+                        if (newStop > botState.currentStop) {
+                            botState.currentStop = newStop;
+                            await syncExchangeSL(newStop); // 🛡️ Sends modification to Upstox
                         }
+                    }
                     } else {
                         botState.currentStop = Math.min(lastKnownLtp + (curA * 3), botState.currentStop || 999999);
                         if (lastKnownLtp > botState.currentStop) {
                             console.log("🛑 STOP HIT (SHORT)");
-                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
+                            // 1. Update verification to get exact traded price
+                            async function finalizeTrade(orderId) {
+                                const res = await axios.get(`https://api.upstox.com/v2/order/details?order_id=${orderId}`, 
+                                    { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } });
+                                const tradePrice = parseFloat(res.data.data.average_price);
+                                
+                                // 2. Save to Historical PnL
+                                const tradeResult = {
+                                    exitPrice: tradePrice,
+                                    pnl: (tradePrice - botState.entryPrice) * botState.quantity,
+                                    time: getIST().toLocaleString()
+                                };
+                                await redis.lpush('silver_trade_history', JSON.stringify(tradeResult));
+                                return tradePrice;
+                            }
                             await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
                         }
                     }
@@ -251,20 +279,35 @@ setInterval(async () => {
     } catch (e) { if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } }
 }, 30000);
 
-// --- NEW FAST PRICE LOOP (Runs every 2s for Dashboard only) ---
-// This keeps the dashboard live without overloading the heavy calculation engine
-setInterval(async () => {
-    if (!ACCESS_TOKEN || !isMarketOpen()) return;
-    try {
-        // Fetch just the lightweight Quote data
-        const res = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
-        });
-        if(res.data?.data?.[INSTRUMENT_KEY]?.last_price) {
-            lastKnownLtp = res.data.data[INSTRUMENT_KEY].last_price;
+const { MarketDataStreamerV3 } = require('upstox-js-sdk');
+let sseClients = []; // Store active dashboard connections
+
+// 🚀 Start WebSocket for real-time data
+async function initWebSocket() {
+    if (!ACCESS_TOKEN) return;
+    const streamer = new MarketDataStreamerV3();
+    const result = await streamer.connect(ACCESS_TOKEN);
+    streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+    
+    streamer.on('data', (data) => {
+        if (data && data[INSTRUMENT_KEY]) {
+            lastKnownLtp = data[INSTRUMENT_KEY].ltp;
+            // Push only the change to active dashboard clients
+            const update = JSON.stringify({ price: lastKnownLtp, pnl: calculateLivePnL() });
+            sseClients.forEach(c => c.res.write(`data: ${update}\n\n`));
         }
-    } catch(e) {}
-}, 2000); // Check price every 2 seconds
+    });
+}
+
+// Add this route to your API section
+app.get('/stream-price', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    const id = Date.now();
+    sseClients.push({ id, res });
+    req.on('close', () => sseClients = sseClients.filter(c => c.id !== id));
+});
 
 // --- API FOR FRONTEND ---
 app.get('/price', (req, res) => {
@@ -297,18 +340,14 @@ app.get('/', (req, res) => {
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <script>
-                // ⚡ LIVE PRICE UPDATER SCRIPT
-                setInterval(() => {
-                    fetch('/price')
-                        .then(r => r.json())
-                        .then(d => {
-                            document.getElementById('live-price').innerText = '₹' + d.price;
-                            const pnlEl = document.getElementById('live-pnl');
-                            pnlEl.innerText = '₹' + d.pnl;
-                            pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
-                        })
-                        .catch(e => console.log('Connection lost'));
-                }, 1000); // 1 Second Refresh Rate
+                const source = new EventSource('/stream-price');
+                source.onmessage = (e) => {
+                    const d = JSON.parse(e.data);
+                    document.getElementById('live-price').innerText = '₹' + d.price;
+                    const pnlEl = document.getElementById('live-pnl');
+                    pnlEl.innerText = '₹' + d.pnl;
+                    pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                };
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
@@ -373,9 +412,16 @@ app.post('/sync-price', async (req, res) => {
         const silverPos = positions.find(p => p.instrument_token === INSTRUMENT_KEY);
 
         if (silverPos && parseInt(silverPos.quantity) !== 0) {
-            const qty = parseInt(silverPos.quantity);
-            botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(qty);
+            // ... your existing sync logic ...
+            
+            // 🆕 Add: If no SL exists for this manual trade, create one
+            if (!botState.slOrderId) {
+                const side = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
+                const slPrice = botState.positionType === 'LONG' ? (lastKnownLtp - 800) : (lastKnownLtp + 800);
+                botState.slOrderId = await placeOrder(side, botState.quantity, slPrice, "SL-M");
+            }
+            console.log("✅ Manual Trade Adopted and Protected with SL.");
+        }
             
             // 🛠️ Updated Pricing Logic: Use buy_price as primary, average_price as fallback
             const realEntry = parseFloat(silverPos.buy_price) || parseFloat(silverPos.average_price) || 0;
