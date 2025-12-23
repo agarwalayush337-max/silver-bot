@@ -4,11 +4,11 @@ const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
-const { MarketDataStreamerV3 } = require('upstox-js-sdk'); // 🆕 Added for Real-time
+const { MarketDataStreamerV3 } = require('upstox-js-sdk'); // 🆕 Added
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json()); // 🆕 Added to handle JSON payloads
+app.use(express.json()); // 🆕 Added for internal JSON handling
 
 // --- ⚙️ CONFIGURATION ---
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
@@ -17,11 +17,12 @@ const MAX_QUANTITY = 1;
 // --- 🔒 ENVIRONMENT VARIABLES ---
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null }); // 🆕 Added retry protection
+// 🆕 Modified Redis with retry protection for Render
+const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
 
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
-let sseClients = []; // 🆕 Added for Real-time Dashboard
+let sseClients = []; // 🆕 Added for Real-time SSE
 let botState = { 
     positionType: null, 
     entryPrice: 0, 
@@ -29,7 +30,7 @@ let botState = {
     totalPnL: 0, 
     quantity: 0, 
     history: [],
-    slOrderId: null // 🆕 Track Exchange SL Order
+    slOrderId: null // 🆕 Added to track Exchange SL
 };
 
 // --- STATE MANAGEMENT ---
@@ -50,7 +51,7 @@ function formatDate(date) { return date.toISOString().split('T')[0]; }
 function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; }
 function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; }
 
-// 🆕 Added Real-time PnL Calculation
+// 🆕 Real-time PnL Calculation Helper
 function calculateLivePnL() {
     let uPnL = 0;
     if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
@@ -58,14 +59,20 @@ function calculateLivePnL() {
     return (parseFloat(botState.totalPnL) + uPnL).toFixed(2);
 }
 
-// 🆕 Added Real-time Dashboard Broadcaster
+// 🆕 Push real-time data to SSE clients
 function pushToDashboard() {
-    const data = JSON.stringify({ price: lastKnownLtp, pnl: calculateLivePnL(), stop: botState.currentStop });
+    const data = JSON.stringify({ 
+        price: lastKnownLtp, 
+        pnl: calculateLivePnL(), 
+        stop: botState.currentStop,
+        status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE"
+    });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
 }
 
 // --- 🆕 UPSTOX EXCHANGE SL MANAGEMENT ---
 async function manageExchangeSL(side, qty, triggerPrice) {
+    if(!ACCESS_TOKEN) return;
     try {
         if (botState.slOrderId) {
             await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
@@ -103,7 +110,6 @@ async function initWebSocket() {
         streamer.on('data', (data) => {
             if (data && data[INSTRUMENT_KEY]) {
                 lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                console.log(`Live Price: ${lastKnownLtp}`);
                 pushToDashboard();
             }
         });
@@ -120,6 +126,7 @@ async function performAutoLogin() {
         console.log("🔐 Generated TOTP.");
 
         browser = await puppeteer.launch({
+            headless: "new",
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
         });
         const page = await browser.newPage();
@@ -127,12 +134,9 @@ async function performAutoLogin() {
 
         const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`;
         console.log("🌍 Navigating to Upstox...");
-        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 90000 });
 
-        const mobileInput = await page.$('#mobileNum');
-        if (!mobileInput) throw new Error("Login Page Not Loaded");
-
-        console.log("📱 Detected Login Screen. Typing Credentials...");
+        await page.waitForSelector('#mobileNum', { timeout: 10000 });
         await page.type('#mobileNum', UPSTOX_USER_ID);
         await page.click('#getOtp');
         
@@ -144,7 +148,7 @@ async function performAutoLogin() {
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 });
+        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 90000 });
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
@@ -163,7 +167,7 @@ async function performAutoLogin() {
         
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
         await saveState();
-        initWebSocket(); // 🆕 Start Websocket after login
+        initWebSocket(); // 🆕 Start WS
 
     } catch (e) { console.error("❌ Auto-Login Failed:", e.message); } 
     finally { if (browser) await browser.close(); }
@@ -239,7 +243,7 @@ async function placeOrder(type, qty, ltp) {
         let orderId = res.data?.data?.order_id || 'PENDING_ID';
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type, price: limitPrice, id: orderId, status: "SENT" });
         
-        // 🆕 Place Exchange-Side SL Order
+        // 🆕 Place Stop Loss on Exchange side
         const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
         await manageExchangeSL(type, qty, slPrice);
 
@@ -252,7 +256,13 @@ async function placeOrder(type, qty, ltp) {
     }
 }
 
-// TRADING LOOP
+// --- CRON & ENGINE ---
+setInterval(() => {
+    const now = getIST();
+    if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
+}, 60000);
+
+// TRADING LOOP (Runs every 30s)
 setInterval(async () => {
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
     try {
@@ -278,20 +288,20 @@ setInterval(async () => {
                     }
                 } else {
                     if (botState.positionType === 'LONG') {
-                        let newStop = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
-                        if (newStop > botState.currentStop) {
-                            botState.currentStop = newStop;
-                            await modifyExchangeSL(newStop); // 🆕 Modify SL on Upstox
+                        let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
+                        if (ns > botState.currentStop) {
+                            botState.currentStop = ns;
+                            await modifyExchangeSL(ns); // 🆕 Modify SL on Exchange
                         }
                         if (lastKnownLtp < botState.currentStop) {
                             botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
                             await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
                         }
                     } else {
-                        let newStop = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
-                        if (newStop < botState.currentStop) {
-                            botState.currentStop = newStop;
-                            await modifyExchangeSL(newStop); // 🆕 Modify SL on Upstox
+                        let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
+                        if (ns < botState.currentStop) {
+                            botState.currentStop = ns;
+                            await modifyExchangeSL(ns); // 🆕 Modify SL on Exchange
                         }
                         if (lastKnownLtp > botState.currentStop) {
                             botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
@@ -304,7 +314,7 @@ setInterval(async () => {
     } catch (e) { if(e.response?.status===401) performAutoLogin(); }
 }, 30000);
 
-// --- 📡 API & DASHBOARD ---
+// --- 📡 API & LIVE DASHBOARD ---
 
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -340,6 +350,9 @@ app.get('/', (req, res) => {
                     pnlEl.innerText = '₹' + d.pnl;
                     pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
+                    const stat = document.getElementById('live-status');
+                    stat.innerText = d.status;
+                    stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
                 };
             </script>
         </head>
@@ -358,12 +371,20 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
                     </div>
                 </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
+                    </div>
+                </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
-                <div id="logContent">${historyHTML || '<p style="text-align:center; color:#64748b;">No trades yet.</p>'}</div>
+                <div id="logContent">${historyHTML}</div>
             </div>
         </body></html>`);
 });
@@ -379,10 +400,10 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = Math.abs(parseInt(pos.quantity));
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             botState.totalPnL = 0;
-            // 🆕 Auto-Create SL for Manual Trade
-            const slSide = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
+            // 🆕 Protect manual trade with Exchange SL
+            const side = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
             const slPrice = botState.positionType === 'LONG' ? (lastKnownLtp - 800) : (lastKnownLtp + 800);
-            await manageExchangeSL(slSide, botState.quantity, slPrice);
+            await manageExchangeSL(side, botState.quantity, slPrice);
         } else { botState.positionType = null; }
         await saveState();
     } catch (e) { console.error("Sync Error", e.message); }
@@ -390,4 +411,4 @@ app.post('/sync-price', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
