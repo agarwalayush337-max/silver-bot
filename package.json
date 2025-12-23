@@ -12,10 +12,7 @@
     "ioredis": "^5.3.2",
     "technicalindicators": "^3.1.0",
     "puppeteer": "latest",
-    "otpauth": "^9.1.4",
-    "ws": "^8.14.2",
-    "protobufjs": "^7.2.5",
-    "upstox-js-sdk": "^2.3.1"
+    "otpauth": "^9.1.4"
   },
   "engines": {
     "node": ">=18.0.0"
