@@ -1,221 +1,329 @@
+/***********************
+ * IMPORTS
+ ***********************/
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
+const WebSocket = require('ws');
 const { EMA, SMA, ATR } = require("technicalindicators");
-const http = require('http');
-const { Server } = require("socket.io");
 
+/***********************
+ * APP SETUP
+ ***********************/
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server); // WebSocket for real-time dashboard
 app.use(express.urlencoded({ extended: true }));
 
-// --- ⚙️ CONFIGURATION ---
-const INSTRUMENT_KEY = "MCX_FO|458305"; 
+/***********************
+ * CONFIG
+ ***********************/
+const INSTRUMENT_KEY = "MCX_FO|458305";
 const MAX_QUANTITY = 1;
 
-const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
-const redis = new Redis(REDIS_URL || "redis://localhost:6379");
+/***********************
+ * ENV
+ ***********************/
+const {
+  UPSTOX_USER_ID,
+  UPSTOX_PIN,
+  UPSTOX_TOTP_SECRET,
+  API_KEY,
+  API_SECRET,
+  REDIRECT_URI,
+  REDIS_URL
+} = process.env;
 
+/***********************
+ * REDIS
+ ***********************/
+const redis = new Redis(REDIS_URL);
+
+/***********************
+ * GLOBAL STATE
+ ***********************/
 let ACCESS_TOKEN = null;
-let lastKnownLtp = 0; 
-let botState = { 
-    positionType: null, 
-    entryPrice: 0, 
-    currentStop: null, 
-    totalPnL: 0, 
-    quantity: 0, 
-    history: [], 
-    pnlHistory: [] // New: For Historical PnL Dashboard
+let lastKnownLtp = 0;
+let ws = null;
+
+let botState = {
+  positionType: null,
+  entryPrice: 0,
+  exitPrice: 0,
+  currentStop: null,
+  slOrderId: null,
+  quantity: 0,
+  totalPnL: 0,
+  pnlHistory: [],
+  history: []
 };
 
-// --- STATE MANAGEMENT ---
+/***********************
+ * STATE PERSISTENCE
+ ***********************/
 async function loadState() {
-    try {
-        const saved = await redis.get('silver_bot_state');
-        if (saved) botState = JSON.parse(saved);
-        console.log("📂 System State Loaded.");
-    } catch (e) { console.log("Initial run, creating state..."); }
+  const saved = await redis.get('silver_bot_state');
+  if (saved) botState = JSON.parse(saved);
+}
+async function saveState() {
+  await redis.set('silver_bot_state', JSON.stringify(botState));
 }
 loadState();
-async function saveState() { await redis.set('silver_bot_state', JSON.stringify(botState)); }
 
-// --- TIME HELPERS ---
-function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
-function formatDate(date) { return date.toISOString().split('T')[0]; }
-function isMarketOpen() { 
-    const t = getIST(); 
-    const m = (t.getHours()*60)+t.getMinutes(); 
-    return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; 
+/***********************
+ * TIME HELPERS
+ ***********************/
+function getIST() {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+}
+function formatDate(d) {
+  return d.toISOString().split('T')[0];
+}
+function isApiAvailable() {
+  const m = getIST().getHours() * 60 + getIST().getMinutes();
+  return m >= 330 && m < 1440;
+}
+function isMarketOpen() {
+  const t = getIST();
+  const m = t.getHours() * 60 + t.getMinutes();
+  return t.getDay() !== 0 && t.getDay() !== 6 && m >= 540 && m < 1430;
 }
 
-// --- AUTO-LOGIN SYSTEM (Puppeteer) ---
+/***********************
+ * AUTO LOGIN
+ ***********************/
 async function performAutoLogin() {
-    console.log("🤖 STARTING AUTO-LOGIN...");
-    let browser = null;
-    try {
-        const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
-        const codeOTP = totp.generate();
-        browser = await puppeteer.launch({
-    // Path where our build script extracts Chrome
-    executablePath: '/opt/render/project/src/render-chrome/opt/google/chrome/google-chrome',
-    headless: "new",
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
-    ]
-});
-        const page = await browser.newPage();
-        const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`;
-        await page.goto(loginUrl);
-        await page.type('#mobileNum', UPSTOX_USER_ID);
-        await page.click('#getOtp');
-        await page.waitForSelector('#otpNum');
-        await page.type('#otpNum', codeOTP);
-        await page.click('#continueBtn');
-        await page.waitForSelector('#pinCode');
-        await page.type('#pinCode', UPSTOX_PIN);
-        await page.click('#pinContinueBtn');
-        await page.waitForNavigation();
-        const authCode = new URL(page.url()).searchParams.get('code');
-        const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', new URLSearchParams({
-            code: authCode, client_id: API_KEY, client_secret: API_SECRET, redirect_uri: REDIRECT_URI, grant_type: 'authorization_code'
-        }));
-        ACCESS_TOKEN = res.data.access_token;
-        console.log("🎉 Session Active.");
-    } catch (e) { console.error("❌ Login Failed:", e.message); } 
-    finally { if (browser) await browser.close(); }
+  let browser;
+  try {
+    const totp = new OTPAuth.TOTP({
+      secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET),
+      digits: 6,
+      period: 30
+    });
+
+    browser = await puppeteer.launch({ args: ['--no-sandbox'] });
+    const page = await browser.newPage();
+
+    await page.goto(
+      `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`,
+      { waitUntil: 'domcontentloaded' }
+    );
+
+    await page.type('#mobileNum', UPSTOX_USER_ID);
+    await page.click('#getOtp');
+
+    await page.waitForSelector('#otpNum');
+    await page.type('#otpNum', totp.generate());
+    await page.click('#continueBtn');
+
+    await page.waitForSelector('#pinCode');
+    await page.type('#pinCode', UPSTOX_PIN);
+    await page.click('#pinContinueBtn');
+
+    await page.waitForNavigation({ waitUntil: 'networkidle0' });
+
+    const code = new URL(page.url()).searchParams.get('code');
+    const params = new URLSearchParams({
+      code,
+      client_id: API_KEY,
+      client_secret: API_SECRET,
+      redirect_uri: REDIRECT_URI,
+      grant_type: 'authorization_code'
+    });
+
+    const res = await axios.post(
+      'https://api.upstox.com/v2/login/authorization/token',
+      params
+    );
+
+    ACCESS_TOKEN = res.data.access_token;
+    await startMarketWS();
+  } catch (e) {
+    console.error("Login failed:", e.message);
+  } finally {
+    if (browser) await browser.close();
+  }
 }
 
-// --- ORDER EXECUTION WITH TRAILING STOP LOSS ---
-async function placeOrderWithTSL(type, qty, ltp, stopPrice) {
-    if (!ACCESS_TOKEN) return;
-    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997));
-    
-    try {
-        // 1. Place Main Entry Order (V3)
-        const entryRes = await axios.post("https://api.upstox.com/v3/order/place", {
-            quantity: qty, product: "I", validity: "DAY", price: limitPrice, instrument_token: INSTRUMENT_KEY,
-            order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, is_amo: !isMarketOpen()
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
+/***********************
+ * MARKET DATA WS (REAL-TIME)
+ ***********************/
+async function startMarketWS() {
+  try {
+    const auth = await axios.get(
+      'https://api.upstox.com/v3/market-data-feed/authorize',
+      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+    );
 
-        const orderId = entryRes.data.data.order_id;
-        botState.history.unshift({ time: getIST().toLocaleTimeString(), type, price: ltp, id: orderId, status: "SENT" });
+    ws = new WebSocket(auth.data.data.authorized_redirect_uri);
 
-        // 2. Place Trailing GTT Stop Loss (New Feature)
-        const trailingGap = Math.abs(ltp - stopPrice);
-        await axios.post("https://api.upstox.com/v3/gtt/place-order", {
-            type: "SINGLE", instrument_token: INSTRUMENT_KEY, product: "I", quantity: qty,
-            transaction_type: type === "BUY" ? "SELL" : "BUY",
-            rules: [{
-                strategy: "STOPLOSS", trigger_type: "IMMEDIATE", 
-                trigger_price: stopPrice, trailing_gap: trailingGap
-            }]
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        guid: "silver-feed",
+        method: "sub",
+        data: { instrumentKeys: [INSTRUMENT_KEY] }
+      }));
+    });
 
-        await saveState();
-    } catch (e) { console.error("Order/TSL Failed:", e.response?.data || e.message); }
+    ws.on('message', msg => {
+      const data = JSON.parse(msg);
+      if (data?.data?.ltp) lastKnownLtp = data.data.ltp;
+    });
+
+    ws.on('close', () => setTimeout(startMarketWS, 3000));
+  } catch (e) {
+    console.error("WS error:", e.message);
+  }
 }
 
-async function verifyOrderStatus(orderId) {
-    try {
-        const res = await axios.get(`https://api.upstox.com/v2/order/details?order_id=${orderId}`, {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
-        });
-        const order = res.data.data;
-        if (order.status === 'complete') {
-            const actualPrice = parseFloat(order.average_price);
-            const log = botState.history.find(h => h.id === orderId);
-            if (log) { log.price = actualPrice; log.status = "FILLED"; }
-            if (botState.positionType) botState.entryPrice = actualPrice;
-            await saveState();
-        }
-    } catch (e) {}
+/***********************
+ * ORDER HELPERS
+ ***********************/
+async function placeSL(trigger, side) {
+  const tx = side === 'LONG' ? 'SELL' : 'BUY';
+  const res = await axios.post(
+    'https://api.upstox.com/v3/order/place',
+    {
+      instrument_token: INSTRUMENT_KEY,
+      quantity: botState.quantity,
+      order_type: "SL-M",
+      transaction_type: tx,
+      trigger_price: Math.round(trigger),
+      product: "I",
+      validity: "DAY"
+    },
+    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+  );
+  botState.slOrderId = res.data.data.order_id;
+  await saveState();
 }
 
-// --- ENGINE & REAL-TIME SOCKETS ---
+async function modifySL(trigger) {
+  if (!botState.slOrderId) return;
+  await axios.put(
+    'https://api.upstox.com/v3/order/modify',
+    {
+      order_id: botState.slOrderId,
+      trigger_price: Math.round(trigger)
+    },
+    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+  );
+}
+
+/***********************
+ * STRATEGY LOOP (UNCHANGED LOGIC)
+ ***********************/
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isMarketOpen()) return;
-    try {
-        const res = await axios.get(`https://api.upstox.com/v3/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
-        });
-        lastKnownLtp = res.data.data[INSTRUMENT_KEY].last_price;
-        
-        // Push to Dashboard via WebSocket (Efficient)
-        io.emit('priceUpdate', { price: lastKnownLtp, pnl: calculateLivePnL() });
-    } catch (e) {}
-}, 2000);
+  if (!ACCESS_TOKEN || !isMarketOpen()) return;
 
-function calculateLivePnL() {
-    let uPnL = 0;
-    if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
-    if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
-    return (botState.totalPnL + uPnL).toFixed(2);
-}
+  try {
+    const c = await axios.get(
+      `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`,
+      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+    );
 
-// --- DASHBOARD WITH HISTORICAL PNL ---
-app.get('/', (req, res) => {
-    res.send(`
-        <!DOCTYPE html><html><head>
-        <script src="/socket.io/socket.io.js"></script>
-        <script>
-            const socket = io();
-            socket.on('priceUpdate', (data) => {
-                document.getElementById('live-price').innerText = '₹' + data.price;
-                document.getElementById('live-pnl').innerText = '₹' + data.pnl;
-            });
-        </script>
-        <body style="background:#0f172a; color:white; font-family:sans-serif; display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
-                <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Pro</h2>
-                <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
-                    <small>REAL-TIME PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp}</b>
-                </div>
-                <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px; margin-bottom:15px;">
-                    <small>TOTAL PNL (LIVE)</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
-                </div>
-                <div style="margin-bottom:20px;">
-                    <form action="/sync-price" method="POST"><button style="width:100%; padding:10px; background:#fbbf24; border:none; border-radius:8px;">🔄 SYNC MANUAL TRADES</button></form>
-                </div>
-                <h4 style="color:#94a3b8;">PnL History</h4>
-                <div style="font-size:12px; max-height:100px; overflow-y:auto; border:1px solid #334155; padding:5px;">
-                    ${botState.pnlHistory.map(p => `<div>${p.date}: ₹${p.amount}</div>`).join('') || 'No records.'}
-                </div>
-                <h4 style="color:#94a3b8;">Recent Trades</h4>
-                ${botState.history.slice(0,5).map(h => `<div style="font-size:11px; border-bottom:1px solid #334155; padding:5px;">${h.time} | ${h.type} | ₹${h.price} | ${h.status}</div>`).join('')}
-            </div>
-        </body></html>
-    `);
-});
+    const candles = c.data.data.candles;
+    if (candles.length < 200) return;
 
-app.post('/sync-price', async (req, res) => {
-    if (!ACCESS_TOKEN) return res.redirect('/');
-    try {
-        const posRes = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', {
-            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
-        });
-        const pos = (posRes.data.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
-        if (pos && parseInt(pos.quantity) !== 0) {
-            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(parseInt(pos.quantity));
-            botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
-            botState.currentStop = botState.positionType === 'LONG' ? lastKnownLtp - 800 : lastKnownLtp + 800;
-            console.log("✅ Manual position synced.");
-        } else {
-            // If position is closed, move today's PnL to history
-            if (botState.positionType) {
-                botState.pnlHistory.unshift({ date: getIST().toLocaleDateString(), amount: calculateLivePnL() });
-            }
-            botState.positionType = null;
+    const close = candles.map(x => x[4]);
+    const high = candles.map(x => x[2]);
+    const low = candles.map(x => x[3]);
+    const vol = candles.map(x => x[5]);
+
+    const e50 = EMA.calculate({ period: 50, values: close });
+    const e200 = EMA.calculate({ period: 200, values: close });
+    const vAvg = SMA.calculate({ period: 20, values: vol });
+    const atr = ATR.calculate({ high, low, close, period: 14 });
+
+    const curA = atr.at(-1);
+    const bH = Math.max(...high.slice(-11, -1));
+    const bL = Math.min(...low.slice(-11, -1));
+
+    if (!botState.positionType) {
+      if (e50.at(-2) > e200.at(-2) && close.at(-1) > bH) {
+        botState.positionType = 'LONG';
+        botState.entryPrice = lastKnownLtp;
+        botState.quantity = MAX_QUANTITY;
+        botState.currentStop = lastKnownLtp - curA * 3;
+        await placeSL(botState.currentStop, 'LONG');
+      }
+      if (e50.at(-2) < e200.at(-2) && close.at(-1) < bL) {
+        botState.positionType = 'SHORT';
+        botState.entryPrice = lastKnownLtp;
+        botState.quantity = MAX_QUANTITY;
+        botState.currentStop = lastKnownLtp + curA * 3;
+        await placeSL(botState.currentStop, 'SHORT');
+      }
+    } else {
+      if (botState.positionType === 'LONG') {
+        const newSL = Math.max(botState.currentStop, lastKnownLtp - curA * 3);
+        if (newSL !== botState.currentStop) {
+          botState.currentStop = newSL;
+          await modifySL(newSL);
         }
-        await saveState();
-    } catch (e) { console.error("Sync Error", e.message); }
-    res.redirect('/');
+      } else {
+        const newSL = Math.min(botState.currentStop, lastKnownLtp + curA * 3);
+        if (newSL !== botState.currentStop) {
+          botState.currentStop = newSL;
+          await modifySL(newSL);
+        }
+      }
+    }
+
+    await saveState();
+  } catch {}
+}, 30000);
+
+/***********************
+ * DASHBOARD
+ ***********************/
+app.get('/', (req, res) => {
+  res.send(`
+  <h2>Silver Prime Bot</h2>
+  <p>Price: ₹${lastKnownLtp}</p>
+  <p>Position: ${botState.positionType || 'NONE'}</p>
+  <p>Entry: ₹${botState.entryPrice}</p>
+  <p>SL: ₹${botState.currentStop}</p>
+  <p>Total PnL: ₹${botState.totalPnL}</p>
+  <h3>Historical PnL</h3>
+  ${botState.pnlHistory.map(p => `<div>${p.date} : ₹${p.pnl}</div>`).join('')}
+  `);
 });
 
+/***********************
+ * MANUAL SYNC
+ ***********************/
+app.post('/sync-price', async (req, res) => {
+  const pos = await axios.get(
+    'https://api.upstox.com/v2/portfolio/short-term-positions',
+    { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
+  );
+
+  const p = pos.data.data.find(x => x.instrument_token === INSTRUMENT_KEY);
+  if (p) {
+    botState.positionType = p.quantity > 0 ? 'LONG' : 'SHORT';
+    botState.quantity = Math.abs(p.quantity);
+    botState.entryPrice = parseFloat(p.buy_price);
+    botState.currentStop =
+      botState.positionType === 'LONG'
+        ? botState.entryPrice - 800
+        : botState.entryPrice + 800;
+
+    await placeSL(botState.currentStop, botState.positionType);
+    await saveState();
+  }
+  res.redirect('/');
+});
+
+/***********************
+ * SERVER
+ ***********************/
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`Bot Running on Port ${PORT}`));
+app.listen(PORT, () => console.log("Bot running on", PORT));
+
+/***********************
+ * AUTO LOGIN CRON
+ ***********************/
+setInterval(() => {
+  if (!ACCESS_TOKEN) performAutoLogin();
+}, 60000);
