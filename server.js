@@ -13,7 +13,6 @@ const INSTRUMENT_KEY = "MCX_FO|458305";
 const MAX_QUANTITY = 1;
 
 // --- 🔒 ENVIRONMENT VARIABLES ---
-// Ensure these are set in Render!
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
 // Connect to Database
@@ -38,10 +37,10 @@ async function saveState() { await redis.set('silver_bot_state', JSON.stringify(
 // --- TIME HELPERS ---
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
 function formatDate(date) { return date.toISOString().split('T')[0]; }
-function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; }
-function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 525 && m < 1439; }
+function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; } // 5:30 AM to Midnight
+function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; } // 9:00 AM to 11:50 PM
 
-// --- 🤖 AUTO-LOGIN SYSTEM (Do Not Remove) ---
+// --- 🤖 ROBUST AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
     let browser = null;
@@ -60,7 +59,7 @@ async function performAutoLogin() {
         console.log("🌍 Navigating to Upstox...");
         await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Check for Mobile Number Field
+        // Check if page loaded correctly
         const mobileInput = await page.$('#mobileNum');
         if (!mobileInput) {
             const pageText = await page.evaluate(() => document.body.innerText); 
@@ -112,7 +111,8 @@ async function performAutoLogin() {
 async function getMergedCandles() {
     const today = new Date();
     const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
-    // Fetch last 10 days + Intraday data
+    
+    // Fetch History + Intraday
     const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
     const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
 
@@ -140,7 +140,7 @@ async function fetchLatestOrderId() {
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
-    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); // Wait for broker to process
+    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); // Wait for broker
 
     try {
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
@@ -152,7 +152,7 @@ async function verifyOrderStatus(orderId, context) {
             const realPrice = parseFloat(order.average_price);
             if (botState.positionType) botState.entryPrice = realPrice;
             
-            // Update History Log with Real Price and Order ID
+            // Log Update
             if (context === 'MANUAL_SYNC' && botState.history.length > 0) {
                  botState.history[0].price = realPrice; botState.history[0].status = "FILLED"; botState.history[0].id = orderId;
             } else {
@@ -161,7 +161,7 @@ async function verifyOrderStatus(orderId, context) {
             }
             await saveState();
         } else if (['rejected', 'cancelled'].includes(order.status)) {
-            // If entry failed, reset position
+            // Reset if entry failed
             if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
             }
@@ -173,7 +173,7 @@ async function verifyOrderStatus(orderId, context) {
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
-    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); // 0.3% Buffer for Limit Order
+    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); // 0.3% buffer
 
     try {
         console.log(`🚀 Sending ${type}: ${qty} Lot @ ₹${limitPrice}`);
@@ -183,11 +183,9 @@ async function placeOrder(type, qty, ltp) {
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
         let orderId = res.data?.data?.order_id || 'PENDING_ID';
-        // Log "SENT" immediately
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type, price: limitPrice, id: orderId, status: "SENT" });
         await saveState();
 
-        // Check verification context
         const context = (type === 'BUY' && botState.positionType === 'LONG') || (type === 'SELL' && botState.positionType === 'SHORT') ? 'ENTRY' : 'EXIT';
         verifyOrderStatus(orderId, context);
         return true;
@@ -200,56 +198,59 @@ async function placeOrder(type, qty, ltp) {
     }
 }
 
-// --- CRON JOBS ---
-// 1. Auto-Login daily at 8:30 AM IST
+// --- CRON & ENGINE ---
 setInterval(() => {
     const now = getIST();
     if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
 }, 60000);
 
-// 2. Trading Loop (Runs every 30 seconds)
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isApiAvailable()) { console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 Market Closed / API Sleeping"); return; }
+    if (!ACCESS_TOKEN || !isApiAvailable()) { console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping"); return; }
     
     try {
         const candles = await getMergedCandles();
         if (candles.length > 200) {
-            // Arrays for Indicators
             const cl = candles.map(c => c[4]);
             const h = candles.map(c => c[2]);
             const l = candles.map(c => c[3]);
             const v = candles.map(c => c[5]);
 
-            lastKnownLtp = cl[cl.length-1]; // Live Price
+            lastKnownLtp = cl[cl.length-1];
 
-            if (isMarketOpen()) {
-                // Calculate Indicators
-                const e50 = EMA.calculate({period: 50, values: cl});
-                const e200 = EMA.calculate({period: 200, values: cl});
-                const vAvg = SMA.calculate({period: 20, values: v});
-                const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-                
-                // --- STRATEGY INDICES ---
-                // We use Index -2 (Previous Closed Candle) for setup to be safe
-                const idx = cl.length - 2; 
-                
-                const prevE50 = e50[idx];
-                const prevE200 = e200[idx];
-                const prevVol = v[idx];
-                const prevAvgVol = vAvg[idx];
-                const curA = atr[atr.length-1];
-                
-                // Breakout Levels (High/Low of last 10 candles, excluding current)
-                const bH = Math.max(...h.slice(-11, -1));
-                const bL = Math.min(...l.slice(-11, -1));
+            // Calculate Indicators
+            const e50 = EMA.calculate({period: 50, values: cl});
+            const e200 = EMA.calculate({period: 200, values: cl});
+            const vAvg = SMA.calculate({period: 20, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            
+            // Current Values
+            const curE50 = e50[e50.length-1];
+            const curE200 = e200[e200.length-1];
+            const curV = v[v.length-1];
+            const curAvgV = vAvg[vAvg.length-1];
 
-                console.log(`📊 P:₹${lastKnownLtp} | Trend:${prevE50>prevE200?'UP':'DOWN'} | Vol:${prevVol} (Avg:${prevAvgVol.toFixed(0)})`);
+            // Strategy Values (Using Previous Candle for Setup)
+            const idx = cl.length - 2; 
+            const prevE50 = e50[idx];
+            const prevE200 = e200[idx];
+            const prevVol = v[idx];
+            const prevAvgVol = vAvg[idx];
+            const curA = atr[atr.length-1];
+            
+            // 10-Candle Breakout Levels
+            const bH = Math.max(...h.slice(-11, -1));
+            const bL = Math.min(...l.slice(-11, -1));
+            
+            // --- 🛑 FORCE LOG PRINTING (Always visible) ---
+            const isOpen = isMarketOpen();
+            console.log(`Time:${getIST().toLocaleTimeString()} | P:₹${lastKnownLtp} | E50:${curE50.toFixed(0)} | E200:${curE200.toFixed(0)} | Vol:${curV} | AvgVol:${curAvgV.toFixed(0)} | MarketOpen:${isOpen}`);
 
+            if (isOpen) {
                 if (!botState.positionType) {
-                    // --- ENTRY LOGIC ---
-                    // 1. Trend Filter: EMA 50 > EMA 200 (using closed candle)
-                    // 2. Volume Filter: Last Closed Vol > 1.5x Avg Vol
-                    // 3. Trigger: LIVE Price breaks 10-candle High
+                    // ENTRY LOGIC:
+                    // 1. Trend: EMA50 > EMA200 (on prev candle)
+                    // 2. Volume: Prev Volume > 1.5x Avg Volume
+                    // 3. Trigger: Live Price Breaks 10-candle High/Low
                     
                     if (prevE50 > prevE200 && prevVol > (prevAvgVol * 1.5) && lastKnownLtp > bH) {
                         console.log("⚡ LONG SIGNAL DETECTED");
@@ -264,11 +265,11 @@ setInterval(async () => {
                         await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
-                    // --- EXIT LOGIC (Trailing SL) ---
+                    // EXIT LOGIC (Trailing SL)
                     if (botState.positionType === 'LONG') {
                         botState.currentStop = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (lastKnownLtp < botState.currentStop) {
-                            console.log("🛑 TRAILING STOP HIT (LONG)");
+                            console.log("🛑 STOP HIT (LONG)");
                             botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; 
                             botState.positionType = null;
                             await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
@@ -276,7 +277,7 @@ setInterval(async () => {
                     } else {
                         botState.currentStop = Math.min(lastKnownLtp + (curA * 3), botState.currentStop || 999999);
                         if (lastKnownLtp > botState.currentStop) {
-                            console.log("🛑 TRAILING STOP HIT (SHORT)");
+                            console.log("🛑 STOP HIT (SHORT)");
                             botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; 
                             botState.positionType = null;
                             await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
@@ -284,21 +285,21 @@ setInterval(async () => {
                     }
                 }
             }
+        } else {
+             console.log(`💓 Heartbeat: Found ${candles.length} candles (Need >200).`);
         }
     } catch (e) { 
-        if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } // Auto-recover if token dies
+        if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); }
     }
 }, 30000);
 
 // --- DASHBOARD UI ---
 app.get('/', (req, res) => {
     let uPnL = 0;
-    // Calculate Unrealized PnL
     if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
     if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
     const totalPnL = botState.totalPnL + uPnL;
 
-    // Generate Trade Log HTML
     let historyHTML = botState.history.slice(0, 10).map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="width:20%; color:#94a3b8;">${t.time}</span> 
