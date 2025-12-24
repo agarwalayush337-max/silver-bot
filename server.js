@@ -160,14 +160,15 @@ let botState = {
     slOrderId: null 
 };
 
-// --- 🧪 GOD MODE SIMULATION (With Manual Controls) 🧪 ---
+// --- 🧪 GOD MODE SIMULATION (With Freeze & Fast Logs) 🧪 ---
 const SIMULATION_MODE = true; 
 
 // Global Simulation Variables
-let mockLtp = 224000;      // Start Price
-let mockVolume = 500;      // Normal Volume
+let mockLtp = 224000;      
+let mockVolume = 500;      
 let mockOrders = [];
 let simTrend = 0;          // 0 = Flat, 1 = Up, -1 = Down
+let simPaused = false;     // 🆕 Freeze State
 
 if (SIMULATION_MODE) {
     console.log("⚠️ GOD MODE ACTIVE: You control the market.");
@@ -177,42 +178,37 @@ if (SIMULATION_MODE) {
         console.log("🔌 [SIM] Socket Ready. Waiting for commands...");
         currentWs = { binaryType: "mock" }; 
 
-        // Update loop (runs every second)
+        // Update loop (runs every second for Dashboard)
         setInterval(() => {
-            // Apply drift based on trend
-            if (simTrend === 1) mockLtp += (10 + Math.random() * 10); // Slow rise
-            else if (simTrend === -1) mockLtp -= (10 + Math.random() * 10); // Slow fall
-            else mockLtp += (Math.random() - 0.5) * 5; // Flat noise
-
+            if (!simPaused) {
+                // Apply drift based on trend
+                if (simTrend === 1) mockLtp += (10 + Math.random() * 10); 
+                else if (simTrend === -1) mockLtp -= (10 + Math.random() * 10); 
+                else mockLtp += (Math.random() - 0.5) * 5; 
+            }
             lastKnownLtp = parseFloat(mockLtp.toFixed(2));
             pushToDashboard(); 
         }, 1000);
-    };
 
     // 2. MOCK AXIOS (The "Fake Exchange")
     const originalAxios = axios;
     axios = {
         ...originalAxios,
         get: async (url, config) => {
-            // A. FAKE CANDLES (Critical for E50/E200)
-            // We generate 300 candles based on the CURRENT mock price
+            // A. FAKE CANDLES (Uses mockVolume)
             if (url.includes("/historical-candle/") || url.includes("/intraday/")) {
                 const candles = [];
                 const now = Date.now();
-                // Create 300 candles ending at current time
                 for(let i=300; i>=0; i--) {
-                    // Make candles trail nicely behind current price so E50/E200 works
-                    // If i is large (past), price is lower (uptrend simulation default)
                     const historicPrice = mockLtp - (i * 20); 
-                    
                     candles.push([
                         new Date(now - i*300000).toISOString(),
-                        historicPrice,          // Open
-                        historicPrice + 50,     // High
-                        historicPrice - 50,     // Low
-                        historicPrice,          // Close
-                        mockVolume,             // Volume (Controllable)
-                        0                       // OI
+                        historicPrice,          
+                        historicPrice + 50,     
+                        historicPrice - 50,     
+                        historicPrice,          
+                        mockVolume,             // 🆕 Uses the Global mockVolume
+                        0                       
                     ]);
                 }
                 return { data: { data: { candles: candles } } };
@@ -260,7 +256,6 @@ if (SIMULATION_MODE) {
         put: async () => ({ data: { status: "success" } })
     };
 }
-
 // --- STATE MANAGEMENT ---
 async function loadState() {
     try {
@@ -711,7 +706,7 @@ setInterval(async () => {
     } catch (e) { 
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
-}, 30000);
+}, 5000);
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
@@ -736,20 +731,21 @@ app.get('/', (req, res) => {
         </div>`).join('');
 
     // Only show controls if Simulation Mode is ON
+    // Only show controls if Simulation Mode is ON
     const simControls = SIMULATION_MODE ? `
     <div style="background:#334155; padding:10px; margin-bottom:15px; border-radius:8px; text-align:center;">
         <h4 style="margin:0 0 10px 0; color:#fbbf24;">🎮 God Mode Controls</h4>
         <div style="display:flex; gap:5px; justify-content:center; flex-wrap:wrap;">
             <button onclick="fetch('/sim/pump', {method:'POST'})" style="padding:8px; background:#4ade80; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🚀 PUMP</button>
             <button onclick="fetch('/sim/dump', {method:'POST'})" style="padding:8px; background:#f87171; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">📉 DUMP</button>
-            <button onclick="fetch('/sim/spike-vol', {method:'POST'})" style="padding:8px; background:#cbd5e1; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🔊 VOL</button>
+            <button onclick="fetch('/sim/spike-vol', {method:'POST'})" style="padding:8px; background:#cbd5e1; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🔊 VOL HIGH</button>
         </div>
         <div style="margin-top:5px; display:flex; gap:5px; justify-content:center;">
             <button onclick="fetch('/sim/trend-up', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend UP ⬆️</button>
+            <button onclick="fetch('/sim/freeze', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer; background:#fbbf24; color:black;">PAUSE ⏸️</button>
             <button onclick="fetch('/sim/trend-down', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend DOWN ⬇️</button>
         </div>
     </div>` : '';
-
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
         <head>
