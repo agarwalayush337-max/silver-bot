@@ -200,15 +200,26 @@ function pushToDashboard() {
 async function manageExchangeSL(side, qty, triggerPrice) {
     if(!ACCESS_TOKEN) return;
     try {
+        // If an old SL exists, cancel it first
         if (botState.slOrderId) {
             await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         }
+        
+        // Place the NEW SL Order
+        // If Entry was BUY -> Transaction Type is SELL
+        // If Entry was SELL -> Transaction Type is BUY
         const res = await axios.post("https://api.upstox.com/v2/order/place", {
-            quantity: qty, product: "I", validity: "DAY", price: 0, 
-            instrument_token: INSTRUMENT_KEY, order_type: "SL-M", 
+            quantity: qty, 
+            product: "I", 
+            validity: "DAY", 
+            price: 0, 
+            instrument_token: INSTRUMENT_KEY, 
+            order_type: "SL-M", 
             transaction_type: side === "BUY" ? "SELL" : "BUY", 
-            trigger_price: Math.round(triggerPrice), is_amo: false
+            trigger_price: Math.round(triggerPrice), 
+            is_amo: false
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        
         botState.slOrderId = res.data.data.order_id;
         await saveState();
     } catch (e) { console.log("Exchange SL Placement Failed"); }
@@ -608,20 +619,31 @@ app.get('/', (req, res) => {
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
 // ✅ RESTORED: SYNC PRICE ROUTE
+// ✅ FIXED: SYNC PRICE ROUTE
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
+        
         if (pos && parseInt(pos.quantity) !== 0) {
-            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(parseInt(pos.quantity));
+            const qty = parseInt(pos.quantity);
+            botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = Math.abs(qty);
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             botState.totalPnL = 0;
-            const side = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
-            const slPrice = botState.positionType === 'LONG' ? (lastKnownLtp - 800) : (lastKnownLtp + 800);
-            await manageExchangeSL(side, botState.quantity, slPrice);
-        } else { botState.positionType = null; }
+            
+            // 🚨 BUG FIX: Pass the ENTRY side (BUY/SELL), not the SL side
+            // If Long (qty > 0), we pass 'BUY'. If Short, we pass 'SELL'.
+            const entrySide = qty > 0 ? 'BUY' : 'SELL';
+            
+            const currentLtp = lastKnownLtp > 0 ? lastKnownLtp : botState.entryPrice;
+            const slPrice = botState.positionType === 'LONG' ? (currentLtp - 800) : (currentLtp + 800);
+            
+            await manageExchangeSL(entrySide, botState.quantity, slPrice);
+        } else { 
+            botState.positionType = null; 
+        }
         await saveState();
     } catch (e) { console.error("Sync Error", e.message); }
     res.redirect('/');
