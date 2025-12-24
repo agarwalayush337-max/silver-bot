@@ -427,7 +427,7 @@ async function fetchLatestOrderId() {
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
-    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); 
+    if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
 
     try {
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
@@ -435,23 +435,39 @@ async function verifyOrderStatus(orderId, context) {
         if (!order) return;
 
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
+        
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
-            if (botState.positionType) botState.entryPrice = realPrice;
+            
+            // ✅ NEW: If this was an SL order that just filled, CLEAR the position
+            if (context === 'EXIT_CHECK') {
+                console.log("✅ Exchange SL Filled! Clearing Position.");
+                if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
+                if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
+                botState.positionType = null;
+                botState.slOrderId = null;
+            } 
+            // Standard Entry Logic
+            else if (botState.positionType) {
+                botState.entryPrice = realPrice;
+            }
             
             const log = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
             if (log) { log.price = realPrice; log.status = "FILLED"; log.id = orderId; }
             
             await saveState();
         } else if (['rejected', 'cancelled'].includes(order.status)) {
-            if (context !== 'MANUAL_SYNC' && botState.positionType) {
+            // If SL was rejected/cancelled, clear the ID so the bot knows it has no protection
+            if (context === 'EXIT_CHECK') {
+                 botState.slOrderId = null;
+            }
+            else if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
             }
             await saveState();
         }
     } catch (e) { console.log("Verification Error: " + e.message); }
 }
-
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
@@ -487,31 +503,23 @@ setInterval(() => {
 }, 60000);
 
 // TRADING LOOP (Runs every 30s)
+// --- TRADING ENGINE (Prevents Double Orders) ---
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isApiAvailable()) {
-        if (!ACCESS_TOKEN) console.log("📡 Waiting for Token...");
-        return;
-    }
-
-    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
-        console.log("🔄 Watchdog: Connecting WebSocket...");
-        initWebSocket();
-    }
+    if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) initWebSocket();
 
     try {
         const candles = await getMergedCandles();
         console.log(`--------------------------------------------------`);
-        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs ? 'Live' : 'Off'}`);
+        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs?'Live':'Off'}`);
 
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
             
-            // ✅ New Code (Always updates price from latest candle)
-            lastKnownLtp = cl[cl.length-1]; 
-            pushToDashboard(); // Force update the UI immediately
-            
+            // Backup Fallback
+            if (lastKnownLtp === 0) lastKnownLtp = cl[cl.length-1];
+
             const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-            
             const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
             const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
 
@@ -519,6 +527,7 @@ setInterval(async () => {
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
+                    // --- ENTRY LOGIC ---
                     if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
                         botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
                         await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
@@ -528,34 +537,46 @@ setInterval(async () => {
                         await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
+                    // --- EXIT / TRAILING LOGIC ---
                     if (botState.positionType === 'LONG') {
                         let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
-                        if (ns > botState.currentStop) {
-                            botState.currentStop = ns; await modifyExchangeSL(ns); 
-                        }
+                        if (ns > botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
+                        
+                        // EXIT TRIGGER
                         if (lastKnownLtp < botState.currentStop) {
-                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
-                            await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                            // ✅ FIX: Check if SL exists. If yes, let IT do the job.
+                            if (botState.slOrderId) {
+                                console.log("🛑 Stop Hit! Waiting for Exchange SL to trigger...");
+                                // We check if it filled to clear our state
+                                verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                            } else {
+                                // Only send order if NO SL exists
+                                console.log("🛑 Stop Hit! Emergency Exit (No SL found).");
+                                botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
+                                await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                            }
                         }
                     } else {
                         let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
-                        if (ns < botState.currentStop) {
-                            botState.currentStop = ns; await modifyExchangeSL(ns); 
-                        }
+                        if (ns < botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
+                        
+                        // EXIT TRIGGER
                         if (lastKnownLtp > botState.currentStop) {
-                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
-                            await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
+                            if (botState.slOrderId) {
+                                console.log("🛑 Stop Hit! Waiting for Exchange SL to trigger...");
+                                verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                            } else {
+                                console.log("🛑 Stop Hit! Emergency Exit (No SL found).");
+                                botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
+                                await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
+                            }
                         }
                     }
                 }
             }
         }
     } catch (e) { 
-        if(e.response?.status===401) { 
-            console.log("❌ 401 Detected in Loop. Resetting.");
-            ACCESS_TOKEN = null; 
-            performAutoLogin(); 
-        } 
+        if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 30000);
 
@@ -638,14 +659,16 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // ✅ RESTORED: SYNC PRICE ROUTE
 // ✅ FIXED: SYNC PRICE ROUTE
 // --- SYNC PRICE ROUTE (With Live Price Fetch) ---
+// --- SYNC PRICE ROUTE (Fixed for Manual Orders) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         console.log("🔄 Syncing Position...");
         
-        // 1. Get Position
         const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
+        
+        // ✅ FIX: Search for the ID "458305" anywhere in the instrument token
+        const pos = (response.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
         if (pos && parseInt(pos.quantity) !== 0) {
             const qty = parseInt(pos.quantity);
@@ -654,30 +677,26 @@ app.post('/sync-price', async (req, res) => {
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             botState.totalPnL = 0;
             
-            // 2. FORCE Live Price Check (Fixes "0" Price Bug)
+            // Force Price Check to avoid 0-price bug
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
                     const qRes = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
                     currentLtp = qRes.data.data[INSTRUMENT_KEY].last_price;
-                    lastKnownLtp = currentLtp; // Update global
-                } catch (e) {
-                    currentLtp = botState.entryPrice; // Fallback to entry price
-                }
+                    lastKnownLtp = currentLtp; 
+                } catch (e) { currentLtp = botState.entryPrice; }
             }
 
-            // 3. Calculate Stop Loss
+            // Calc SL
             const entrySide = qty > 0 ? 'BUY' : 'SELL';
             const slPrice = botState.positionType === 'LONG' ? (currentLtp - 800) : (currentLtp + 800);
             
-            console.log(`🔄 Sync State: ${botState.positionType} @ ${botState.entryPrice} | SL: ${slPrice}`);
-            
-            // 4. Place the SL
+            console.log(`🔄 Sync Found: ${botState.positionType} | SL: ${slPrice}`);
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
 
         } else { 
             botState.positionType = null; 
-            console.log("🔄 No open position found.");
+            console.log("🔄 No open position found for ID 458305.");
         }
         await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
