@@ -101,63 +101,56 @@ async function modifyExchangeSL(newTrigger) {
 }
 
 // --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
-let currentStreamer = null; // Track instance globally
-
 async function initWebSocket() {
-    if (!ACCESS_TOKEN) return;
-
-    // 1. Clean up any existing broken connection
-    if (currentStreamer) {
-        console.log("🧹 Cleaning up old WebSocket instance...");
-        try { currentStreamer.disconnect(); } catch (e) {}
-        currentStreamer = null;
-    }
+    if (!ACCESS_TOKEN || currentStreamer) return;
 
     try {
-        console.log("🔌 Initializing Market Data WebSocket (Fresh Instance)...");
+        console.log("🔌 Initializing Market Data WebSocket (Manual Mode)...");
         
-        // Disable internal auto-reconnect to avoid the 'clearSubscriptions' library crash
-        currentStreamer = new MarketDataStreamerV3(); 
+        // We use the SDK but EXPLICITLY disable their broken auto-reconnect
+        currentStreamer = new MarketDataStreamerV3(false); // 'false' disables auto-reconnect
 
         currentStreamer.on('error', (err) => {
             console.error("❌ WebSocket Error:", err.message);
-            
-            // If 401, the token/session is dead for WS. Stop and wait for Auto-Login.
             if (err.message.includes('401')) {
-                console.log("⚠️ 401 Detected: Invalidating session to trigger Auto-Login.");
-                ACCESS_TOKEN = null; 
-                if (currentStreamer) currentStreamer.disconnect();
-                currentStreamer = null;
+                console.log("🔑 Session Invalid. Resetting for Auto-Login...");
+                ACCESS_TOKEN = null;
             }
+            // Cleanup to prevent the "clearSubscriptions" crash
+            currentStreamer = null; 
         });
 
-        // 2. Add a significant delay (10s) before the first connect after login
-        // Upstox servers often need time to sync the token to their WS cluster.
-        console.log("⏳ Waiting 10s for token synchronization...");
+        console.log("⏳ Waiting 10s for Upstox server sync...");
         setTimeout(async () => {
-            if (!ACCESS_TOKEN || !currentStreamer) return;
-            
+            if (!ACCESS_TOKEN) return;
             try {
                 await currentStreamer.connect(ACCESS_TOKEN);
                 
                 currentStreamer.on('open', () => {
-                    console.log("✅ WebSocket Connected. Subscribing to:", INSTRUMENT_KEY);
+                    console.log("✅ Connected! Monitoring:", INSTRUMENT_KEY);
                     currentStreamer.subscribe([INSTRUMENT_KEY], 'ltpc');
                 });
 
                 currentStreamer.on('data', (data) => {
                     if (data && data[INSTRUMENT_KEY]) {
                         lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                        pushToDashboard(); // Updates real-time dashboard
+                        pushToDashboard(); 
                     }
                 });
-            } catch (connErr) {
-                console.error("❌ Connection Failed:", connErr.message);
+
+                currentStreamer.on('close', () => {
+                    console.log("🔌 WebSocket Closed.");
+                    currentStreamer = null;
+                });
+            } catch (e) {
+                console.log("❌ Connection failed, will retry via Watchdog.");
+                currentStreamer = null;
             }
         }, 10000);
 
-    } catch (e) { 
-        console.error("❌ WS Setup Failed:", e.message); 
+    } catch (e) {
+        currentStreamer = null;
+        console.error("❌ WS Setup Error:", e.message);
     }
 }
 
@@ -220,6 +213,7 @@ async function performAutoLogin() {
 
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
+        if (browser) await browser.close();
         console.log("🎉 SUCCESS! Session Active.");
     
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
