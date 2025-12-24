@@ -197,17 +197,28 @@ function pushToDashboard() {
 }
 
 // --- EXCHANGE SL MANAGEMENT ---
+// --- MANAGE EXCHANGE SL (With Error Details) ---
 async function manageExchangeSL(side, qty, triggerPrice) {
     if(!ACCESS_TOKEN) return;
+
+    // Safety: Ensure trigger price is valid
+    if (!triggerPrice || triggerPrice <= 0) {
+        console.error("❌ SL Failed: Invalid Trigger Price (" + triggerPrice + ")");
+        return;
+    }
+
     try {
-        // If an old SL exists, cancel it first
+        // If an old SL exists, try to cancel it first (don't worry if it fails)
         if (botState.slOrderId) {
-            await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+            try {
+                await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { 
+                    headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+                });
+            } catch (ignore) {}
         }
         
-        // Place the NEW SL Order
-        // If Entry was BUY -> Transaction Type is SELL
-        // If Entry was SELL -> Transaction Type is BUY
+        console.log(`📝 Placing SL-M | Qty: ${qty} | Trigger: ${triggerPrice}`);
+
         const res = await axios.post("https://api.upstox.com/v2/order/place", {
             quantity: qty, 
             product: "I", 
@@ -218,11 +229,17 @@ async function manageExchangeSL(side, qty, triggerPrice) {
             transaction_type: side === "BUY" ? "SELL" : "BUY", 
             trigger_price: Math.round(triggerPrice), 
             is_amo: false
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
         
         botState.slOrderId = res.data.data.order_id;
+        console.log("✅ SL Placed Order ID:", botState.slOrderId);
         await saveState();
-    } catch (e) { console.log("Exchange SL Placement Failed"); }
+
+    } catch (e) { 
+        // 🚨 PRINT THE REAL ERROR
+        const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
+        console.error(`❌ Exchange SL Placement Failed: ${errMsg}`); 
+    }
 }
 
 async function modifyExchangeSL(newTrigger) {
@@ -620,9 +637,13 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 
 // ✅ RESTORED: SYNC PRICE ROUTE
 // ✅ FIXED: SYNC PRICE ROUTE
+// --- SYNC PRICE ROUTE (With Live Price Fetch) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
+        console.log("🔄 Syncing Position...");
+        
+        // 1. Get Position
         const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
         
@@ -633,19 +654,33 @@ app.post('/sync-price', async (req, res) => {
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             botState.totalPnL = 0;
             
-            // 🚨 BUG FIX: Pass the ENTRY side (BUY/SELL), not the SL side
-            // If Long (qty > 0), we pass 'BUY'. If Short, we pass 'SELL'.
+            // 2. FORCE Live Price Check (Fixes "0" Price Bug)
+            let currentLtp = lastKnownLtp;
+            if (!currentLtp || currentLtp === 0) {
+                try {
+                    const qRes = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+                    currentLtp = qRes.data.data[INSTRUMENT_KEY].last_price;
+                    lastKnownLtp = currentLtp; // Update global
+                } catch (e) {
+                    currentLtp = botState.entryPrice; // Fallback to entry price
+                }
+            }
+
+            // 3. Calculate Stop Loss
             const entrySide = qty > 0 ? 'BUY' : 'SELL';
-            
-            const currentLtp = lastKnownLtp > 0 ? lastKnownLtp : botState.entryPrice;
             const slPrice = botState.positionType === 'LONG' ? (currentLtp - 800) : (currentLtp + 800);
             
+            console.log(`🔄 Sync State: ${botState.positionType} @ ${botState.entryPrice} | SL: ${slPrice}`);
+            
+            // 4. Place the SL
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
+
         } else { 
             botState.positionType = null; 
+            console.log("🔄 No open position found.");
         }
         await saveState();
-    } catch (e) { console.error("Sync Error", e.message); }
+    } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
 
