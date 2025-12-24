@@ -150,15 +150,26 @@ let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
 let sseClients = []; 
 let currentWs = null; // ✅ Websocket Tracker
+// 🆕 Added historicalPnL and exchangeSLPrice
 let botState = { 
     positionType: null, 
     entryPrice: 0, 
     currentStop: null, 
-    totalPnL: 0, 
+    historicalPnL: 0,   // Tracks Closed PnL
+    totalPnL: 0,        // (Unused now, replaced by historicalPnL)
     quantity: 0, 
-    history: [],
-    slOrderId: null 
+    history: [], 
+    slOrderId: null,
+    exchangeSLPrice: 0  // Tracks the actual SL at Exchange
 };
+
+// 🆕 RESET PNL ROUTE
+app.post('/reset-pnl', async (req, res) => {
+    botState.historicalPnL = 0;
+    botState.totalPnL = 0;
+    await saveState();
+    res.redirect('/');
+});
 
 // --- STATE MANAGEMENT ---
 async function loadState() {
@@ -232,14 +243,9 @@ async function manageExchangeSL(side, qty, triggerPrice) {
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
         
         botState.slOrderId = res.data.data.order_id;
-        console.log("✅ SL Placed Order ID:", botState.slOrderId);
+        botState.exchangeSLPrice = triggerPrice; // 🆕 Save the SL Price
         await saveState();
-
-    } catch (e) { 
-        // 🚨 PRINT THE REAL ERROR
-        const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
-        console.error(`❌ Exchange SL Placement Failed: ${errMsg}`); 
-    }
+    } catch (e) { console.error(`❌ Exchange SL Failed`); }
 }
 
 async function modifyExchangeSL(newTrigger) {
@@ -445,12 +451,22 @@ async function verifyOrderStatus(orderId, context) {
             const realPrice = parseFloat(order.average_price);
             
             // 1. Update State (PnL / Position)
+            // ... inside verifyOrderStatus ...
             if (context === 'EXIT_CHECK') {
-                if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
-                if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
-                botState.positionType = null;
-                botState.slOrderId = null;
+                console.log("✅ Exchange SL Filled! Clearing Position.");
+                // 🆕 Calculate PnL for this specific trade
+                let tradePnL = 0;
+                if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
+                if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
+                
+                // 🆕 Add to Historical PnL
+                botState.historicalPnL += tradePnL;
+
+                botState.positionType = null; 
+                botState.slOrderId = null; 
                 botState.currentStop = null;
+                botState.exchangeSLPrice = 0; // Clear Exchange SL
+// ...
                 
                 // Add SL Exit Log if missing
                 const exists = botState.history.find(h => h.id === orderId);
@@ -623,67 +639,91 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    const historyHTML = botState.history.slice(0, 10).map(t => 
-        `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-            <span style="width:20%; color:#94a3b8;">${t.time}</span> 
-            <b style="width:15%; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="width:20%; font-weight:bold;">₹${t.price}</span> 
-            <div style="width:45%; text-align:right;">
-                <span style="display:block; color:${t.status=='FILLED'?'#4ade80':t.status=='SENT'?'#fbbf24':'#f472b6'}">${t.status}</span>
-                <span style="display:block; color:#64748b; font-size:10px;">${t.id || '-'}</span>
-            </div>
-        </div>`).join('');
+    // 1. Calculate Open PnL (Unrealized)
+    let openPnL = 0;
+    if (botState.positionType === 'LONG') openPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
+    if (botState.positionType === 'SHORT') openPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
+    const totalNetPnL = (botState.historicalPnL + openPnL).toFixed(2);
 
-    res.send(`
-        <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
-        <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <script>
-                const source = new EventSource('/live-updates');
-                source.onmessage = (e) => {
-                    const d = JSON.parse(e.data);
-                    document.getElementById('live-price').innerText = '₹' + d.price;
-                    const pnlEl = document.getElementById('live-pnl');
-                    pnlEl.innerText = '₹' + d.pnl;
-                    pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
-                    document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
-                    const stat = document.getElementById('live-status');
-                    stat.innerText = d.status;
-                    stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
-                };
-            </script>
-        </head>
-        <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
-                <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
-                <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
-                    <small style="color:#94a3b8;">LIVE PRICE</small><br>
-                    <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
-                </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TOTAL PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
-                    </div>
-                </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
-                    </div>
-                </div>
-                <div style="display:flex; gap:10px; margin-bottom:20px;">
-                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
-                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
-                </div>
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
-                <div id="logContent">${historyHTML}</div>
-            </div>
-        </body></html>`);
+    // 2. Generate Trade Log (New Format: Time | Details | Actual | ID)
+    const historyHTML = botState.history.slice(0, 15).map(t => {
+        let color = '#fbbf24'; // Default Yellow
+        if(t.type === 'BUY' || t.status === 'FILLED') color = '#4ade80'; // Green
+        if(t.type === 'SELL' || t.type === 'SL-EXIT') color = '#f87171'; // Red
+        if(t.type === 'SYSTEM') color = '#94a3b8'; // Grey
+
+        return `
+        <tr style="border-bottom:1px solid #334155; font-size:12px;">
+            <td style="padding:8px; color:#94a3b8;">${t.time}</td>
+            <td style="padding:8px; font-weight:bold; color:${color};">
+                ${t.type === 'SYSTEM' ? 'Autologin' : t.type} <span style="font-weight:normal; color:#fff;">(${t.status})</span>
+            </td>
+            <td style="padding:8px;">₹${t.price}</td>
+            <td style="padding:8px; color:#64748b; font-size:10px;">${t.id || '-'}</td>
+        </tr>`;
+    }).join('');
+
+    const simControls = SIMULATION_MODE ? `
+    <div style="background:#334155; padding:10px; margin-bottom:15px; border-radius:8px; text-align:center;">
+        <h4 style="margin:0 0 10px 0; color:#fbbf24;">🎮 God Mode Controls</h4>
+        <div style="display:flex; gap:5px; justify-content:center; flex-wrap:wrap;">
+            <button onclick="fetch('/sim/pump', {method:'POST'})" style="padding:8px; background:#4ade80; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🚀 PUMP</button>
+            <button onclick="fetch('/sim/dump', {method:'POST'})" style="padding:8px; background:#f87171; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">📉 DUMP</button>
+            <button onclick="fetch('/sim/spike-vol', {method:'POST'})" style="padding:8px; background:#cbd5e1; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🔊 VOL</button>
+        </div>
+        <div style="margin-top:5px; display:flex; gap:5px; justify-content:center;">
+            <button onclick="fetch('/sim/trend-up', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend UP ⬆️</button>
+            <button onclick="fetch('/sim/freeze', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer; background:#fbbf24; color:black;">PAUSE ⏸️</button>
+            <button onclick="fetch('/sim/trend-down', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend DOWN ⬇️</button>
+        </div>
+    </div>` : '';
+
+    res.send(`<!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Silver Prime Auto</title><script>const source = new EventSource('/live-updates');source.onmessage = (e) => {const d = JSON.parse(e.data);document.getElementById('live-price').innerText = '₹' + d.price;const stat = document.getElementById('live-status');stat.innerText = d.status;stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';};</script></head><body style="display:flex; justify-content:center; padding:20px;"><div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;"><h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2><div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;"><small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b></div>
+    
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+            <small style="color:#94a3b8;">HISTORICAL PNL</small><br><b style="color:${botState.historicalPnL >= 0 ? '#4ade80' : '#f87171'}">₹${botState.historicalPnL.toFixed(2)}</b>
+        </div>
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+            <small style="color:#94a3b8;">TOTAL NET PNL</small><br><b style="color:${totalNetPnL >= 0 ? '#4ade80' : '#f87171'}">₹${totalNetPnL}</b>
+        </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+            <small style="color:#94a3b8;">STRATEGY SL</small><br><b style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '-'}</b>
+        </div>
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px; border:1px solid #334155;">
+            <small style="color:#94a3b8;">EXCHANGE SL ORDER</small><br>
+            <b style="color:#fbbf24;">₹${botState.exchangeSLPrice || '-'}</b>
+            <div style="font-size:9px; color:#64748b; margin-top:2px;">${botState.slOrderId || 'NO ORDER'}</div>
+        </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b></div>
+        <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b></div>
+    </div>
+
+    <div style="display:flex; gap:10px; margin-bottom:10px;">
+            <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
+            <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
+    </div>
+    
+    <form action="/reset-pnl" method="POST" style="margin-bottom:20px;">
+        <button style="width:100%; padding:5px; background:#334155; color:#94a3b8; border:1px solid #475569; border-radius:6px; cursor:pointer; font-size:10px;">⚠️ RESET PNL HISTORY</button>
+    </form>
+
+    ${simControls}
+
+    <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
+    <table style="width:100%; border-collapse:collapse; text-align:left;">
+        <thead style="color:#64748b; font-size:10px; text-transform:uppercase;">
+            <tr><th style="padding:8px;">Time</th><th style="padding:8px;">Details</th><th style="padding:8px;">Actual</th><th style="padding:8px;">Order ID</th></tr>
+        </thead>
+        <tbody>${historyHTML}</tbody>
+    </table>
+    </div></body></html>`);
 });
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
