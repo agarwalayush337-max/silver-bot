@@ -6,8 +6,8 @@ const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
-const { MarketDataStreamerV3 } = require('upstox-js-sdk'); // 🆕 Added
-
+const UpstoxClient = require('upstox-js-sdk'); // 🆕 Import the entire client
+let currentWs = null; // 🆕 Declare this at the top too
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json()); // 🆕 Added for internal JSON handling
@@ -110,31 +110,28 @@ async function initWebSocket() {
     try {
         console.log("🔌 Initializing Manual Market Data Feed...");
         
-        // 1. Configure the SDK Client
-        let defaultClient = UpstoxClient.ApiClient.instance;
+        // 1. Setup the Client
+        let defaultClient = UpstoxClient.ApiClient.instance; // 🆕 Now this will find ApiClient
         let OAUTH2 = defaultClient.authentications['OAUTH2'];
         OAUTH2.accessToken = ACCESS_TOKEN;
 
-        // 2. Get Authorized WebSocket URL (V3)
         const apiInstance = new UpstoxClient.WebsocketApi();
+
+        // 2. Get the specific authorized URL for this connection
         apiInstance.getMarketDataFeedAuthorize("3.0", (error, data) => {
             if (error) {
-                console.error("❌ Auth Error:", error.message);
+                console.error("❌ WS Auth Error:", error.message);
                 return;
             }
 
             const wsUrl = data.data.authorizedRedirectUri;
-            console.log("📡 Authorized URL received. Connecting...");
-
-            // 3. Connect using standard WebSocket (SDK uses 'ws' internally)
             const WebSocket = require('ws'); 
             currentWs = new WebSocket(wsUrl, { followRedirects: true });
 
             currentWs.onopen = () => {
-                console.log("✅ WebSocket Open! Subscribing...");
-                // Official V3 Subscription Request Structure
+                console.log("✅ WebSocket Open! Subscribing to:", INSTRUMENT_KEY);
                 const subRequest = {
-                    guid: "bot-session-" + Date.now(),
+                    guid: "bot-" + Date.now(),
                     method: "sub",
                     data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
                 };
@@ -142,26 +139,26 @@ async function initWebSocket() {
             };
 
             currentWs.onmessage = (msg) => {
-                // Note: V3 returns Binary Protobuf data. 
-                // For a quick fix without external .proto files, 
-                // Upstox often returns a simpler JSON 'heartbeat' for ltpc mode 
-                // in some SDK versions, but usually requires decoding.
                 try {
-                    const data = JSON.parse(msg.data.toString());
-                    if (data?.feeds?.[INSTRUMENT_KEY]) {
-                        lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
-                        pushToDashboard();
+                    // V3 sends data as a buffer/string that needs parsing
+                    const response = JSON.parse(msg.data.toString());
+                    if (response?.feeds?.[INSTRUMENT_KEY]) {
+                        lastKnownLtp = response.feeds[INSTRUMENT_KEY].ltpc.ltp;
+                        pushToDashboard(); // Updates your UI
                     }
-                } catch (e) { /* Decode logic for Protobuf would go here */ }
+                } catch (e) { /* Protobuf binary data handling would go here if needed */ }
             };
 
-            currentWs.onerror = (err) => console.error("❌ WS Error:", err.message);
-            currentWs.onclose = () => { currentWs = null; console.log("🔌 WS Closed."); };
+            currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
+            currentWs.onclose = () => {
+                console.log("🔌 WebSocket Closed.");
+                currentWs = null; // Reset for the Watchdog to try again
+            };
         });
 
     } catch (e) { 
         currentWs = null;
-        console.error("❌ Init Failed:", e.message); 
+        console.error("❌ WS Setup Crash:", e.message); 
     }
 }
 
@@ -169,6 +166,10 @@ async function initWebSocket() {
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
+    if (currentWs) {
+        try { currentWs.close(); } catch(e) {}
+        currentWs = null;
+    }
     let browser = null;
     try {
         const totp = new OTPAuth.TOTP({ algorithm: 'SHA1', digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
