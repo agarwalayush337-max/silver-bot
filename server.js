@@ -384,7 +384,9 @@ async function performAutoLogin() {
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
         
-        console.log("🎉 SUCCESS! Session Active. Closing Browser...");
+        await initWebSocket();
+        
+        console.log("🎉 SUCCESS! Session Active & Socket Started.");
         if (browser) await browser.close(); 
         browser = null;
 
@@ -424,9 +426,12 @@ async function fetchLatestOrderId() {
     } catch (e) { console.log("ID Fetch Failed: " + e.message); } return null;
 }
 
+// --- VERIFY ORDER (Updates Dashboard Logs) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
+    
+    // Wait a moment for the exchange to process the fill
     if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
 
     try {
@@ -439,35 +444,53 @@ async function verifyOrderStatus(orderId, context) {
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
             
-            // ✅ NEW: If this was an SL order that just filled, CLEAR the position
+            // 1. Update State (PnL / Position)
             if (context === 'EXIT_CHECK') {
-                console.log("✅ Exchange SL Filled! Clearing Position.");
                 if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
                 if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
                 botState.positionType = null;
                 botState.slOrderId = null;
+                botState.currentStop = null;
+                
+                // Add SL Exit Log if missing
+                const exists = botState.history.find(h => h.id === orderId);
+                if (!exists) {
+                     botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SL-EXIT", price: realPrice, id: orderId, status: "FILLED" });
+                }
             } 
-            // Standard Entry Logic
             else if (botState.positionType) {
                 botState.entryPrice = realPrice;
             }
+
+            // 2. FIX DASHBOARD LOGS
+            // Find the log that says "SENT" or has this ID, and update it with REAL data
+            const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
             
-            const log = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
-            if (log) { log.price = realPrice; log.status = "FILLED"; log.id = orderId; }
-            
-            await saveState();
-        } else if (['rejected', 'cancelled'].includes(order.status)) {
-            // If SL was rejected/cancelled, clear the ID so the bot knows it has no protection
-            if (context === 'EXIT_CHECK') {
-                 botState.slOrderId = null;
+            if (logIndex !== -1) {
+                botState.history[logIndex].price = realPrice; // Set Actual Execution Price
+                botState.history[logIndex].status = "FILLED";
+                botState.history[logIndex].id = orderId;      // Ensure ID is saved
             }
+
+            await saveState();
+            pushToDashboard(); // 🚀 Force UI Update
+            
+        } else if (['rejected', 'cancelled'].includes(order.status)) {
+            if (context === 'EXIT_CHECK') botState.slOrderId = null;
             else if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
             }
+            
+            // Mark log as failed
+            const log = botState.history.find(h => h.id === orderId);
+            if (log) log.status = order.status.toUpperCase();
+            
             await saveState();
+            pushToDashboard();
         }
     } catch (e) { console.log("Verification Error: " + e.message); }
 }
+// --- PLACE ORDER (Robust Logging) ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
@@ -480,15 +503,24 @@ async function placeOrder(type, qty, ltp) {
             order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, is_amo: isAmo
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
-        let orderId = res.data?.data?.order_id || 'PENDING_ID';
-        botState.history.unshift({ time: getIST().toLocaleTimeString(), type, price: limitPrice, id: orderId, status: "SENT" });
+        const orderId = res.data?.data?.order_id;
+        
+        // Log to History immediately
+        botState.history.unshift({ 
+            time: getIST().toLocaleTimeString(), 
+            type, 
+            price: limitPrice, 
+            id: orderId || "PENDING", // If ID is missing, mark as PENDING
+            status: "SENT" 
+        });
         
         const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
         await manageExchangeSL(type, qty, slPrice);
 
         await saveState();
-        // ✅ RESTORED: Call verification
-        verifyOrderStatus(orderId, 'ENTRY');
+        pushToDashboard(); // Update UI to show "SENT" immediately
+
+        if (orderId) verifyOrderStatus(orderId, 'ENTRY');
         return true;
     } catch (e) {
         console.error(`❌ ORDER FAILED: ${e.message}`);
@@ -504,9 +536,17 @@ setInterval(() => {
 
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Prevents Double Orders) ---
+// --- TRADING ENGINE (Strict WebSocket Only) ---
 setInterval(async () => {
     if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) initWebSocket();
+    
+    // 1. WebSocket Watchdog
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
+        initWebSocket();
+        // Wait for next loop; do not trade on 0 price
+        console.log("⏳ Waiting for WebSocket Price..."); 
+        return; 
+    }
 
     try {
         const candles = await getMergedCandles();
@@ -515,9 +555,6 @@ setInterval(async () => {
 
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
-            
-            // Backup Fallback
-            if (lastKnownLtp === 0) lastKnownLtp = cl[cl.length-1];
 
             const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
@@ -544,16 +581,12 @@ setInterval(async () => {
                         
                         // EXIT TRIGGER
                         if (lastKnownLtp < botState.currentStop) {
-                            // ✅ FIX: Check if SL exists. If yes, let IT do the job.
                             if (botState.slOrderId) {
-                                console.log("🛑 Stop Hit! Waiting for Exchange SL to trigger...");
-                                // We check if it filled to clear our state
+                                console.log("🛑 Stop Hit! Waiting for Exchange SL...");
                                 verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                             } else {
-                                // Only send order if NO SL exists
-                                console.log("🛑 Stop Hit! Emergency Exit (No SL found).");
-                                botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
-                                await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                                console.log("🛑 Stop Hit! Emergency Exit.");
+                                await placeOrder("SELL", botState.quantity, lastKnownLtp);
                             }
                         }
                     } else {
@@ -563,12 +596,11 @@ setInterval(async () => {
                         // EXIT TRIGGER
                         if (lastKnownLtp > botState.currentStop) {
                             if (botState.slOrderId) {
-                                console.log("🛑 Stop Hit! Waiting for Exchange SL to trigger...");
+                                console.log("🛑 Stop Hit! Waiting for Exchange SL...");
                                 verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                             } else {
-                                console.log("🛑 Stop Hit! Emergency Exit (No SL found).");
-                                botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
-                                await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
+                                console.log("🛑 Stop Hit! Emergency Exit.");
+                                await placeOrder("BUY", botState.quantity, lastKnownLtp);
                             }
                         }
                     }
