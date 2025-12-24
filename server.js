@@ -160,97 +160,104 @@ let botState = {
     slOrderId: null 
 };
 
-// --- 🧪 SIMULATION / MATRIX MODE 🧪 ---
-const SIMULATION_MODE = true; // ⬅️ SET TO TRUE TO TEST, FALSE FOR REAL TRADING
+// --- 🧪 GOD MODE SIMULATION (With Manual Controls) 🧪 ---
+const SIMULATION_MODE = true; 
+
+// Global Simulation Variables
+let mockLtp = 224000;      // Start Price
+let mockVolume = 500;      // Normal Volume
+let mockOrders = [];
+let simTrend = 0;          // 0 = Flat, 1 = Up, -1 = Down
 
 if (SIMULATION_MODE) {
-    console.log("⚠️ STARTING IN SIMULATION MODE (THE MATRIX) ⚠️");
-    console.log("Money is safe. Prices are fake. Orders are virtual.");
+    console.log("⚠️ GOD MODE ACTIVE: You control the market.");
 
-    // 1. MOCK STATE (The "Fake Exchange" Database)
-    let mockOrders = [];
-    let mockLtp = 224000;
-    
-    // 2. MOCK WEB SOCKET (Generates Fake Price Moves)
-    // We override the real initWebSocket with this fake one
+    // 1. MOCK WEB SOCKET (Stable Feed)
     initWebSocket = async function() {
-        console.log("🔌 [SIMULATION] WS Connected to Matrix Feed...");
-        currentWs = { binaryType: "mock" }; // Dummy object to satisfy checks
-        
-        // Generate a Sine Wave Price (Swings between 223,000 and 225,000 every minute)
+        console.log("🔌 [SIM] Socket Ready. Waiting for commands...");
+        currentWs = { binaryType: "mock" }; 
+
+        // Update loop (runs every second)
         setInterval(() => {
-            const time = Date.now() / 5000; // Speed of movement
-            const wave = Math.sin(time) * 1000; // Amplitude (+/- 1000 Rs)
-            const noise = (Math.random() - 0.5) * 50; // Add jitter (+/- 25 Rs)
-            
-            mockLtp = 224000 + wave + noise;
+            // Apply drift based on trend
+            if (simTrend === 1) mockLtp += (10 + Math.random() * 10); // Slow rise
+            else if (simTrend === -1) mockLtp -= (10 + Math.random() * 10); // Slow fall
+            else mockLtp += (Math.random() - 0.5) * 5; // Flat noise
+
             lastKnownLtp = parseFloat(mockLtp.toFixed(2));
-            
-            // Push update to dashboard
             pushToDashboard(); 
-            
-            // Randomly log price sometimes to show life
-            if (Math.random() < 0.1) console.log(`⚡ [SIM] Price: ₹${lastKnownLtp}`);
-        }, 1000); // Update every second
+        }, 1000);
     };
 
-    // 3. MOCK AXIOS (The "Fake API" Interceptor)
-    // We hijack axios calls to return fake data instead of calling Upstox
+    // 2. MOCK AXIOS (The "Fake Exchange")
     const originalAxios = axios;
     axios = {
         ...originalAxios,
         get: async (url, config) => {
-            // A. Mock "Retrieve All Orders"
+            // A. FAKE CANDLES (Critical for E50/E200)
+            // We generate 300 candles based on the CURRENT mock price
+            if (url.includes("/historical-candle/") || url.includes("/intraday/")) {
+                const candles = [];
+                const now = Date.now();
+                // Create 300 candles ending at current time
+                for(let i=300; i>=0; i--) {
+                    // Make candles trail nicely behind current price so E50/E200 works
+                    // If i is large (past), price is lower (uptrend simulation default)
+                    const historicPrice = mockLtp - (i * 20); 
+                    
+                    candles.push([
+                        new Date(now - i*300000).toISOString(),
+                        historicPrice,          // Open
+                        historicPrice + 50,     // High
+                        historicPrice - 50,     // Low
+                        historicPrice,          // Close
+                        mockVolume,             // Volume (Controllable)
+                        0                       // OI
+                    ]);
+                }
+                return { data: { data: { candles: candles } } };
+            }
+
+            // B. Mock "Retrieve Orders"
             if (url.includes("/order/retrieve-all")) {
                 return { data: { status: "success", data: mockOrders } };
             }
-            // B. Mock "Authorize" (Auto-Login)
+            // C. Mock "Authorize"
             if (url.includes("authorize")) {
-                return { data: { data: { authorizedRedirectUri: "wss://mock-socket" } } };
+                return { data: { data: { authorizedRedirectUri: "wss://mock" } } };
             }
-            // C. Mock "Positions" (Sync Price)
+            // D. Mock "Positions"
             if (url.includes("short-term-positions")) {
-                return { data: { status: "success", data: [] } }; // Return empty for now
+                return { data: { data: [] } };
             }
             return { data: { status: "success" } };
         },
         
         post: async (url, data, config) => {
-            // D. Mock "Place Order"
+            // E. Mock "Place Order"
             if (url.includes("/order/place")) {
                 const newId = "SIM-" + Date.now();
                 console.log(`📝 [SIM] Order Placed: ${data.transaction_type} ${data.quantity} Qty @ ₹${data.price || 'MKT'}`);
                 
-                // Create a fake "Filled" order immediately
                 mockOrders.unshift({
                     order_id: newId,
-                    status: "complete", // Instant fill for testing
-                    average_price: lastKnownLtp, // Fill at current fake price
+                    status: "complete",
+                    average_price: lastKnownLtp,
                     transaction_type: data.transaction_type,
                     quantity: data.quantity,
                     order_timestamp: new Date().toISOString()
                 });
-                
                 return { data: { status: "success", data: { order_id: newId } } };
             }
-            // E. Mock "Login Token"
+            // F. Login
             if (url.includes("login/authorization/token")) {
-                return { data: { access_token: "SIMULATION_TOKEN_123" } };
+                return { data: { access_token: "SIM_TOKEN" } };
             }
             return { data: { status: "success" } };
         },
         
-        delete: async (url, config) => {
-            // F. Mock "Cancel Order"
-            console.log("🗑️ [SIM] Order Cancelled");
-            return { data: { status: "success" } };
-        },
-        
-        put: async (url, data, config) => {
-            // G. Mock "Modify Order" (Trailing SL)
-            console.log(`🔄 [SIM] Order Modified. New Trigger: ${data.trigger_price}`);
-            return { data: { status: "success" } };
-        }
+        delete: async () => ({ data: { status: "success" } }),
+        put: async () => ({ data: { status: "success" } })
     };
 }
 
@@ -728,10 +735,26 @@ app.get('/', (req, res) => {
             </div>
         </div>`).join('');
 
+    // Only show controls if Simulation Mode is ON
+    const simControls = SIMULATION_MODE ? `
+    <div style="background:#334155; padding:10px; margin-bottom:15px; border-radius:8px; text-align:center;">
+        <h4 style="margin:0 0 10px 0; color:#fbbf24;">🎮 God Mode Controls</h4>
+        <div style="display:flex; gap:5px; justify-content:center; flex-wrap:wrap;">
+            <button onclick="fetch('/sim/pump', {method:'POST'})" style="padding:8px; background:#4ade80; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🚀 PUMP</button>
+            <button onclick="fetch('/sim/dump', {method:'POST'})" style="padding:8px; background:#f87171; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">📉 DUMP</button>
+            <button onclick="fetch('/sim/spike-vol', {method:'POST'})" style="padding:8px; background:#cbd5e1; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🔊 VOL</button>
+        </div>
+        <div style="margin-top:5px; display:flex; gap:5px; justify-content:center;">
+            <button onclick="fetch('/sim/trend-up', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend UP ⬆️</button>
+            <button onclick="fetch('/sim/trend-down', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend DOWN ⬇️</button>
+        </div>
+    </div>` : '';
+
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Silver Prime Auto</title>
             <script>
                 const source = new EventSource('/live-updates');
                 source.onmessage = (e) => {
@@ -750,10 +773,12 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
+                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
                     <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">TOTAL PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
@@ -762,6 +787,7 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
                     </div>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
@@ -770,10 +796,14 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
                     </div>
                 </div>
+
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
+
+                ${simControls}
+
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
                 <div id="logContent">${historyHTML}</div>
             </div>
@@ -830,4 +860,19 @@ app.post('/sync-price', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+
+// --- 🎮 GOD MODE CONTROLS ---
+if (SIMULATION_MODE) {
+    app.post('/sim/pump', (req, res) => { mockLtp += 300; res.send("OK"); }); // Jump UP 300
+    app.post('/sim/dump', (req, res) => { mockLtp -= 300; res.send("OK"); }); // Jump DOWN 300
+    app.post('/sim/trend-up', (req, res) => { simTrend = 1; res.send("OK"); });
+    app.post('/sim/trend-down', (req, res) => { simTrend = -1; res.send("OK"); });
+    app.post('/sim/spike-vol', (req, res) => { 
+        mockVolume = 5000; // Huge volume spike
+        setTimeout(() => mockVolume = 500, 10000); // Reset after 10s
+        res.send("OK"); 
+    });
+}
+
+
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
