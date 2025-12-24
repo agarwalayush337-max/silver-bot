@@ -1,5 +1,5 @@
 const express = require('express');
-const axios = require('axios');
+let axios = require('axios');
 const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
