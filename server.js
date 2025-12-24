@@ -154,7 +154,12 @@ async function performAutoLogin() {
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 });
+        try {
+            // Wait for the URL to contain "code=" indicating the redirect started
+            await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 30000 });
+        } catch (e) {
+            console.log("⚠️ URL check timed out, trying one last URL capture...");
+        }
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
