@@ -196,19 +196,25 @@ if (SIMULATION_MODE) {
     axios = {
         ...originalAxios,
         get: async (url, config) => {
-            // A. FAKE CANDLES (Uses mockVolume)
+            // A. FAKE CANDLES (STABLE HISTORY)
             if (url.includes("/historical-candle/") || url.includes("/intraday/")) {
                 const candles = [];
                 const now = Date.now();
+                // Generate history anchored at 224000 (NOT current price)
+                // This ensures EMA stays flat while you pump the live price
+                const basePrice = 224000; 
+                
                 for(let i=300; i>=0; i--) {
-                    const historicPrice = mockLtp - (i * 20); 
+                    // Slight wobble so it looks real, but average is 224000
+                    const historicPrice = basePrice + Math.sin(i/5) * 50; 
+                    
                     candles.push([
                         new Date(now - i*300000).toISOString(),
                         historicPrice,          
-                        historicPrice + 50,     
-                        historicPrice - 50,     
+                        historicPrice + 20,     
+                        historicPrice - 20,     
                         historicPrice,          
-                        mockVolume,             // 🆕 Uses the Global mockVolume
+                        mockVolume,             // Controlled by your button
                         0                       
                     ]);
                 }
@@ -662,11 +668,11 @@ setInterval(async () => {
             if (isMarketOpen()) {
                 if (!botState.positionType) {
                     // --- ENTRY LOGIC ---
-                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
+                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5)) {
                         botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
                         await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
+                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5)) {
                         botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
                         await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
