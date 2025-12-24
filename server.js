@@ -103,37 +103,48 @@ async function modifyExchangeSL(newTrigger) {
 // --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN) return;
+
     try {
         console.log("🔌 Initializing Market Data WebSocket...");
-        const streamer = new MarketDataStreamerV3();
         
-        // IMPORTANT: Handle the error event so the bot doesn't crash
+        // We initialize with autoReconnect: false to prevent the SDK library crash
+        const streamer = new MarketDataStreamerV3(); 
+
         streamer.on('error', (err) => {
             console.error("❌ WebSocket Streamer Error:", err.message);
-            // If it's a 401, we reset token to trigger re-login
-            if (err.message.includes('401')) ACCESS_TOKEN = null;
-        });
-
-        await streamer.connect(ACCESS_TOKEN);
-        
-        streamer.on('open', () => {
-            console.log("✅ WebSocket Connected. Subscribing to:", INSTRUMENT_KEY);
-            streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
-        });
-
-        streamer.on('data', (data) => {
-            if (data && data[INSTRUMENT_KEY]) {
-                lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                pushToDashboard(); // Updates your live dashboard
+            if (err.message.includes('401')) {
+                console.log("🔑 Token Sync Issue. Clearing token to retry...");
+                ACCESS_TOKEN = null; // Triggers fresh login via your interval
             }
         });
 
-        streamer.on('close', () => console.log("🔌 WebSocket Connection Closed."));
+        // Delay the actual connection by 5 seconds to let Upstox servers sync your token
+        console.log("⏳ Waiting 5s for session synchronization...");
+        setTimeout(async () => {
+            try {
+                await streamer.connect(ACCESS_TOKEN);
+                
+                streamer.on('open', () => {
+                    console.log("✅ WebSocket Connected. Subscribing to:", INSTRUMENT_KEY);
+                    streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+                });
+
+                streamer.on('data', (data) => {
+                    if (data && data[INSTRUMENT_KEY]) {
+                        lastKnownLtp = data[INSTRUMENT_KEY].ltp;
+                        pushToDashboard();
+                    }
+                });
+            } catch (connectErr) {
+                console.error("❌ Connection Attempt Failed:", connectErr.message);
+            }
+        }, 5000);
 
     } catch (e) { 
         console.error("❌ WS Initialization Failed:", e.message); 
     }
 }
+
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
@@ -309,7 +320,11 @@ setInterval(async () => {
         console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping (Outside Market Hours)");
         return;
     }
-
+    // If we have a token but no price, try to (re)initialize WebSocket
+    if (ACCESS_TOKEN && lastKnownLtp === 0) {
+        console.log("🔄 Price stagnant. Attempting WebSocket Init...");
+        initWebSocket();
+    }
     try {
         const candles = await getMergedCandles();
         
@@ -402,12 +417,11 @@ setInterval(async () => {
             console.log(`⏳ Building Data: ${candles.length}/200 candles loaded. Waiting for history...`);
         }
     } catch (e) { 
-        console.error("❌ Trading Loop Error:", e.message);
-        if (e.response?.status === 401) { 
-            console.log("🔑 Token expired. Re-triggering Auto-Login...");
-            ACCESS_TOKEN = null; 
-            performAutoLogin(); 
-        } 
+        if(e.response?.status === 401) {
+            console.log("❌ Unauthorized API call. Resetting session.");
+            ACCESS_TOKEN = null;
+            performAutoLogin();
+        }
     }
 }, 30000);
 
