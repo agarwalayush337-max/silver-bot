@@ -179,6 +179,7 @@ async function performAutoLogin() {
 }
 
 
+
 // --- DATA ENGINE ---
 async function getMergedCandles() {
     const today = new Date();
@@ -317,7 +318,7 @@ setInterval(async () => {
                 }
             }
         }
-    } catch (e) { if(e.response?.status===401) performAutoLogin(); }
+    } catch (e) { if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } }
 }, 30000);
 
 // --- 📡 API & LIVE DASHBOARD ---
