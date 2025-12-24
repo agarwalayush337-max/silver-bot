@@ -14,7 +14,8 @@
     "puppeteer": "latest",
     "otpauth": "^9.1.4",
     "ws": "^8.14.2",
-    "upstox-js-sdk": "^2.3.1"
+    "upstox-js-sdk": "^2.3.1",
+    "protobufjs": "^7.2.5"
   },
   "engines": {
     "node": ">=18.0.0"
