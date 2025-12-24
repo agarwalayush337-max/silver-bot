@@ -226,7 +226,7 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🔌 WEBSOCKET (Debug Mode) ---
+// --- 🔌 WEBSOCKET (Universal Decoder) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -252,53 +252,64 @@ async function initWebSocket() {
 
         currentWs.onmessage = (msg) => {
             try {
-                if (!FeedResponse) {
-                    console.error("❌ Proto Schema is undefined!"); 
-                    return;
-                }
+                if (!FeedResponse) return;
 
-                // 1. Decode Binary
+                // 1. Decode
                 const buffer = new Uint8Array(msg.data);
                 const message = FeedResponse.decode(buffer);
-                const object = FeedResponse.toObject(message, { longs: String, enums: String, bytes: String });
+                // Convert to plain object with defaults enabled
+                const object = FeedResponse.toObject(message, { 
+                    longs: String, 
+                    enums: String, 
+                    bytes: String, 
+                    defaults: true, 
+                    oneofs: true 
+                });
 
-                // Debug: Print the keys Upstox is sending (Only first 5 times to avoid spam)
-                // if (Math.random() < 0.05) console.log("📩 Keys received:", Object.keys(object?.feeds || {}));
-
-                // 2. Safe Search
+                // 2. Aggressive Search (Logs for the first few updates)
                 if (object && object.feeds) {
-                    for (const key in object.feeds) {
-                        if (key.includes("458305")) { 
-                            const feed = object.feeds[key];
-                            
-                            // 3. Extract Price
-                            let newPrice = null;
-                            if (feed.ltpc) newPrice = feed.ltpc.ltp;
-                            else if (feed.fullFeed?.marketFF?.ltpc) newPrice = feed.fullFeed.marketFF.ltpc.ltp;
-                            else if (feed.fullFeed?.indexFF?.ltpc) newPrice = feed.fullFeed.indexFF.ltpc.ltp;
+                    const keys = Object.keys(object.feeds);
+                    
+                    // DEBUG: Print keys once to see what Upstox is actually sending
+                    // if (Math.random() < 0.01) console.log("🔑 Keys:", keys);
 
-                            if (newPrice) {
-                                // Log success so you know it's working
-                                // console.log(`⚡ Decoded Price: ${newPrice}`);
+                    for (const key of keys) {
+                        const feed = object.feeds[key];
+                        let newPrice = 0;
+
+                        // 3. Hunt for Price in ALL possible locations
+                        if (feed.ltpc?.ltp) {
+                            newPrice = feed.ltpc.ltp;
+                        } else if (feed.fullFeed?.marketFF?.ltpc?.ltp) {
+                            newPrice = feed.fullFeed.marketFF.ltpc.ltp;
+                        } else if (feed.fullFeed?.indexFF?.ltpc?.ltp) {
+                            newPrice = feed.fullFeed.indexFF.ltpc.ltp;
+                        } else if (feed.firstLevelWithGreeks?.ltpc?.ltp) {
+                            newPrice = feed.firstLevelWithGreeks.ltpc.ltp;
+                        }
+
+                        // 4. Update if we found ANY valid price
+                        if (newPrice > 0) {
+                            // Match strictly or just take the first valid price (since we usually sub to 1 item)
+                            if (key.includes("458305") || keys.length === 1) {
                                 if (newPrice !== lastKnownLtp) {
                                     lastKnownLtp = newPrice;
-                                    pushToDashboard(); 
+                                    pushToDashboard(); // 🚀 Force Update
+                                    // console.log(`⚡ Price: ${newPrice}`);
                                 }
                             }
                         }
                     }
                 }
             } catch (e) { 
-                // ✅ ERROR LOGS ARE NOW ACTIVE
-                console.error("❌ Decode Error:", e.message);
+                console.error("❌ Decode Logic Error:", e.message);
             }
         };
 
-        currentWs.onclose = () => { console.log("🔌 WebSocket Disconnected"); currentWs = null; };
+        currentWs.onclose = () => { currentWs = null; };
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
-
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
