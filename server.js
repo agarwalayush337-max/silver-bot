@@ -1,5 +1,5 @@
 const express = require('express');
-let axios = require('axios');
+const axios = require('axios');
 const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
@@ -160,113 +160,6 @@ let botState = {
     slOrderId: null 
 };
 
-// --- 🧪 GOD MODE SIMULATION (With Freeze & Fast Logs) 🧪 ---
-const SIMULATION_MODE = true; 
-
-// Global Simulation Variables
-let mockLtp = 224000;      
-let mockVolume = 500;      
-let mockOrders = [];
-let simTrend = 0;          // 0 = Flat, 1 = Up, -1 = Down
-let simPaused = false;     // 🆕 Freeze State
-
-if (SIMULATION_MODE) {
-    console.log("⚠️ GOD MODE ACTIVE: You control the market.");
-
-    // 1. MOCK WEB SOCKET (Stable Feed)
-    initWebSocket = async function() {
-        console.log("🔌 [SIM] Socket Ready. Waiting for commands...");
-        currentWs = { binaryType: "mock" }; 
-
-        // Update loop (runs every second for Dashboard)
-        setInterval(() => {
-            if (!simPaused) {
-                // Apply drift based on trend
-                if (simTrend === 1) mockLtp += (10 + Math.random() * 10); 
-                else if (simTrend === -1) mockLtp -= (10 + Math.random() * 10); 
-                else mockLtp += (Math.random() - 0.5) * 5; 
-            }
-            lastKnownLtp = parseFloat(mockLtp.toFixed(2));
-            pushToDashboard(); 
-        }, 1000);
-    };
-
-    // 2. MOCK AXIOS (The "Fake Exchange")
-    // 2. MOCK AXIOS (The "Fake Exchange")
-    const originalAxios = axios;
-    axios = {
-        ...originalAxios,
-        get: async (url, config) => {
-            // A. FAKE CANDLES (STABLE HISTORY + VOL SPIKE)
-            if (url.includes("/historical-candle/") || url.includes("/intraday/")) {
-                const candles = [];
-                const now = Date.now();
-                const basePrice = 224000; 
-                
-                for(let i=300; i>=0; i--) {
-                    // History stays around 224000 so EMA is flat.
-                    const historicPrice = basePrice + Math.sin(i/5) * 50; 
-                    
-                    // 🚨 THE FIX: 
-                    // If i > 0 (History), use Low Volume (500). 
-                    // If i == 0 (Current), use your Button Volume (mockVolume).
-                    const vol = (i === 0) ? mockVolume : 500;
-
-                    candles.push([
-                        new Date(now - i*300000).toISOString(),
-                        historicPrice,          
-                        historicPrice + 20,     
-                        historicPrice - 20,     
-                        historicPrice,          
-                        vol,    // <--- Logic applied here
-                        0                       
-                    ]);
-                }
-                return { data: { data: { candles: candles } } };
-            }
-
-            // B. Mock "Retrieve Orders"
-            if (url.includes("/order/retrieve-all")) {
-                return { data: { status: "success", data: mockOrders } };
-            }
-            // C. Mock "Authorize"
-            if (url.includes("authorize")) {
-                return { data: { data: { authorizedRedirectUri: "wss://mock" } } };
-            }
-            // D. Mock "Positions"
-            if (url.includes("short-term-positions")) {
-                return { data: { data: [] } };
-            }
-            return { data: { status: "success" } };
-        },
-        
-        post: async (url, data, config) => {
-            // E. Mock "Place Order"
-            if (url.includes("/order/place")) {
-                const newId = "SIM-" + Date.now();
-                console.log(`📝 [SIM] Order Placed: ${data.transaction_type} ${data.quantity} Qty @ ₹${data.price || 'MKT'}`);
-                
-                mockOrders.unshift({
-                    order_id: newId,
-                    status: "complete",
-                    average_price: lastKnownLtp,
-                    transaction_type: data.transaction_type,
-                    quantity: data.quantity,
-                    order_timestamp: new Date().toISOString()
-                });
-                return { data: { status: "success", data: { order_id: newId } } };
-            }
-            // F. Login
-            if (url.includes("login/authorization/token")) {
-                return { data: { access_token: "SIM_TOKEN" } };
-            }
-            return { data: { status: "success" } };
-        },
-        
-        delete: async () => ({ data: { status: "success" } }),
-        put: async () => ({ data: { status: "success" } })
-    };
-}
 // --- STATE MANAGEMENT ---
 async function loadState() {
     try {
@@ -644,58 +537,41 @@ setInterval(() => {
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
-// --- TRADING ENGINE (Fixed: Uses Live Price & Includes Catch Block) ---
-// --- TRADING ENGINE (Fixed Logs & Live Price Logic) ---
 setInterval(async () => {
     if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) { initWebSocket(); console.log("⏳ Waiting for WS..."); return; }
+    
+    // 1. WebSocket Watchdog
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
+        initWebSocket();
+        // Wait for next loop; do not trade on 0 price
+        console.log("⏳ Waiting for WebSocket Price..."); 
+        return; 
+    }
 
     try {
         const candles = await getMergedCandles();
-        
-        if (candles.length > 200) {
-            // 1. Calculate Indicators FIRST
-            const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
-            
-            const e50 = EMA.calculate({period: 50, values: cl});
-            const curE50 = e50[e50.length-1];
-            
-            const vAvg = SMA.calculate({period: 20, values: v});
-            const curV = v[v.length-1];
-            const curAvgV = vAvg[vAvg.length-1];
-            
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-            const curA = atr[atr.length-1];
+        console.log(`--------------------------------------------------`);
+        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs?'Live':'Off'}`);
 
-            // 2. LOG EVERYTHING (So you can debug)
-            console.log(`--------------------------------------------------`);
-            console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp}`);
-            console.log(`📊 EMA50: ${curE50.toFixed(0)} | Vol: ${curV} | AvgVol: ${curAvgV.toFixed(0)}`);
-            console.log(`🎯 Condition: Price > EMA? ${lastKnownLtp > curE50} | Vol > 1.5x? ${curV > (curAvgV * 1.5)}`);
+        if (candles.length > 200) {
+            const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
+
+            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
+            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
+
+            console.log(`📈 E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV}`);
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
-                    // --- ENTRY LOGIC (Uses LIVE PRICE) ---
-                    
-                    // LONG: Live Price > EMA50 + Volume Spike
-                    if (lastKnownLtp > curE50 && curV > (curAvgV * 1.5)) {
-                        console.log("🚀 BUY SIGNAL: Live Price > EMA50 & High Vol");
-                        botState.positionType = 'LONG'; 
-                        botState.entryPrice = lastKnownLtp; 
-                        botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp - (curA * 3);
-                        await saveState(); 
-                        await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                    // --- ENTRY LOGIC ---
+                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
+                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
+                        await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    // SHORT: Live Price < EMA50 + Volume Spike
-                    else if (lastKnownLtp < curE50 && curV > (curAvgV * 1.5)) {
-                        console.log("🚀 SELL SIGNAL: Live Price < EMA50 & High Vol");
-                        botState.positionType = 'SHORT'; 
-                        botState.entryPrice = lastKnownLtp; 
-                        botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp + (curA * 3);
-                        await saveState(); 
-                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
+                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
+                        await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
                     // --- EXIT / TRAILING LOGIC ---
@@ -703,6 +579,7 @@ setInterval(async () => {
                         let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (ns > botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
                         
+                        // EXIT TRIGGER
                         if (lastKnownLtp < botState.currentStop) {
                             if (botState.slOrderId) {
                                 console.log("🛑 Stop Hit! Waiting for Exchange SL...");
@@ -716,6 +593,7 @@ setInterval(async () => {
                         let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
                         if (ns < botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
                         
+                        // EXIT TRIGGER
                         if (lastKnownLtp > botState.currentStop) {
                             if (botState.slOrderId) {
                                 console.log("🛑 Stop Hit! Waiting for Exchange SL...");
@@ -732,7 +610,7 @@ setInterval(async () => {
     } catch (e) { 
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
-}, 5000);
+}, 30000);
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
@@ -756,27 +634,10 @@ app.get('/', (req, res) => {
             </div>
         </div>`).join('');
 
-    // Only show controls if Simulation Mode is ON
-    // Only show controls if Simulation Mode is ON
-    const simControls = SIMULATION_MODE ? `
-    <div style="background:#334155; padding:10px; margin-bottom:15px; border-radius:8px; text-align:center;">
-        <h4 style="margin:0 0 10px 0; color:#fbbf24;">🎮 God Mode Controls</h4>
-        <div style="display:flex; gap:5px; justify-content:center; flex-wrap:wrap;">
-            <button onclick="fetch('/sim/pump', {method:'POST'})" style="padding:8px; background:#4ade80; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🚀 PUMP</button>
-            <button onclick="fetch('/sim/dump', {method:'POST'})" style="padding:8px; background:#f87171; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">📉 DUMP</button>
-            <button onclick="fetch('/sim/spike-vol', {method:'POST'})" style="padding:8px; background:#cbd5e1; border:none; border-radius:4px; cursor:pointer; color:black; font-weight:bold;">🔊 VOL HIGH</button>
-        </div>
-        <div style="margin-top:5px; display:flex; gap:5px; justify-content:center;">
-            <button onclick="fetch('/sim/trend-up', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend UP ⬆️</button>
-            <button onclick="fetch('/sim/freeze', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer; background:#fbbf24; color:black;">PAUSE ⏸️</button>
-            <button onclick="fetch('/sim/trend-down', {method:'POST'})" style="padding:5px; font-size:10px; cursor:pointer;">Trend DOWN ⬇️</button>
-        </div>
-    </div>` : '';
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Silver Prime Auto</title>
             <script>
                 const source = new EventSource('/live-updates');
                 source.onmessage = (e) => {
@@ -795,12 +656,10 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
-                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
                     <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
-
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">TOTAL PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
@@ -809,7 +668,6 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
                     </div>
                 </div>
-
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
@@ -818,14 +676,10 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
                     </div>
                 </div>
-
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
-
-                ${simControls}
-
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
                 <div id="logContent">${historyHTML}</div>
             </div>
@@ -882,19 +736,4 @@ app.post('/sync-price', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-
-// --- 🎮 GOD MODE CONTROLS ---
-if (SIMULATION_MODE) {
-    app.post('/sim/pump', (req, res) => { mockLtp += 300; res.send("OK"); }); // Jump UP 300
-    app.post('/sim/dump', (req, res) => { mockLtp -= 300; res.send("OK"); }); // Jump DOWN 300
-    app.post('/sim/trend-up', (req, res) => { simTrend = 1; res.send("OK"); });
-    app.post('/sim/trend-down', (req, res) => { simTrend = -1; res.send("OK"); });
-    app.post('/sim/spike-vol', (req, res) => { 
-        mockVolume = 5000; // Huge volume spike
-        setTimeout(() => mockVolume = 500, 10000); // Reset after 10s
-        res.send("OK"); 
-    });
-}
-
-
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
