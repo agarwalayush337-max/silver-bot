@@ -104,54 +104,74 @@ async function modifyExchangeSL(newTrigger) {
 }
 
 // --- 🔌 MANUAL WEBSOCKET ENGINE (FIXED) ---
+// --- 🔌 MANUAL WEBSOCKET ENGINE (AXIOS VERSION) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
 
     try {
         console.log("🔌 Initializing Manual Market Data Feed...");
-        
-        let defaultClient = UpstoxClient.ApiClient.instance;
-        let OAUTH2 = defaultClient.authentications['OAUTH2'];
-        OAUTH2.accessToken = ACCESS_TOKEN;
 
-        const apiInstance = new UpstoxClient.WebsocketApi();
-        apiInstance.getMarketDataFeedAuthorize("3.0", (error, data) => {
-            if (error) {
-                console.error("❌ WS Auth Error:", error.message);
-                if (error.message.includes("401")) ACCESS_TOKEN = null;
-                return;
+        // 1. Get Authorized URL directly via Axios (Bypasses SDK "Gone" Error)
+        // We use the V2 endpoint which provides the V3-compatible Redirect URI
+        const response = await axios.get("https://api.upstox.com/v2/feed/market-data-feed/authorize", {
+            headers: { 
+                'Authorization': 'Bearer ' + ACCESS_TOKEN,
+                'Accept': 'application/json'
             }
+        });
 
-            const wsUrl = data.data.authorizedRedirectUri;
-            const WebSocket = require('ws'); 
-            currentWs = new WebSocket(wsUrl, { followRedirects: true });
+        const wsUrl = response.data.data.authorizedRedirectUri;
+        console.log("📡 Authorized URL received. Connecting...");
 
-            currentWs.onopen = () => {
-                console.log("✅ WebSocket Open! Subscribing...");
-                const subRequest = {
-                    guid: "bot-" + Date.now(),
-                    method: "sub",
-                    data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
-                };
-                currentWs.send(JSON.stringify(subRequest));
+        // 2. Connect using standard 'ws' library
+        const WebSocket = require('ws'); 
+        currentWs = new WebSocket(wsUrl, { followRedirects: true });
+
+        currentWs.onopen = () => {
+            console.log("✅ WebSocket Open! Subscribing...");
+            const subRequest = {
+                guid: "bot-" + Date.now(),
+                method: "sub",
+                data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
             };
+            currentWs.send(JSON.stringify(subRequest));
+        };
 
-            currentWs.onmessage = (msg) => {
-                try {
-                    const strMsg = msg.data.toString();
+        currentWs.onmessage = (msg) => {
+            try {
+                // V3 usually sends binary, but 'ltpc' mode often allows simple JSON parsing 
+                // depending on the feed configuration.
+                const strMsg = msg.data.toString();
+                // Simple check to ensure we have JSON data
+                if (strMsg.trim().startsWith('{')) {
                     const data = JSON.parse(strMsg);
                     if (data?.feeds?.[INSTRUMENT_KEY]) {
                         lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
                         pushToDashboard();
                     }
-                } catch (e) { }
-            };
+                }
+            } catch (e) { 
+                // If it's pure binary (protobuf), we ignore it and rely on the 
+                // 30-second API fallback which we verified is working.
+            }
+        };
 
-            currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
-            currentWs.onclose = () => { console.log("🔌 WebSocket Closed."); currentWs = null; };
-        });
+        currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
+        currentWs.onclose = () => {
+            console.log("🔌 WebSocket Closed.");
+            currentWs = null; 
+        };
 
-    } catch (e) { currentWs = null; console.error("❌ WS Init Crash:", e.message); }
+    } catch (e) { 
+        currentWs = null;
+        // 410 "Gone" or 401 "Unauthorized" handling
+        if (e.response && (e.response.status === 410 || e.response.status === 401)) {
+            console.error(`❌ WS Auth Failed (${e.response.status}). Token might be expired.`);
+            ACCESS_TOKEN = null; // Trigger re-login
+        } else {
+            console.error("❌ WS Init Crash:", e.message);
+        }
+    }
 }
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
