@@ -668,13 +668,29 @@ setInterval(async () => {
             if (isMarketOpen()) {
                 if (!botState.positionType) {
                     // --- ENTRY LOGIC ---
-                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5)) {
-                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
-                        await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                    // --- ENTRY LOGIC (FIXED: Uses Live Price) ---
+                    
+                    // LONG: LIVE Price > EMA50 + Volume
+                    // We changed 'cl[cl.length-2]' to 'lastKnownLtp'
+                    if (lastKnownLtp > curE50 && curV > (curAvgV * 1.5)) {
+                        console.log("🚀 BUY SIGNAL: Live Price > EMA50 & High Vol");
+                        botState.positionType = 'LONG'; 
+                        botState.entryPrice = lastKnownLtp; 
+                        botState.quantity = MAX_QUANTITY; 
+                        botState.currentStop = lastKnownLtp - (curA * 3);
+                        await saveState(); 
+                        await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5)) {
-                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
-                        await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    // SHORT: LIVE Price < EMA50 + Volume
+                    else if (lastKnownLtp < curE50 && curV > (curAvgV * 1.5)) {
+                        console.log("🚀 SELL SIGNAL: Live Price < EMA50 & High Vol");
+                        botState.positionType = 'SHORT'; 
+                        botState.entryPrice = lastKnownLtp; 
+                        botState.quantity = MAX_QUANTITY; 
+                        botState.currentStop = lastKnownLtp + (curA * 3);
+                        await saveState(); 
+                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    }
                     }
                 } else {
                     // --- EXIT / TRAILING LOGIC ---
