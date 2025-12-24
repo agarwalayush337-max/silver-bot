@@ -160,6 +160,100 @@ let botState = {
     slOrderId: null 
 };
 
+// --- 🧪 SIMULATION / MATRIX MODE 🧪 ---
+const SIMULATION_MODE = true; // ⬅️ SET TO TRUE TO TEST, FALSE FOR REAL TRADING
+
+if (SIMULATION_MODE) {
+    console.log("⚠️ STARTING IN SIMULATION MODE (THE MATRIX) ⚠️");
+    console.log("Money is safe. Prices are fake. Orders are virtual.");
+
+    // 1. MOCK STATE (The "Fake Exchange" Database)
+    let mockOrders = [];
+    let mockLtp = 224000;
+    
+    // 2. MOCK WEB SOCKET (Generates Fake Price Moves)
+    // We override the real initWebSocket with this fake one
+    initWebSocket = async function() {
+        console.log("🔌 [SIMULATION] WS Connected to Matrix Feed...");
+        currentWs = { binaryType: "mock" }; // Dummy object to satisfy checks
+        
+        // Generate a Sine Wave Price (Swings between 223,000 and 225,000 every minute)
+        setInterval(() => {
+            const time = Date.now() / 5000; // Speed of movement
+            const wave = Math.sin(time) * 1000; // Amplitude (+/- 1000 Rs)
+            const noise = (Math.random() - 0.5) * 50; // Add jitter (+/- 25 Rs)
+            
+            mockLtp = 224000 + wave + noise;
+            lastKnownLtp = parseFloat(mockLtp.toFixed(2));
+            
+            // Push update to dashboard
+            pushToDashboard(); 
+            
+            // Randomly log price sometimes to show life
+            if (Math.random() < 0.1) console.log(`⚡ [SIM] Price: ₹${lastKnownLtp}`);
+        }, 1000); // Update every second
+    };
+
+    // 3. MOCK AXIOS (The "Fake API" Interceptor)
+    // We hijack axios calls to return fake data instead of calling Upstox
+    const originalAxios = axios;
+    axios = {
+        ...originalAxios,
+        get: async (url, config) => {
+            // A. Mock "Retrieve All Orders"
+            if (url.includes("/order/retrieve-all")) {
+                return { data: { status: "success", data: mockOrders } };
+            }
+            // B. Mock "Authorize" (Auto-Login)
+            if (url.includes("authorize")) {
+                return { data: { data: { authorizedRedirectUri: "wss://mock-socket" } } };
+            }
+            // C. Mock "Positions" (Sync Price)
+            if (url.includes("short-term-positions")) {
+                return { data: { status: "success", data: [] } }; // Return empty for now
+            }
+            return { data: { status: "success" } };
+        },
+        
+        post: async (url, data, config) => {
+            // D. Mock "Place Order"
+            if (url.includes("/order/place")) {
+                const newId = "SIM-" + Date.now();
+                console.log(`📝 [SIM] Order Placed: ${data.transaction_type} ${data.quantity} Qty @ ₹${data.price || 'MKT'}`);
+                
+                // Create a fake "Filled" order immediately
+                mockOrders.unshift({
+                    order_id: newId,
+                    status: "complete", // Instant fill for testing
+                    average_price: lastKnownLtp, // Fill at current fake price
+                    transaction_type: data.transaction_type,
+                    quantity: data.quantity,
+                    order_timestamp: new Date().toISOString()
+                });
+                
+                return { data: { status: "success", data: { order_id: newId } } };
+            }
+            // E. Mock "Login Token"
+            if (url.includes("login/authorization/token")) {
+                return { data: { access_token: "SIMULATION_TOKEN_123" } };
+            }
+            return { data: { status: "success" } };
+        },
+        
+        delete: async (url, config) => {
+            // F. Mock "Cancel Order"
+            console.log("🗑️ [SIM] Order Cancelled");
+            return { data: { status: "success" } };
+        },
+        
+        put: async (url, data, config) => {
+            // G. Mock "Modify Order" (Trailing SL)
+            console.log(`🔄 [SIM] Order Modified. New Trigger: ${data.trigger_price}`);
+            return { data: { status: "success" } };
+        }
+    };
+}
+
 // --- STATE MANAGEMENT ---
 async function loadState() {
     try {
