@@ -21,7 +21,8 @@ const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, RED
 const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
 
 let ACCESS_TOKEN = null;
-let lastKnownLtp = 0; 
+let lastKnownLtp = 0;
+let currentStreamer = null; // 🆕 Add this line here
 let sseClients = []; // 🆕 Added for Real-time SSE
 let botState = { 
     positionType: null, 
@@ -102,32 +103,32 @@ async function modifyExchangeSL(newTrigger) {
 
 // --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
 async function initWebSocket() {
+    // Prevent multiple simultaneous connection attempts
     if (!ACCESS_TOKEN || currentStreamer) return;
 
     try {
-        console.log("🔌 Initializing Market Data WebSocket (Manual Mode)...");
+        console.log("🔌 Initializing Market Data WebSocket...");
         
-        // We use the SDK but EXPLICITLY disable their broken auto-reconnect
-        currentStreamer = new MarketDataStreamerV3(false); // 'false' disables auto-reconnect
+        // Pass 'false' to disable the SDK's broken internal auto-reconnect
+        currentStreamer = new MarketDataStreamerV3(false); 
 
         currentStreamer.on('error', (err) => {
             console.error("❌ WebSocket Error:", err.message);
             if (err.message.includes('401')) {
-                console.log("🔑 Session Invalid. Resetting for Auto-Login...");
+                console.log("🔑 Session sync failed. Resetting token...");
                 ACCESS_TOKEN = null;
             }
-            // Cleanup to prevent the "clearSubscriptions" crash
-            currentStreamer = null; 
+            currentStreamer = null; // Reset so watchdog can try again
         });
 
-        console.log("⏳ Waiting 10s for Upstox server sync...");
+        // 10 second delay to allow Upstox servers to sync the new token
         setTimeout(async () => {
-            if (!ACCESS_TOKEN) return;
+            if (!ACCESS_TOKEN || !currentStreamer) return;
             try {
                 await currentStreamer.connect(ACCESS_TOKEN);
                 
                 currentStreamer.on('open', () => {
-                    console.log("✅ Connected! Monitoring:", INSTRUMENT_KEY);
+                    console.log("✅ WebSocket Connected. Monitoring:", INSTRUMENT_KEY);
                     currentStreamer.subscribe([INSTRUMENT_KEY], 'ltpc');
                 });
 
@@ -143,14 +144,13 @@ async function initWebSocket() {
                     currentStreamer = null;
                 });
             } catch (e) {
-                console.log("❌ Connection failed, will retry via Watchdog.");
                 currentStreamer = null;
             }
         }, 10000);
 
     } catch (e) {
         currentStreamer = null;
-        console.error("❌ WS Setup Error:", e.message);
+        console.error("❌ WS Init Error:", e.message);
     }
 }
 
@@ -213,10 +213,17 @@ async function performAutoLogin() {
 
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
-        if (browser) await browser.close();
-        console.log("🎉 SUCCESS! Session Active.");
+        if (browser) await browser.close(); 
+
+        console.log("🎉 SUCCESS! Session Active. Closing browser. Watchdog will start WS.");
     
-        botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
+        botState.history.unshift({ 
+            time: getIST().toLocaleTimeString(), 
+            type: "SYSTEM", 
+            price: 0, 
+            id: "Login", 
+            status: "OK" 
+        });
         await saveState();
      
     } catch (e) { console.error("❌ Auto-Login Failed:", e.message); } 
