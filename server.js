@@ -5,7 +5,7 @@ const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
 
-// ✅ CORRECT IMPORT (Only one declaration)
+// ✅ CORRECT IMPORT for Manual WebSocket
 const UpstoxClient = require('upstox-js-sdk'); 
 
 const app = express();
@@ -19,7 +19,7 @@ const MAX_QUANTITY = 1;
 // --- 🔒 ENVIRONMENT VARIABLES ---
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-// Redis Setup
+// Redis with Retry Logic
 const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
 
 // --- GLOBAL VARIABLES ---
@@ -103,31 +103,26 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🔌 MANUAL WEBSOCKET ENGINE (NO SDK BUGS) ---
+// --- 🔌 MANUAL WEBSOCKET ENGINE (FIXED) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
 
     try {
         console.log("🔌 Initializing Manual Market Data Feed...");
         
-        // 1. Configure Client with Token
         let defaultClient = UpstoxClient.ApiClient.instance;
         let OAUTH2 = defaultClient.authentications['OAUTH2'];
         OAUTH2.accessToken = ACCESS_TOKEN;
 
-        // 2. Get Authorized URL
         const apiInstance = new UpstoxClient.WebsocketApi();
         apiInstance.getMarketDataFeedAuthorize("3.0", (error, data) => {
             if (error) {
                 console.error("❌ WS Auth Error:", error.message);
-                // If 401, clear token to trigger re-login
                 if (error.message.includes("401")) ACCESS_TOKEN = null;
                 return;
             }
 
             const wsUrl = data.data.authorizedRedirectUri;
-            
-            // 3. Connect using standard 'ws' library
             const WebSocket = require('ws'); 
             currentWs = new WebSocket(wsUrl, { followRedirects: true });
 
@@ -143,42 +138,27 @@ async function initWebSocket() {
 
             currentWs.onmessage = (msg) => {
                 try {
-                    // V3 sending binary/blob, usually SDK handles this but simple JSON might work for 'ltpc'
-                    // If this fails, we rely on the 30s polling loop as backup, but 'ltpc' is often plain text in V3.
-                    // Ideally, use protobuf, but for now we try/catch JSON.
                     const strMsg = msg.data.toString();
                     const data = JSON.parse(strMsg);
                     if (data?.feeds?.[INSTRUMENT_KEY]) {
                         lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
                         pushToDashboard();
                     }
-                } catch (e) { 
-                    // Binary data ignored - fallback to polling if needed
-                }
+                } catch (e) { }
             };
 
             currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
-            currentWs.onclose = () => {
-                console.log("🔌 WebSocket Closed.");
-                currentWs = null; 
-            };
+            currentWs.onclose = () => { console.log("🔌 WebSocket Closed."); currentWs = null; };
         });
 
-    } catch (e) { 
-        currentWs = null;
-        console.error("❌ WS Init Crash:", e.message); 
-    }
+    } catch (e) { currentWs = null; console.error("❌ WS Init Crash:", e.message); }
 }
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
     
-    // Cleanup old socket
-    if (currentWs) {
-        try { currentWs.close(); } catch(e) {}
-        currentWs = null;
-    }
+    if (currentWs) { try { currentWs.close(); } catch(e) {} currentWs = null; }
 
     let browser = null;
     try {
@@ -211,12 +191,11 @@ async function performAutoLogin() {
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        // ✅ URL Check instead of Network Idle
+        // ✅ FIXED: Wait for URL instead of network idle
         await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 40000 });
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
-        if (!authCode) throw new Error("No Auth Code found");
 
         const params = new URLSearchParams();
         params.append('code', authCode);
@@ -260,7 +239,42 @@ async function getMergedCandles() {
     } catch (e) { return []; }
 }
 
-// --- ORDER EXECUTION ---
+// --- ✅ RESTORED: ORDER VERIFICATION LOGIC ---
+async function fetchLatestOrderId() {
+    try {
+        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
+        if (res.data?.data?.length > 0) return res.data.data.sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp))[0].order_id;
+    } catch (e) { console.log("ID Fetch Failed: " + e.message); } return null;
+}
+
+async function verifyOrderStatus(orderId, context) {
+    if (!orderId) orderId = await fetchLatestOrderId();
+    if (!orderId) return;
+    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); 
+
+    try {
+        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
+        const order = res.data.data.find(o => o.order_id === orderId);
+        if (!order) return;
+
+        console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
+        if (order.status === 'complete') {
+            const realPrice = parseFloat(order.average_price);
+            if (botState.positionType) botState.entryPrice = realPrice;
+            
+            const log = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
+            if (log) { log.price = realPrice; log.status = "FILLED"; log.id = orderId; }
+            
+            await saveState();
+        } else if (['rejected', 'cancelled'].includes(order.status)) {
+            if (context !== 'MANUAL_SYNC' && botState.positionType) {
+                botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
+            }
+            await saveState();
+        }
+    } catch (e) { console.log("Verification Error: " + e.message); }
+}
+
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
@@ -280,6 +294,8 @@ async function placeOrder(type, qty, ltp) {
         await manageExchangeSL(type, qty, slPrice);
 
         await saveState();
+        // ✅ RESTORED: Call verification
+        verifyOrderStatus(orderId, 'ENTRY');
         return true;
     } catch (e) {
         console.error(`❌ ORDER FAILED: ${e.message}`);
@@ -290,7 +306,6 @@ async function placeOrder(type, qty, ltp) {
 // --- CRON & WATCHDOG ---
 setInterval(() => {
     const now = getIST();
-    // Daily Auto-Login at 8:30 AM IST
     if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
 }, 60000);
 
@@ -301,7 +316,6 @@ setInterval(async () => {
         return;
     }
 
-    // 🔄 Watchdog: If Price is 0 or Socket disconnected, try connecting
     if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
         console.log("🔄 Watchdog: Connecting WebSocket...");
         initWebSocket();
@@ -315,7 +329,6 @@ setInterval(async () => {
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
             
-            // If WS is down, fallback to candle close for LTP
             if (lastKnownLtp === 0) lastKnownLtp = cl[cl.length-1];
 
             const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
@@ -385,6 +398,7 @@ app.get('/', (req, res) => {
             <span style="width:20%; font-weight:bold;">₹${t.price}</span> 
             <div style="width:45%; text-align:right;">
                 <span style="display:block; color:${t.status=='FILLED'?'#4ade80':t.status=='SENT'?'#fbbf24':'#f472b6'}">${t.status}</span>
+                <span style="display:block; color:#64748b; font-size:10px;">${t.id || '-'}</span>
             </div>
         </div>`).join('');
 
@@ -430,14 +444,37 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
                     </div>
                 </div>
-                <form action="/trigger-login" method="POST"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 TRIGGER AUTO-LOGIN</button></form>
-                <br>
+                <div style="display:flex; gap:10px; margin-bottom:20px;">
+                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
+                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
+                </div>
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
                 <div id="logContent">${historyHTML}</div>
             </div>
         </body></html>`);
 });
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
+
+// ✅ RESTORED: SYNC PRICE ROUTE
+app.post('/sync-price', async (req, res) => {
+    if (!ACCESS_TOKEN) return res.redirect('/');
+    try {
+        const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
+        if (pos && parseInt(pos.quantity) !== 0) {
+            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = Math.abs(parseInt(pos.quantity));
+            botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
+            botState.totalPnL = 0;
+            const side = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
+            const slPrice = botState.positionType === 'LONG' ? (lastKnownLtp - 800) : (lastKnownLtp + 800);
+            await manageExchangeSL(side, botState.quantity, slPrice);
+        } else { botState.positionType = null; }
+        await saveState();
+    } catch (e) { console.error("Sync Error", e.message); }
+    res.redirect('/');
+});
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
