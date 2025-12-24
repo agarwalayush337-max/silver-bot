@@ -123,53 +123,43 @@ async function performAutoLogin() {
     try {
         const totp = new OTPAuth.TOTP({ algorithm: 'SHA1', digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
         const codeOTP = totp.generate();
-        console.log("🔐 Generated TOTP: " + codeOTP);
+        console.log("🔐 Generated TOTP.");
 
         browser = await puppeteer.launch({
-            headless: "new", // Use the stable new headless mode
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
         });
         const page = await browser.newPage();
-        await page.setViewport({ width: 1280, height: 800 }); // Fixes button visibility issues
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
         const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${API_KEY}&redirect_uri=${REDIRECT_URI}`;
         console.log("🌍 Navigating to Upstox...");
-        
-        // Changed to 'networkidle2' for better stability on Render
-        await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 40000 });
+        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // 1. Mobile Number Entry
-        await page.waitForSelector('#mobileNum', { visible: true, timeout: 20000 });
-        console.log("📱 Entering Mobile Number...");
-        await page.type('#mobileNum', UPSTOX_USER_ID, { delay: 100 });
+        const mobileInput = await page.$('#mobileNum');
+        if (!mobileInput) {
+            const pageText = await page.evaluate(() => document.body.innerText); 
+            console.error("📄 PAGE CONTENT:", pageText);
+            throw new Error("Login Page Not Loaded");
+        }
+
+        console.log("📱 Detected Login Screen. Typing Credentials...");
+        await page.type('#mobileNum', UPSTOX_USER_ID);
         await page.click('#getOtp');
         
-        // 2. OTP Entry (Handles both '#otpNum' and '#mobileOtp' variations)
-        const otpSelector = await Promise.race([
-            page.waitForSelector('#otpNum', { visible: true, timeout: 15000 }).then(() => '#otpNum'),
-            page.waitForSelector('#mobileOtp', { visible: true, timeout: 15000 }).then(() => '#mobileOtp')
-        ]);
-        
-        console.log(`🔐 Typing OTP into ${otpSelector}...`);
-        await page.type(otpSelector, codeOTP, { delay: 100 });
+        await page.waitForSelector('#otpNum', { visible: true, timeout: 30000 });
+        await page.type('#otpNum', codeOTP);
         await page.click('#continueBtn');
 
-        // 3. 6-Digit PIN Entry
-        await page.waitForSelector('#pinCode', { visible: true, timeout: 15000 });
-        console.log("🔑 Entering Security PIN...");
-        await page.type('#pinCode', UPSTOX_PIN, { delay: 100 });
+        await page.waitForSelector('#pinCode', { visible: true, timeout: 30000 });
+        await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        // 4. Capture Auth Code from Redirect
-        console.log("⏳ Waiting for Redirect...");
         await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 });
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
-        if (!authCode) throw new Error("No Auth Code found in URL: " + finalUrl);
+        if (!authCode) throw new Error("No Auth Code found");
 
-        // 5. Exchange Code for Access Token
         const params = new URLSearchParams();
         params.append('code', authCode);
         params.append('client_id', API_KEY);
@@ -177,22 +167,17 @@ async function performAutoLogin() {
         params.append('redirect_uri', REDIRECT_URI);
         params.append('grant_type', 'authorization_code');
 
-        const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { 
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-        
+        const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
         console.log("🎉 SUCCESS! Session Active.");
         
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
         await saveState();
 
-    } catch (e) { 
-        console.error("❌ Auto-Login Failed:", e.message); 
-    } finally { 
-        if (browser) await browser.close(); 
-    }
+    } catch (e) { console.error("❌ Auto-Login Failed:", e.message); } 
+    finally { if (browser) await browser.close(); }
 }
+
 
 // --- DATA ENGINE ---
 async function getMergedCandles() {
