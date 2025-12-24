@@ -131,7 +131,7 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🔌 WEBSOCKET (Binary Decoded) ---
+// --- 🔌 WEBSOCKET (Binary Decoded with Debugging) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -143,8 +143,7 @@ async function initWebSocket() {
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(wsUrl, { followRedirects: true });
         
-        // 🆕 IMPORTANT: Tell the socket to receive data as a Buffer
-        currentWs.binaryType = "arraybuffer"; 
+        currentWs.binaryType = "arraybuffer"; // Receive data as Buffer
 
         currentWs.onopen = () => {
             console.log("✅ WebSocket Connected! Subscribing...");
@@ -158,30 +157,39 @@ async function initWebSocket() {
 
         currentWs.onmessage = (msg) => {
             try {
-                // 🧠 BINARY DECODER ENGINE
-                // 1. Load data as Uint8Array
+                // Debug: Print size of incoming data
+                // console.log(`📩 Received ${msg.data.byteLength} bytes`); 
+
+                if (!FeedResponse) {
+                    throw new Error("Proto Schema not initialized (Check protobufjs install)");
+                }
+
                 const buffer = new Uint8Array(msg.data);
-                
-                // 2. Decode using the Proto Schema we defined at the top
                 const message = FeedResponse.decode(buffer);
-                
-                // 3. Convert to JSON object
                 const object = FeedResponse.toObject(message, { longs: String, enums: String, bytes: String });
                 
-                // 4. Extract Price and Update Dashboard
                 if (object?.feeds?.[INSTRUMENT_KEY]?.ltpc?.ltp) {
-                    lastKnownLtp = object.feeds[INSTRUMENT_KEY].ltpc.ltp;
-                    pushToDashboard(); // Updates UI instantly!
+                    const newPrice = object.feeds[INSTRUMENT_KEY].ltpc.ltp;
+                    
+                    // Only update and log if price CHANGED
+                    if (newPrice !== lastKnownLtp) {
+                        lastKnownLtp = newPrice;
+                        pushToDashboard(); // 🚀 INSTANT UPDATE
+                        // console.log(`⚡ Price Update: ₹${lastKnownLtp}`);
+                    }
                 }
             } catch (e) { 
-                // Ignore initial handshake or non-feed messages
+                // 🛑 THIS LOG WILL TELL US THE PROBLEM
+                console.error("❌ Decode Error:", e.message);
             }
         };
 
         currentWs.onclose = () => { currentWs = null; };
-        currentWs.onerror = () => { currentWs = null; };
+        currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
+
+
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
