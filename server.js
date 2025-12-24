@@ -227,6 +227,7 @@ async function modifyExchangeSL(newTrigger) {
 }
 
 // --- 🔌 WEBSOCKET (Universal Decoder) ---
+// --- 🔌 WEBSOCKET (Binary Request & Response) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -247,17 +248,20 @@ async function initWebSocket() {
                 method: "sub",
                 data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
             };
-            currentWs.send(JSON.stringify(subRequest));
+            
+            // 🚨 CRITICAL FIX: Send as Binary Buffer, not Text
+            // Upstox V3 ignores text frames for subscriptions
+            const binaryMsg = Buffer.from(JSON.stringify(subRequest));
+            currentWs.send(binaryMsg);
         };
 
         currentWs.onmessage = (msg) => {
             try {
                 if (!FeedResponse) return;
 
-                // 1. Decode
+                // 1. Decode Response
                 const buffer = new Uint8Array(msg.data);
                 const message = FeedResponse.decode(buffer);
-                // Convert to plain object with defaults enabled
                 const object = FeedResponse.toObject(message, { 
                     longs: String, 
                     enums: String, 
@@ -266,36 +270,24 @@ async function initWebSocket() {
                     oneofs: true 
                 });
 
-                // 2. Aggressive Search (Logs for the first few updates)
+                // 2. Universal Price Search
                 if (object && object.feeds) {
-                    const keys = Object.keys(object.feeds);
-                    
-                    // DEBUG: Print keys once to see what Upstox is actually sending
-                    // if (Math.random() < 0.01) console.log("🔑 Keys:", keys);
-
-                    for (const key of keys) {
+                    for (const key in object.feeds) {
                         const feed = object.feeds[key];
                         let newPrice = 0;
 
-                        // 3. Hunt for Price in ALL possible locations
-                        if (feed.ltpc?.ltp) {
-                            newPrice = feed.ltpc.ltp;
-                        } else if (feed.fullFeed?.marketFF?.ltpc?.ltp) {
-                            newPrice = feed.fullFeed.marketFF.ltpc.ltp;
-                        } else if (feed.fullFeed?.indexFF?.ltpc?.ltp) {
-                            newPrice = feed.fullFeed.indexFF.ltpc.ltp;
-                        } else if (feed.firstLevelWithGreeks?.ltpc?.ltp) {
-                            newPrice = feed.firstLevelWithGreeks.ltpc.ltp;
-                        }
+                        // Check all possible locations for price
+                        if (feed.ltpc?.ltp) newPrice = feed.ltpc.ltp;
+                        else if (feed.fullFeed?.marketFF?.ltpc?.ltp) newPrice = feed.fullFeed.marketFF.ltpc.ltp;
+                        else if (feed.fullFeed?.indexFF?.ltpc?.ltp) newPrice = feed.fullFeed.indexFF.ltpc.ltp;
 
-                        // 4. Update if we found ANY valid price
+                        // Update Dashboard
                         if (newPrice > 0) {
-                            // Match strictly or just take the first valid price (since we usually sub to 1 item)
-                            if (key.includes("458305") || keys.length === 1) {
+                             // Strict check or fallback if we only have 1 key
+                            if (key.includes("458305") || Object.keys(object.feeds).length === 1) {
                                 if (newPrice !== lastKnownLtp) {
                                     lastKnownLtp = newPrice;
-                                    pushToDashboard(); // 🚀 Force Update
-                                    // console.log(`⚡ Price: ${newPrice}`);
+                                    pushToDashboard(); 
                                 }
                             }
                         }
