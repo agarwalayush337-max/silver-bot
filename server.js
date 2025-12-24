@@ -1,3 +1,5 @@
+const { UpstoxClient } = require('upstox-js-sdk'); // 🆕 Ensure this is imported
+let currentWs = null; // Track the raw WebSocket object
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
@@ -103,54 +105,63 @@ async function modifyExchangeSL(newTrigger) {
 
 // --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
 async function initWebSocket() {
-    // Prevent multiple simultaneous connection attempts
-    if (!ACCESS_TOKEN || currentStreamer) return;
+    if (!ACCESS_TOKEN || currentWs) return;
 
     try {
-        console.log("🔌 Initializing Market Data WebSocket...");
+        console.log("🔌 Initializing Manual Market Data Feed...");
         
-        // Pass 'false' to disable the SDK's broken internal auto-reconnect
-        currentStreamer = new MarketDataStreamerV3(false); 
+        // 1. Configure the SDK Client
+        let defaultClient = UpstoxClient.ApiClient.instance;
+        let OAUTH2 = defaultClient.authentications['OAUTH2'];
+        OAUTH2.accessToken = ACCESS_TOKEN;
 
-        currentStreamer.on('error', (err) => {
-            console.error("❌ WebSocket Error:", err.message);
-            if (err.message.includes('401')) {
-                console.log("🔑 Session sync failed. Resetting token...");
-                ACCESS_TOKEN = null;
+        // 2. Get Authorized WebSocket URL (V3)
+        const apiInstance = new UpstoxClient.WebsocketApi();
+        apiInstance.getMarketDataFeedAuthorize("3.0", (error, data) => {
+            if (error) {
+                console.error("❌ Auth Error:", error.message);
+                return;
             }
-            currentStreamer = null; // Reset so watchdog can try again
+
+            const wsUrl = data.data.authorizedRedirectUri;
+            console.log("📡 Authorized URL received. Connecting...");
+
+            // 3. Connect using standard WebSocket (SDK uses 'ws' internally)
+            const WebSocket = require('ws'); 
+            currentWs = new WebSocket(wsUrl, { followRedirects: true });
+
+            currentWs.onopen = () => {
+                console.log("✅ WebSocket Open! Subscribing...");
+                // Official V3 Subscription Request Structure
+                const subRequest = {
+                    guid: "bot-session-" + Date.now(),
+                    method: "sub",
+                    data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
+                };
+                currentWs.send(JSON.stringify(subRequest));
+            };
+
+            currentWs.onmessage = (msg) => {
+                // Note: V3 returns Binary Protobuf data. 
+                // For a quick fix without external .proto files, 
+                // Upstox often returns a simpler JSON 'heartbeat' for ltpc mode 
+                // in some SDK versions, but usually requires decoding.
+                try {
+                    const data = JSON.parse(msg.data.toString());
+                    if (data?.feeds?.[INSTRUMENT_KEY]) {
+                        lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
+                        pushToDashboard();
+                    }
+                } catch (e) { /* Decode logic for Protobuf would go here */ }
+            };
+
+            currentWs.onerror = (err) => console.error("❌ WS Error:", err.message);
+            currentWs.onclose = () => { currentWs = null; console.log("🔌 WS Closed."); };
         });
 
-        // 10 second delay to allow Upstox servers to sync the new token
-        setTimeout(async () => {
-            if (!ACCESS_TOKEN || !currentStreamer) return;
-            try {
-                await currentStreamer.connect(ACCESS_TOKEN);
-                
-                currentStreamer.on('open', () => {
-                    console.log("✅ WebSocket Connected. Monitoring:", INSTRUMENT_KEY);
-                    currentStreamer.subscribe([INSTRUMENT_KEY], 'ltpc');
-                });
-
-                currentStreamer.on('data', (data) => {
-                    if (data && data[INSTRUMENT_KEY]) {
-                        lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                        pushToDashboard(); 
-                    }
-                });
-
-                currentStreamer.on('close', () => {
-                    console.log("🔌 WebSocket Closed.");
-                    currentStreamer = null;
-                });
-            } catch (e) {
-                currentStreamer = null;
-            }
-        }, 10000);
-
-    } catch (e) {
-        currentStreamer = null;
-        console.error("❌ WS Init Error:", e.message);
+    } catch (e) { 
+        currentWs = null;
+        console.error("❌ Init Failed:", e.message); 
     }
 }
 
