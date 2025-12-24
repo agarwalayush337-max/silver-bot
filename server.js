@@ -189,8 +189,10 @@ function calculateLivePnL() {
 function pushToDashboard() {
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
-        pnl: calculateLivePnL(), 
+        pnl: calculateLivePnL(),
+        historicalPnl: botState.totalPnL.toFixed(2), // ✅ Historical PnL
         stop: botState.currentStop,
+        slID: botState.slOrderId, // ✅ Exchange Order ID
         status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE"
     });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
@@ -550,9 +552,6 @@ setInterval(async () => {
 
     try {
         const candles = await getMergedCandles();
-        console.log(`--------------------------------------------------`);
-        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs?'Live':'Off'}`);
-
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
 
@@ -560,8 +559,7 @@ setInterval(async () => {
             const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
             const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
 
-            console.log(`📈 E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV}`);
-
+            console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Volume: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
             if (isMarketOpen()) {
                 if (!botState.positionType) {
                     // --- ENTRY LOGIC ---
@@ -623,15 +621,15 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
+    // ✅ LOG FORMAT: Time | Details | Actual Price | Order ID
     const historyHTML = botState.history.slice(0, 10).map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="width:20%; color:#94a3b8;">${t.time}</span> 
-            <b style="width:15%; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="width:20%; font-weight:bold;">₹${t.price}</span> 
-            <div style="width:45%; text-align:right;">
-                <span style="display:block; color:${t.status=='FILLED'?'#4ade80':t.status=='SENT'?'#fbbf24':'#f472b6'}">${t.status}</span>
-                <span style="display:block; color:#64748b; font-size:10px;">${t.id || '-'}</span>
-            </div>
+            <b style="width:20%; color:${t.type.includes('SYSTEM') ? '#60a5fa' : (t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24')}">
+                ${t.type === 'SYSTEM' ? 'Autologin' : t.type}
+            </b> 
+            <span style="width:25%; font-weight:bold;">₹${t.price}</span> 
+            <span style="width:35%; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
         </div>`).join('');
 
     res.send(`
@@ -643,10 +641,26 @@ app.get('/', (req, res) => {
                 source.onmessage = (e) => {
                     const d = JSON.parse(e.data);
                     document.getElementById('live-price').innerText = '₹' + d.price;
+                    
+                    // Live PnL
                     const pnlEl = document.getElementById('live-pnl');
                     pnlEl.innerText = '₹' + d.pnl;
                     pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                    
+                    // Historical PnL
+                    const histPnlEl = document.getElementById('hist-pnl');
+                    if(histPnlEl) {
+                        histPnlEl.innerText = '₹' + d.historicalPnl;
+                        histPnlEl.style.color = d.historicalPnl >= 0 ? '#4ade80' : '#f87171';
+                    }
+
+                    // Trailing SL
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
+                    
+                    // Exchange SL & ID
+                    document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
+                    document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
+
                     const stat = document.getElementById('live-status');
                     stat.innerText = d.status;
                     stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
@@ -654,20 +668,34 @@ app.get('/', (req, res) => {
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
+            <div style="width:100%; max-width:550px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
+                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
                     <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TOTAL PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
+                        <small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
                     </div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
+                        <small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${botState.totalPnL.toFixed(2)}</b>
                     </div>
                 </div>
+
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">TRAILING SL (CALC)</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">EXCHANGE SL</small><br>
+                        <b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
+                        <br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span>
+                    </div>
+                </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
                         <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
@@ -676,11 +704,18 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
                     </div>
                 </div>
-                <div style="display:flex; gap:10px; margin-bottom:20px;">
+
+                <div style="display:flex; gap:10px; margin-bottom:10px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
+                <form action="/reset-pnl" method="POST" style="margin-bottom:20px;">
+                    <button style="width:100%; padding:8px; background:#334155; color:#94a3b8; border:1px border-dashed #475569; border-radius:8px; cursor:pointer; font-size:12px;">❌ RESET HISTORICAL PNL (ONE TIME)</button>
+                </form>
+                
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between;">
+                    <span>Time</span> <span>Details</span> <span>Price</span> <span>Order ID</span>
+                </h4>
                 <div id="logContent">${historyHTML}</div>
             </div>
         </body></html>`);
@@ -736,4 +771,12 @@ app.post('/sync-price', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+
+// ✅ NEW ROUTE: One-time PnL Reset
+app.post('/reset-pnl', async (req, res) => {
+    botState.totalPnL = 0;
+    await saveState();
+    pushToDashboard();
+    res.redirect('/');
+});
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
