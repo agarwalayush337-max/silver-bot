@@ -350,8 +350,10 @@ setInterval(async () => {
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
             
-            if (lastKnownLtp === 0) lastKnownLtp = cl[cl.length-1];
-
+            // ✅ New Code (Always updates price from latest candle)
+            lastKnownLtp = cl[cl.length-1]; 
+            pushToDashboard(); // Force update the UI immediately
+            
             const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
             const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
