@@ -1,16 +1,16 @@
-const { UpstoxClient } = require('upstox-js-sdk'); // 🆕 Ensure this is imported
-let currentWs = null; // Track the raw WebSocket object
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
-const UpstoxClient = require('upstox-js-sdk'); // 🆕 Import the entire client
-let currentWs = null; // 🆕 Declare this at the top too
+
+// ✅ CORRECT IMPORT (Only one declaration)
+const UpstoxClient = require('upstox-js-sdk'); 
+
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json()); // 🆕 Added for internal JSON handling
+app.use(express.json());
 
 // --- ⚙️ CONFIGURATION ---
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
@@ -19,13 +19,14 @@ const MAX_QUANTITY = 1;
 // --- 🔒 ENVIRONMENT VARIABLES ---
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
 
-// 🆕 Modified Redis with retry protection for Render
+// Redis Setup
 const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
 
+// --- GLOBAL VARIABLES ---
 let ACCESS_TOKEN = null;
-let lastKnownLtp = 0;
-let currentStreamer = null; // 🆕 Add this line here
-let sseClients = []; // 🆕 Added for Real-time SSE
+let lastKnownLtp = 0; 
+let sseClients = []; 
+let currentWs = null; // ✅ Websocket Tracker
 let botState = { 
     positionType: null, 
     entryPrice: 0, 
@@ -33,7 +34,7 @@ let botState = {
     totalPnL: 0, 
     quantity: 0, 
     history: [],
-    slOrderId: null // 🆕 Added to track Exchange SL
+    slOrderId: null 
 };
 
 // --- STATE MANAGEMENT ---
@@ -54,7 +55,7 @@ function formatDate(date) { return date.toISOString().split('T')[0]; }
 function isApiAvailable() { const m = (getIST().getHours()*60)+getIST().getMinutes(); return m >= 330 && m < 1440; }
 function isMarketOpen() { const t = getIST(); const m = (t.getHours()*60)+t.getMinutes(); return t.getDay()!==0 && t.getDay()!==6 && m >= 540 && m < 1430; }
 
-// 🆕 Real-time PnL Calculation Helper
+// --- DASHBOARD HELPERS ---
 function calculateLivePnL() {
     let uPnL = 0;
     if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
@@ -62,7 +63,6 @@ function calculateLivePnL() {
     return (parseFloat(botState.totalPnL) + uPnL).toFixed(2);
 }
 
-// 🆕 Push real-time data to SSE clients
 function pushToDashboard() {
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
@@ -73,7 +73,7 @@ function pushToDashboard() {
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
 }
 
-// --- 🆕 UPSTOX EXCHANGE SL MANAGEMENT ---
+// --- EXCHANGE SL MANAGEMENT ---
 async function manageExchangeSL(side, qty, triggerPrice) {
     if(!ACCESS_TOKEN) return;
     try {
@@ -103,33 +103,36 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
+// --- 🔌 MANUAL WEBSOCKET ENGINE (NO SDK BUGS) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
 
     try {
         console.log("🔌 Initializing Manual Market Data Feed...");
         
-        // 1. Setup the Client
-        let defaultClient = UpstoxClient.ApiClient.instance; // 🆕 Now this will find ApiClient
+        // 1. Configure Client with Token
+        let defaultClient = UpstoxClient.ApiClient.instance;
         let OAUTH2 = defaultClient.authentications['OAUTH2'];
         OAUTH2.accessToken = ACCESS_TOKEN;
 
+        // 2. Get Authorized URL
         const apiInstance = new UpstoxClient.WebsocketApi();
-
-        // 2. Get the specific authorized URL for this connection
         apiInstance.getMarketDataFeedAuthorize("3.0", (error, data) => {
             if (error) {
                 console.error("❌ WS Auth Error:", error.message);
+                // If 401, clear token to trigger re-login
+                if (error.message.includes("401")) ACCESS_TOKEN = null;
                 return;
             }
 
             const wsUrl = data.data.authorizedRedirectUri;
+            
+            // 3. Connect using standard 'ws' library
             const WebSocket = require('ws'); 
             currentWs = new WebSocket(wsUrl, { followRedirects: true });
 
             currentWs.onopen = () => {
-                console.log("✅ WebSocket Open! Subscribing to:", INSTRUMENT_KEY);
+                console.log("✅ WebSocket Open! Subscribing...");
                 const subRequest = {
                     guid: "bot-" + Date.now(),
                     method: "sub",
@@ -140,36 +143,43 @@ async function initWebSocket() {
 
             currentWs.onmessage = (msg) => {
                 try {
-                    // V3 sends data as a buffer/string that needs parsing
-                    const response = JSON.parse(msg.data.toString());
-                    if (response?.feeds?.[INSTRUMENT_KEY]) {
-                        lastKnownLtp = response.feeds[INSTRUMENT_KEY].ltpc.ltp;
-                        pushToDashboard(); // Updates your UI
+                    // V3 sending binary/blob, usually SDK handles this but simple JSON might work for 'ltpc'
+                    // If this fails, we rely on the 30s polling loop as backup, but 'ltpc' is often plain text in V3.
+                    // Ideally, use protobuf, but for now we try/catch JSON.
+                    const strMsg = msg.data.toString();
+                    const data = JSON.parse(strMsg);
+                    if (data?.feeds?.[INSTRUMENT_KEY]) {
+                        lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
+                        pushToDashboard();
                     }
-                } catch (e) { /* Protobuf binary data handling would go here if needed */ }
+                } catch (e) { 
+                    // Binary data ignored - fallback to polling if needed
+                }
             };
 
             currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
             currentWs.onclose = () => {
                 console.log("🔌 WebSocket Closed.");
-                currentWs = null; // Reset for the Watchdog to try again
+                currentWs = null; 
             };
         });
 
     } catch (e) { 
         currentWs = null;
-        console.error("❌ WS Setup Crash:", e.message); 
+        console.error("❌ WS Init Crash:", e.message); 
     }
 }
-
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
+    
+    // Cleanup old socket
     if (currentWs) {
         try { currentWs.close(); } catch(e) {}
         currentWs = null;
     }
+
     let browser = null;
     try {
         const totp = new OTPAuth.TOTP({ algorithm: 'SHA1', digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(UPSTOX_TOTP_SECRET) });
@@ -187,11 +197,7 @@ async function performAutoLogin() {
         await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         const mobileInput = await page.$('#mobileNum');
-        if (!mobileInput) {
-            const pageText = await page.evaluate(() => document.body.innerText); 
-            console.error("📄 PAGE CONTENT:", pageText);
-            throw new Error("Login Page Not Loaded");
-        }
+        if (!mobileInput) throw new Error("Login Page Not Loaded");
 
         console.log("📱 Detected Login Screen. Typing Credentials...");
         await page.type('#mobileNum', UPSTOX_USER_ID);
@@ -205,12 +211,8 @@ async function performAutoLogin() {
         await page.type('#pinCode', UPSTOX_PIN);
         await page.click('#pinContinueBtn');
 
-        try {
-            // Wait for the URL to contain "code=" indicating the redirect started
-            await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 40000 });
-        } catch (e) {
-            console.log("⚠️ URL check timed out, trying one last URL capture...");
-        }
+        // ✅ URL Check instead of Network Idle
+        await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 40000 });
         
         const finalUrl = page.url();
         const authCode = new URL(finalUrl).searchParams.get('code');
@@ -225,24 +227,19 @@ async function performAutoLogin() {
 
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
+        
+        console.log("🎉 SUCCESS! Session Active. Closing Browser...");
         if (browser) await browser.close(); 
+        browser = null;
 
-        console.log("🎉 SUCCESS! Session Active. Closing browser. Watchdog will start WS.");
-    
-        botState.history.unshift({ 
-            time: getIST().toLocaleTimeString(), 
-            type: "SYSTEM", 
-            price: 0, 
-            id: "Login", 
-            status: "OK" 
-        });
+        botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
         await saveState();
-     
-    } catch (e) { console.error("❌ Auto-Login Failed:", e.message); } 
-    finally { if (browser) await browser.close(); }
+
+    } catch (e) { 
+        console.error("❌ Auto-Login Failed:", e.message); 
+        if (browser) await browser.close();
+    } 
 }
-
-
 
 // --- DATA ENGINE ---
 async function getMergedCandles() {
@@ -264,41 +261,6 @@ async function getMergedCandles() {
 }
 
 // --- ORDER EXECUTION ---
-async function fetchLatestOrderId() {
-    try {
-        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
-        if (res.data?.data?.length > 0) return res.data.data.sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp))[0].order_id;
-    } catch (e) { console.log("ID Fetch Failed: " + e.message); } return null;
-}
-
-async function verifyOrderStatus(orderId, context) {
-    if (!orderId) orderId = await fetchLatestOrderId();
-    if (!orderId) return;
-    if (context !== 'MANUAL_SYNC') await new Promise(r => setTimeout(r, 2000)); 
-
-    try {
-        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
-        const order = res.data.data.find(o => o.order_id === orderId);
-        if (!order) return;
-
-        console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
-        if (order.status === 'complete') {
-            const realPrice = parseFloat(order.average_price);
-            if (botState.positionType) botState.entryPrice = realPrice;
-            
-            const log = botState.history.find(h => h.id === orderId || h.id === 'PENDING_ID' || h.status === 'SENT');
-            if (log) { log.price = realPrice; log.status = "FILLED"; log.id = orderId; }
-            
-            await saveState();
-        } else if (['rejected', 'cancelled'].includes(order.status)) {
-            if (context !== 'MANUAL_SYNC' && botState.positionType) {
-                botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
-            }
-            await saveState();
-        }
-    } catch (e) { console.log("Verification Error: " + e.message); }
-}
-
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
@@ -314,142 +276,98 @@ async function placeOrder(type, qty, ltp) {
         let orderId = res.data?.data?.order_id || 'PENDING_ID';
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type, price: limitPrice, id: orderId, status: "SENT" });
         
-        // 🆕 Place Stop Loss on Exchange side
         const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
         await manageExchangeSL(type, qty, slPrice);
 
         await saveState();
-        verifyOrderStatus(orderId, 'ENTRY');
         return true;
     } catch (e) {
-        console.error(`❌ ORDER FAILED`);
+        console.error(`❌ ORDER FAILED: ${e.message}`);
         return false;
     }
 }
 
-// --- CRON & ENGINE ---
+// --- CRON & WATCHDOG ---
 setInterval(() => {
     const now = getIST();
+    // Daily Auto-Login at 8:30 AM IST
     if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
 }, 60000);
 
 // TRADING LOOP (Runs every 30s)
-// TRADING LOOP (Runs every 30s)
 setInterval(async () => {
-    // 1. Check if API is available and token exists
     if (!ACCESS_TOKEN || !isApiAvailable()) {
-        console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping (Outside Market Hours)");
+        if (!ACCESS_TOKEN) console.log("📡 Waiting for Token...");
         return;
     }
-    // WATCHDOG: If we have a token but no live price, start the socket
-    if (ACCESS_TOKEN && lastKnownLtp === 0 && !currentStreamer) {
-        console.log("🔄 Watchdog: Price missing. Starting WebSocket...");
+
+    // 🔄 Watchdog: If Price is 0 or Socket disconnected, try connecting
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
+        console.log("🔄 Watchdog: Connecting WebSocket...");
         initWebSocket();
-        return; // Wait for the 10s init to complete
     }
+
     try {
         const candles = await getMergedCandles();
-        
-        // 2. ALWAYS LOG BASIC INFO (This fixes the "Silence" in Render logs)
         console.log(`--------------------------------------------------`);
-        console.log(`🕒 Time: ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | MktOpen: ${isMarketOpen()}`);
+        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs ? 'Live' : 'Off'}`);
 
         if (candles.length > 200) {
-            // Data Preparation
-            const cl = candles.map(c => c[4]);
-            const h = candles.map(c => c[2]);
-            const l = candles.map(c => c[3]);
-            const v = candles.map(c => c[5]);
+            const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
             
-            // Calculate Indicators
-            const e50 = EMA.calculate({period: 50, values: cl});
-            const e200 = EMA.calculate({period: 200, values: cl});
-            const vAvg = SMA.calculate({period: 20, values: v});
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            // If WS is down, fallback to candle close for LTP
+            if (lastKnownLtp === 0) lastKnownLtp = cl[cl.length-1];
+
+            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            // Get Current Values
-            const curE50 = e50[e50.length - 1];
-            const curE200 = e200[e200.length - 1];
-            const curV = v[v.length - 1];
-            const curAvgV = vAvg[vAvg.length - 1];
-            const curA = atr[atr.length - 1];
+            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
+            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
 
-            // 3. LOG TECHNICAL INDICATORS (As requested)
-            console.log(`📈 E50: ${curE50.toFixed(2)} | E200: ${curE200.toFixed(2)}`);
-            console.log(`📊 Vol: ${curV} | AvgVol: ${curAvgV.toFixed(0)} | ATR: ${curA.toFixed(2)}`);
-
-            // Entry/Exit Logic Constants
-            const bH = Math.max(...h.slice(-11, -1));
-            const bL = Math.min(...l.slice(-11, -1));
+            console.log(`📈 E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV}`);
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
-                    // LONG SIGNAL: Price > E50, Volume Spike, and Breakout High
-                    if (cl[cl.length - 2] > e50[e50.length - 2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
-                        console.log("⚡ EXECUTION: LONG SIGNAL DETECTED");
-                        botState.positionType = 'LONG'; 
-                        botState.entryPrice = lastKnownLtp; 
-                        botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp - (curA * 3);
-                        await saveState(); 
-                        await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
+                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
+                        await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    // SHORT SIGNAL: Price < E50, Volume Spike, and Breakdown Low
-                    else if (cl[cl.length - 2] < e50[e50.length - 2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
-                        console.log("⚡ EXECUTION: SHORT SIGNAL DETECTED");
-                        botState.positionType = 'SHORT'; 
-                        botState.entryPrice = lastKnownLtp; 
-                        botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp + (curA * 3);
-                        await saveState(); 
-                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
+                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
+                        await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
-                    // Position Management (Trailing Stop)
                     if (botState.positionType === 'LONG') {
                         let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (ns > botState.currentStop) {
-                            botState.currentStop = ns;
-                            await modifyExchangeSL(ns); 
+                            botState.currentStop = ns; await modifyExchangeSL(ns); 
                         }
                         if (lastKnownLtp < botState.currentStop) {
-                            console.log("🛑 EXIT: LONG STOP HIT");
-                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; 
-                            botState.positionType = null;
-                            await saveState(); 
-                            await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
+                            await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
                         }
                     } else {
                         let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
                         if (ns < botState.currentStop) {
-                            botState.currentStop = ns;
-                            await modifyExchangeSL(ns); 
+                            botState.currentStop = ns; await modifyExchangeSL(ns); 
                         }
                         if (lastKnownLtp > botState.currentStop) {
-                            console.log("🛑 EXIT: SHORT STOP HIT");
-                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; 
-                            botState.positionType = null;
-                            await saveState(); 
-                            await placeOrder("BUY", botState.quantity, lastKnownLtp);
+                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
+                            await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
                         }
                     }
                 }
             }
-        } else {
-            console.log(`⏳ Building Data: ${candles.length}/200 candles loaded. Waiting for history...`);
         }
     } catch (e) { 
-        if(e.response?.status === 401) {
-            console.log("❌ Loop detected 401. Resetting...");
-            ACCESS_TOKEN = null;
-            if (currentStreamer) currentStreamer.disconnect();
-            currentStreamer = null;
-        }
+        if(e.response?.status===401) { 
+            console.log("❌ 401 Detected in Loop. Resetting.");
+            ACCESS_TOKEN = null; 
+            performAutoLogin(); 
+        } 
     }
 }, 30000);
 
-// --- 📡 API & LIVE DASHBOARD ---
-
+// --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -467,7 +385,6 @@ app.get('/', (req, res) => {
             <span style="width:20%; font-weight:bold;">₹${t.price}</span> 
             <div style="width:45%; text-align:right;">
                 <span style="display:block; color:${t.status=='FILLED'?'#4ade80':t.status=='SENT'?'#fbbf24':'#f472b6'}">${t.status}</span>
-                <span style="display:block; color:#64748b; font-size:10px;">${t.id || '-'}</span>
             </div>
         </div>`).join('');
 
@@ -491,7 +408,7 @@ app.get('/', (req, res) => {
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+            <div style="width:100%; max-width:500px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br>
@@ -513,36 +430,14 @@ app.get('/', (req, res) => {
                         <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
                     </div>
                 </div>
-                <div style="display:flex; gap:10px; margin-bottom:20px;">
-                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
-                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
-                </div>
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155;">Trade Log</h4>
+                <form action="/trigger-login" method="POST"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 TRIGGER AUTO-LOGIN</button></form>
+                <br>
                 <div id="logContent">${historyHTML}</div>
             </div>
         </body></html>`);
 });
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
-app.post('/sync-price', async (req, res) => {
-    if (!ACCESS_TOKEN) return res.redirect('/');
-    try {
-        const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        const pos = (response.data?.data || []).find(p => p.instrument_token === INSTRUMENT_KEY);
-        if (pos && parseInt(pos.quantity) !== 0) {
-            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(parseInt(pos.quantity));
-            botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
-            botState.totalPnL = 0;
-            // 🆕 Protect manual trade with Exchange SL
-            const side = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
-            const slPrice = botState.positionType === 'LONG' ? (lastKnownLtp - 800) : (lastKnownLtp + 800);
-            await manageExchangeSL(side, botState.quantity, slPrice);
-        } else { botState.positionType = null; }
-        await saveState();
-    } catch (e) { console.error("Sync Error", e.message); }
-    res.redirect('/');
-});
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
