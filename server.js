@@ -6,9 +6,37 @@ const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
 
 // ✅ CORRECT IMPORT for Manual WebSocket
-const UpstoxClient = require('upstox-js-sdk'); 
+const UpstoxClient = require('upstox-js-sdk');
+const protobuf = require("protobufjs"); // 🆕 REQUIRED
 
 const app = express();
+// --- 📜 UPSTOX PROTOBUF SCHEMA ---
+// This definition translates the binary stream into readable numbers
+const PROTO_DEF = `
+syntax = "proto3";
+package com.upstox.marketdatafeeder.rpc.proto;
+
+message FeedResponse {
+    map<string, Feed> feeds = 1;
+}
+
+message Feed {
+    LTPC ltpc = 1;
+}
+
+message LTPC {
+    double ltp = 1;
+    int64 ltt = 2;
+    double cp = 3;
+}
+`;
+
+// Initialize the Translator
+let FeedResponse;
+try {
+    const root = protobuf.parse(PROTO_DEF).root;
+    FeedResponse = root.lookupType("com.upstox.marketdatafeeder.rpc.proto.FeedResponse");
+} catch (e) { console.error("❌ Proto Parse Error:", e); }
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -103,33 +131,23 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🔌 MANUAL WEBSOCKET ENGINE (FIXED) ---
-// --- 🔌 MANUAL WEBSOCKET ENGINE (AXIOS VERSION) ---
-// --- 🔌 MANUAL WEBSOCKET ENGINE (V3 COMPATIBLE) ---
+// --- 🔌 WEBSOCKET (Binary Decoded) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
-
     try {
-        console.log("🔌 Initializing Manual Market Data Feed (V3)...");
-
-        // 1. Get Authorized URL from the NEW V3 Endpoint
-        // V2 is deprecated (410 Gone), so we must use V3
+        console.log("🔌 Initializing WS (V3 Binary Mode)...");
         const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", {
-            headers: { 
-                'Authorization': 'Bearer ' + ACCESS_TOKEN,
-                'Accept': 'application/json'
-            }
+            headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' }
         });
-
         const wsUrl = response.data.data.authorizedRedirectUri;
-        console.log("📡 Authorized URL received. Connecting...");
-
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(wsUrl, { followRedirects: true });
+        
+        // 🆕 IMPORTANT: Tell the socket to receive data as a Buffer
+        currentWs.binaryType = "arraybuffer"; 
 
         currentWs.onopen = () => {
-            console.log("✅ WebSocket Open! Subscribing...");
-            // V3 Subscription Format
+            console.log("✅ WebSocket Connected! Subscribing...");
             const subRequest = {
                 guid: "bot-" + Date.now(),
                 method: "sub",
@@ -139,42 +157,31 @@ async function initWebSocket() {
         };
 
         currentWs.onmessage = (msg) => {
-            // NOTE: V3 sends data in Binary (Protobuf) format.
-            // A simple JSON.parse will fail, but that's okay!
-            // We rely on the 30-second polling loop for trading logic.
-            // This WebSocket connection just keeps the session alive.
             try {
-                const strMsg = msg.data.toString();
-                // Only try to parse if it looks like JSON (rare in V3)
-                if (strMsg.trim().startsWith('{')) {
-                    const data = JSON.parse(strMsg);
-                    if (data?.feeds?.[INSTRUMENT_KEY]) {
-                        lastKnownLtp = data.feeds[INSTRUMENT_KEY].ltpc.ltp;
-                        pushToDashboard();
-                    }
+                // 🧠 BINARY DECODER ENGINE
+                // 1. Load data as Uint8Array
+                const buffer = new Uint8Array(msg.data);
+                
+                // 2. Decode using the Proto Schema we defined at the top
+                const message = FeedResponse.decode(buffer);
+                
+                // 3. Convert to JSON object
+                const object = FeedResponse.toObject(message, { longs: String, enums: String, bytes: String });
+                
+                // 4. Extract Price and Update Dashboard
+                if (object?.feeds?.[INSTRUMENT_KEY]?.ltpc?.ltp) {
+                    lastKnownLtp = object.feeds[INSTRUMENT_KEY].ltpc.ltp;
+                    pushToDashboard(); // Updates UI instantly!
                 }
             } catch (e) { 
-                // Ignore binary parse errors - Bot will use polling data
+                // Ignore initial handshake or non-feed messages
             }
         };
 
-        currentWs.onerror = (err) => console.error("❌ WS Runtime Error:", err.message);
-        currentWs.onclose = () => {
-            console.log("🔌 WebSocket Closed.");
-            currentWs = null; 
-        };
-
-    } catch (e) { 
-        currentWs = null;
-        if (e.response && e.response.status === 401) {
-            console.error(`❌ WS Token Expired. Refreshing...`);
-            ACCESS_TOKEN = null; 
-        } else {
-            console.error(`❌ WS Init Failed (${e.response?.status || 'Error'}):`, e.message);
-        }
-    }
+        currentWs.onclose = () => { currentWs = null; };
+        currentWs.onerror = () => { currentWs = null; };
+    } catch (e) { currentWs = null; }
 }
-
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
     console.log("🤖 STARTING AUTO-LOGIN SEQUENCE...");
