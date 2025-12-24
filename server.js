@@ -189,6 +189,7 @@ if (SIMULATION_MODE) {
             lastKnownLtp = parseFloat(mockLtp.toFixed(2));
             pushToDashboard(); 
         }, 1000);
+    };
 
     // 2. MOCK AXIOS (The "Fake Exchange")
     const originalAxios = axios;
