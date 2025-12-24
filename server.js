@@ -101,47 +101,63 @@ async function modifyExchangeSL(newTrigger) {
 }
 
 // --- 🆕 WEBSOCKET REAL-TIME ENGINE ---
+let currentStreamer = null; // Track instance globally
+
 async function initWebSocket() {
     if (!ACCESS_TOKEN) return;
 
-    try {
-        console.log("🔌 Initializing Market Data WebSocket...");
-        
-        // We initialize with autoReconnect: false to prevent the SDK library crash
-        const streamer = new MarketDataStreamerV3(); 
+    // 1. Clean up any existing broken connection
+    if (currentStreamer) {
+        console.log("🧹 Cleaning up old WebSocket instance...");
+        try { currentStreamer.disconnect(); } catch (e) {}
+        currentStreamer = null;
+    }
 
-        streamer.on('error', (err) => {
-            console.error("❌ WebSocket Streamer Error:", err.message);
+    try {
+        console.log("🔌 Initializing Market Data WebSocket (Fresh Instance)...");
+        
+        // Disable internal auto-reconnect to avoid the 'clearSubscriptions' library crash
+        currentStreamer = new MarketDataStreamerV3(); 
+
+        currentStreamer.on('error', (err) => {
+            console.error("❌ WebSocket Error:", err.message);
+            
+            // If 401, the token/session is dead for WS. Stop and wait for Auto-Login.
             if (err.message.includes('401')) {
-                console.log("🔑 Token Sync Issue. Clearing token to retry...");
-                ACCESS_TOKEN = null; // Triggers fresh login via your interval
+                console.log("⚠️ 401 Detected: Invalidating session to trigger Auto-Login.");
+                ACCESS_TOKEN = null; 
+                if (currentStreamer) currentStreamer.disconnect();
+                currentStreamer = null;
             }
         });
 
-        // Delay the actual connection by 5 seconds to let Upstox servers sync your token
-        console.log("⏳ Waiting 5s for session synchronization...");
+        // 2. Add a significant delay (10s) before the first connect after login
+        // Upstox servers often need time to sync the token to their WS cluster.
+        console.log("⏳ Waiting 10s for token synchronization...");
         setTimeout(async () => {
+            if (!ACCESS_TOKEN || !currentStreamer) return;
+            
             try {
-                await streamer.connect(ACCESS_TOKEN);
+                await currentStreamer.connect(ACCESS_TOKEN);
                 
-                streamer.on('open', () => {
+                currentStreamer.on('open', () => {
                     console.log("✅ WebSocket Connected. Subscribing to:", INSTRUMENT_KEY);
-                    streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+                    currentStreamer.subscribe([INSTRUMENT_KEY], 'ltpc');
                 });
 
-                streamer.on('data', (data) => {
+                currentStreamer.on('data', (data) => {
                     if (data && data[INSTRUMENT_KEY]) {
                         lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                        pushToDashboard();
+                        pushToDashboard(); // Updates real-time dashboard
                     }
                 });
-            } catch (connectErr) {
-                console.error("❌ Connection Attempt Failed:", connectErr.message);
+            } catch (connErr) {
+                console.error("❌ Connection Failed:", connErr.message);
             }
-        }, 5000);
+        }, 10000);
 
     } catch (e) { 
-        console.error("❌ WS Initialization Failed:", e.message); 
+        console.error("❌ WS Setup Failed:", e.message); 
     }
 }
 
@@ -205,18 +221,10 @@ async function performAutoLogin() {
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
         console.log("🎉 SUCCESS! Session Active.");
-        setTimeout(() => {
-            initWebSocket();
-        }, 2000);
-
+    
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
         await saveState();
-        // Add this to your performAutoLogin function in server.js
-        await initWebSocket();
-        
-        botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
-        await saveState();
-
+     
     } catch (e) { console.error("❌ Auto-Login Failed:", e.message); } 
     finally { if (browser) await browser.close(); }
 }
@@ -320,10 +328,11 @@ setInterval(async () => {
         console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping (Outside Market Hours)");
         return;
     }
-    // If we have a token but no price, try to (re)initialize WebSocket
-    if (ACCESS_TOKEN && lastKnownLtp === 0) {
-        console.log("🔄 Price stagnant. Attempting WebSocket Init...");
+    // WATCHDOG: If we have a token but no live price, start the socket
+    if (ACCESS_TOKEN && lastKnownLtp === 0 && !currentStreamer) {
+        console.log("🔄 Watchdog: Price missing. Starting WebSocket...");
         initWebSocket();
+        return; // Wait for the 10s init to complete
     }
     try {
         const candles = await getMergedCandles();
@@ -418,9 +427,10 @@ setInterval(async () => {
         }
     } catch (e) { 
         if(e.response?.status === 401) {
-            console.log("❌ Unauthorized API call. Resetting session.");
+            console.log("❌ Loop detected 401. Resetting...");
             ACCESS_TOKEN = null;
-            performAutoLogin();
+            if (currentStreamer) currentStreamer.disconnect();
+            currentStreamer = null;
         }
     }
 }, 30000);
