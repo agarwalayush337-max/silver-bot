@@ -175,6 +175,8 @@ async function performAutoLogin() {
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
         console.log("🎉 SUCCESS! Session Active.");
+        // Add this to your performAutoLogin function in server.js
+        await initWebSocket();
         
         botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
         await saveState();
@@ -275,55 +277,113 @@ setInterval(() => {
 }, 60000);
 
 // TRADING LOOP (Runs every 30s)
+// TRADING LOOP (Runs every 30s)
 setInterval(async () => {
-    if (!ACCESS_TOKEN || !isApiAvailable()) return;
+    // 1. Check if API is available and token exists
+    if (!ACCESS_TOKEN || !isApiAvailable()) {
+        console.log(!ACCESS_TOKEN ? "📡 Waiting for Token..." : "😴 API Sleeping (Outside Market Hours)");
+        return;
+    }
+
     try {
         const candles = await getMergedCandles();
-        if (candles.length > 200) {
-            const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
-            lastKnownLtp = cl[cl.length-1];
+        
+        // 2. ALWAYS LOG BASIC INFO (This fixes the "Silence" in Render logs)
+        console.log(`--------------------------------------------------`);
+        console.log(`🕒 Time: ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | MktOpen: ${isMarketOpen()}`);
 
-            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+        if (candles.length > 200) {
+            // Data Preparation
+            const cl = candles.map(c => c[4]);
+            const h = candles.map(c => c[2]);
+            const l = candles.map(c => c[3]);
+            const v = candles.map(c => c[5]);
             
-            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
-            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
+            // Calculate Indicators
+            const e50 = EMA.calculate({period: 50, values: cl});
+            const e200 = EMA.calculate({period: 200, values: cl});
+            const vAvg = SMA.calculate({period: 20, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            
+            // Get Current Values
+            const curE50 = e50[e50.length - 1];
+            const curE200 = e200[e200.length - 1];
+            const curV = v[v.length - 1];
+            const curAvgV = vAvg[vAvg.length - 1];
+            const curA = atr[atr.length - 1];
+
+            // 3. LOG TECHNICAL INDICATORS (As requested)
+            console.log(`📈 E50: ${curE50.toFixed(2)} | E200: ${curE200.toFixed(2)}`);
+            console.log(`📊 Vol: ${curV} | AvgVol: ${curAvgV.toFixed(0)} | ATR: ${curA.toFixed(2)}`);
+
+            // Entry/Exit Logic Constants
+            const bH = Math.max(...h.slice(-11, -1));
+            const bL = Math.min(...l.slice(-11, -1));
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
-                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
-                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
-                        await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                    // LONG SIGNAL: Price > E50, Volume Spike, and Breakout High
+                    if (cl[cl.length - 2] > e50[e50.length - 2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
+                        console.log("⚡ EXECUTION: LONG SIGNAL DETECTED");
+                        botState.positionType = 'LONG'; 
+                        botState.entryPrice = lastKnownLtp; 
+                        botState.quantity = MAX_QUANTITY; 
+                        botState.currentStop = lastKnownLtp - (curA * 3);
+                        await saveState(); 
+                        await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
-                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
-                        await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    // SHORT SIGNAL: Price < E50, Volume Spike, and Breakdown Low
+                    else if (cl[cl.length - 2] < e50[e50.length - 2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
+                        console.log("⚡ EXECUTION: SHORT SIGNAL DETECTED");
+                        botState.positionType = 'SHORT'; 
+                        botState.entryPrice = lastKnownLtp; 
+                        botState.quantity = MAX_QUANTITY; 
+                        botState.currentStop = lastKnownLtp + (curA * 3);
+                        await saveState(); 
+                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     }
                 } else {
+                    // Position Management (Trailing Stop)
                     if (botState.positionType === 'LONG') {
                         let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (ns > botState.currentStop) {
                             botState.currentStop = ns;
-                            await modifyExchangeSL(ns); // 🆕 Modify SL on Exchange
+                            await modifyExchangeSL(ns); 
                         }
                         if (lastKnownLtp < botState.currentStop) {
-                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; botState.positionType = null;
-                            await saveState(); await placeOrder("SELL", botState.quantity, lastKnownLtp);
+                            console.log("🛑 EXIT: LONG STOP HIT");
+                            botState.totalPnL += (lastKnownLtp - botState.entryPrice) * botState.quantity; 
+                            botState.positionType = null;
+                            await saveState(); 
+                            await placeOrder("SELL", botState.quantity, lastKnownLtp);
                         }
                     } else {
                         let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
                         if (ns < botState.currentStop) {
                             botState.currentStop = ns;
-                            await modifyExchangeSL(ns); // 🆕 Modify SL on Exchange
+                            await modifyExchangeSL(ns); 
                         }
                         if (lastKnownLtp > botState.currentStop) {
-                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; botState.positionType = null;
-                            await saveState(); await placeOrder("BUY", botState.quantity, lastKnownLtp);
+                            console.log("🛑 EXIT: SHORT STOP HIT");
+                            botState.totalPnL += (botState.entryPrice - lastKnownLtp) * botState.quantity; 
+                            botState.positionType = null;
+                            await saveState(); 
+                            await placeOrder("BUY", botState.quantity, lastKnownLtp);
                         }
                     }
                 }
             }
+        } else {
+            console.log(`⏳ Building Data: ${candles.length}/200 candles loaded. Waiting for history...`);
         }
-    } catch (e) { if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } }
+    } catch (e) { 
+        console.error("❌ Trading Loop Error:", e.message);
+        if (e.response?.status === 401) { 
+            console.log("🔑 Token expired. Re-triggering Auto-Login...");
+            ACCESS_TOKEN = null; 
+            performAutoLogin(); 
+        } 
+    }
 }, 30000);
 
 // --- 📡 API & LIVE DASHBOARD ---
