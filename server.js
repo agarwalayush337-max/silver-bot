@@ -192,29 +192,33 @@ if (SIMULATION_MODE) {
     };
 
     // 2. MOCK AXIOS (The "Fake Exchange")
+    // 2. MOCK AXIOS (The "Fake Exchange")
     const originalAxios = axios;
     axios = {
         ...originalAxios,
         get: async (url, config) => {
-            // A. FAKE CANDLES (STABLE HISTORY)
+            // A. FAKE CANDLES (STABLE HISTORY + VOL SPIKE)
             if (url.includes("/historical-candle/") || url.includes("/intraday/")) {
                 const candles = [];
                 const now = Date.now();
-                // Generate history anchored at 224000 (NOT current price)
-                // This ensures EMA stays flat while you pump the live price
                 const basePrice = 224000; 
                 
                 for(let i=300; i>=0; i--) {
-                    // Slight wobble so it looks real, but average is 224000
+                    // History stays around 224000 so EMA is flat.
                     const historicPrice = basePrice + Math.sin(i/5) * 50; 
                     
+                    // 🚨 THE FIX: 
+                    // If i > 0 (History), use Low Volume (500). 
+                    // If i == 0 (Current), use your Button Volume (mockVolume).
+                    const vol = (i === 0) ? mockVolume : 500;
+
                     candles.push([
                         new Date(now - i*300000).toISOString(),
                         historicPrice,          
                         historicPrice + 20,     
                         historicPrice - 20,     
                         historicPrice,          
-                        mockVolume,             // Controlled by your button
+                        vol,    // <--- Logic applied here
                         0                       
                     ]);
                 }
