@@ -641,31 +641,37 @@ setInterval(() => {
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
 // --- TRADING ENGINE (Fixed: Uses Live Price & Includes Catch Block) ---
+// --- TRADING ENGINE (Fixed Logs & Live Price Logic) ---
 setInterval(async () => {
-    // 1. Safety Checks
     if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) { initWebSocket(); console.log("⏳ Waiting for WebSocket..."); return; }
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) { initWebSocket(); console.log("⏳ Waiting for WS..."); return; }
 
     try {
-        // 2. Get Data
         const candles = await getMergedCandles();
         
-        // Debug Log (To see the crossover happening)
-        const e50 = EMA.calculate({period: 50, values: candles.map(c=>c[4])});
-        const curE50 = e50[e50.length-1];
-        console.log(`--------------------------------------------------`);
-        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | EMA50: ${curE50.toFixed(0)}`);
-
         if (candles.length > 200) {
+            // 1. Calculate Indicators FIRST
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
-            const vAvg = SMA.calculate({period: 20, values: v});
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            const curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
+            const e50 = EMA.calculate({period: 50, values: cl});
+            const curE50 = e50[e50.length-1];
+            
+            const vAvg = SMA.calculate({period: 20, values: v});
+            const curV = v[v.length-1];
+            const curAvgV = vAvg[vAvg.length-1];
+            
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            const curA = atr[atr.length-1];
+
+            // 2. LOG EVERYTHING (So you can debug)
+            console.log(`--------------------------------------------------`);
+            console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp}`);
+            console.log(`📊 EMA50: ${curE50.toFixed(0)} | Vol: ${curV} | AvgVol: ${curAvgV.toFixed(0)}`);
+            console.log(`🎯 Condition: Price > EMA? ${lastKnownLtp > curE50} | Vol > 1.5x? ${curV > (curAvgV * 1.5)}`);
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
-                    // --- ENTRY LOGIC (Uses LIVE PRICE 'lastKnownLtp') ---
+                    // --- ENTRY LOGIC (Uses LIVE PRICE) ---
                     
                     // LONG: Live Price > EMA50 + Volume Spike
                     if (lastKnownLtp > curE50 && curV > (curAvgV * 1.5)) {
@@ -693,7 +699,6 @@ setInterval(async () => {
                         let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
                         if (ns > botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
                         
-                        // EXIT TRIGGER
                         if (lastKnownLtp < botState.currentStop) {
                             if (botState.slOrderId) {
                                 console.log("🛑 Stop Hit! Waiting for Exchange SL...");
@@ -707,7 +712,6 @@ setInterval(async () => {
                         let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
                         if (ns < botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
                         
-                        // EXIT TRIGGER
                         if (lastKnownLtp > botState.currentStop) {
                             if (botState.slOrderId) {
                                 console.log("🛑 Stop Hit! Waiting for Exchange SL...");
@@ -722,7 +726,6 @@ setInterval(async () => {
             }
         }
     } catch (e) { 
-        // 🚨 THIS WAS MISSING BEFORE
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 5000);
