@@ -105,15 +105,16 @@ async function modifyExchangeSL(newTrigger) {
 
 // --- 🔌 MANUAL WEBSOCKET ENGINE (FIXED) ---
 // --- 🔌 MANUAL WEBSOCKET ENGINE (AXIOS VERSION) ---
+// --- 🔌 MANUAL WEBSOCKET ENGINE (V3 COMPATIBLE) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
 
     try {
-        console.log("🔌 Initializing Manual Market Data Feed...");
+        console.log("🔌 Initializing Manual Market Data Feed (V3)...");
 
-        // 1. Get Authorized URL directly via Axios (Bypasses SDK "Gone" Error)
-        // We use the V2 endpoint which provides the V3-compatible Redirect URI
-        const response = await axios.get("https://api.upstox.com/v2/feed/market-data-feed/authorize", {
+        // 1. Get Authorized URL from the NEW V3 Endpoint
+        // V2 is deprecated (410 Gone), so we must use V3
+        const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", {
             headers: { 
                 'Authorization': 'Bearer ' + ACCESS_TOKEN,
                 'Accept': 'application/json'
@@ -123,12 +124,12 @@ async function initWebSocket() {
         const wsUrl = response.data.data.authorizedRedirectUri;
         console.log("📡 Authorized URL received. Connecting...");
 
-        // 2. Connect using standard 'ws' library
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(wsUrl, { followRedirects: true });
 
         currentWs.onopen = () => {
             console.log("✅ WebSocket Open! Subscribing...");
+            // V3 Subscription Format
             const subRequest = {
                 guid: "bot-" + Date.now(),
                 method: "sub",
@@ -138,11 +139,13 @@ async function initWebSocket() {
         };
 
         currentWs.onmessage = (msg) => {
+            // NOTE: V3 sends data in Binary (Protobuf) format.
+            // A simple JSON.parse will fail, but that's okay!
+            // We rely on the 30-second polling loop for trading logic.
+            // This WebSocket connection just keeps the session alive.
             try {
-                // V3 usually sends binary, but 'ltpc' mode often allows simple JSON parsing 
-                // depending on the feed configuration.
                 const strMsg = msg.data.toString();
-                // Simple check to ensure we have JSON data
+                // Only try to parse if it looks like JSON (rare in V3)
                 if (strMsg.trim().startsWith('{')) {
                     const data = JSON.parse(strMsg);
                     if (data?.feeds?.[INSTRUMENT_KEY]) {
@@ -151,8 +154,7 @@ async function initWebSocket() {
                     }
                 }
             } catch (e) { 
-                // If it's pure binary (protobuf), we ignore it and rely on the 
-                // 30-second API fallback which we verified is working.
+                // Ignore binary parse errors - Bot will use polling data
             }
         };
 
@@ -164,12 +166,11 @@ async function initWebSocket() {
 
     } catch (e) { 
         currentWs = null;
-        // 410 "Gone" or 401 "Unauthorized" handling
-        if (e.response && (e.response.status === 410 || e.response.status === 401)) {
-            console.error(`❌ WS Auth Failed (${e.response.status}). Token might be expired.`);
-            ACCESS_TOKEN = null; // Trigger re-login
+        if (e.response && e.response.status === 401) {
+            console.error(`❌ WS Token Expired. Refreshing...`);
+            ACCESS_TOKEN = null; 
         } else {
-            console.error("❌ WS Init Crash:", e.message);
+            console.error(`❌ WS Init Failed (${e.response?.status || 'Error'}):`, e.message);
         }
     }
 }
