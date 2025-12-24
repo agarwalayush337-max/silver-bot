@@ -195,7 +195,7 @@ async function performAutoLogin() {
 
         try {
             // Wait for the URL to contain "code=" indicating the redirect started
-            await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 30000 });
+            await page.waitForFunction(() => window.location.href.includes('code='), { timeout: 40000 });
         } catch (e) {
             console.log("⚠️ URL check timed out, trying one last URL capture...");
         }
