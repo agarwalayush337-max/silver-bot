@@ -104,16 +104,35 @@ async function modifyExchangeSL(newTrigger) {
 async function initWebSocket() {
     if (!ACCESS_TOKEN) return;
     try {
+        console.log("🔌 Initializing Market Data WebSocket...");
         const streamer = new MarketDataStreamerV3();
+        
+        // IMPORTANT: Handle the error event so the bot doesn't crash
+        streamer.on('error', (err) => {
+            console.error("❌ WebSocket Streamer Error:", err.message);
+            // If it's a 401, we reset token to trigger re-login
+            if (err.message.includes('401')) ACCESS_TOKEN = null;
+        });
+
         await streamer.connect(ACCESS_TOKEN);
-        streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+        
+        streamer.on('open', () => {
+            console.log("✅ WebSocket Connected. Subscribing to:", INSTRUMENT_KEY);
+            streamer.subscribe([INSTRUMENT_KEY], 'ltpc');
+        });
+
         streamer.on('data', (data) => {
             if (data && data[INSTRUMENT_KEY]) {
                 lastKnownLtp = data[INSTRUMENT_KEY].ltp;
-                pushToDashboard();
+                pushToDashboard(); // Updates your live dashboard
             }
         });
-    } catch (e) { console.error("WS Error:", e.message); }
+
+        streamer.on('close', () => console.log("🔌 WebSocket Connection Closed."));
+
+    } catch (e) { 
+        console.error("❌ WS Initialization Failed:", e.message); 
+    }
 }
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
@@ -175,6 +194,12 @@ async function performAutoLogin() {
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
         console.log("🎉 SUCCESS! Session Active.");
+        setTimeout(() => {
+            initWebSocket();
+        }, 2000);
+
+        botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SYSTEM", price: 0, id: "Auto-Login OK", status: "OK" });
+        await saveState();
         // Add this to your performAutoLogin function in server.js
         await initWebSocket();
         
