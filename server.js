@@ -12,22 +12,116 @@ const protobuf = require("protobufjs"); // 🆕 REQUIRED
 const app = express();
 // --- 📜 UPSTOX PROTOBUF SCHEMA ---
 // This definition translates the binary stream into readable numbers
+// --- 📜 OFFICIAL UPSTOX PROTO SCHEMA ---
 const PROTO_DEF = `
 syntax = "proto3";
-package com.upstox.marketdatafeeder.rpc.proto;
+package com.upstox.marketdatafeederv3udapi.rpc.proto;
 
-message FeedResponse {
-    map<string, Feed> feeds = 1;
+message LTPC {
+  double ltp = 1;
+  int64 ltt = 2;
+  int64 ltq = 3;
+  double cp = 4;
+}
+
+message MarketLevel {
+  repeated Quote bidAskQuote = 1;
+}
+
+message MarketOHLC {
+  repeated OHLC ohlc = 1;
+}
+
+message Quote {
+  int64 bidQ = 1;
+  double bidP = 2;
+  int64 askQ = 3;
+  double askP = 4;
+}
+
+message OptionGreeks {
+  double delta = 1;
+  double theta = 2;
+  double gamma = 3;
+  double vega = 4;
+  double rho = 5;
+}
+
+message OHLC {
+  string interval = 1;
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+  int64 vol = 6;
+  int64 ts = 7;
+}
+
+enum Type {
+  initial_feed = 0;
+  live_feed = 1;
+  market_info = 2;
+}
+
+message MarketFullFeed {
+  LTPC ltpc = 1;
+  MarketLevel marketLevel = 2;
+  OptionGreeks optionGreeks = 3;
+  MarketOHLC marketOHLC = 4;
+  double atp = 5;
+  int64 vtt = 6;
+  double oi = 7;
+  double iv = 8;
+  double tbq = 9;
+  double tsq = 10;
+}
+
+message IndexFullFeed {
+  LTPC ltpc = 1;
+  MarketOHLC marketOHLC = 2;
+}
+
+message FullFeed {
+  oneof FullFeedUnion {
+    MarketFullFeed marketFF = 1;
+    IndexFullFeed indexFF = 2;
+  }
+}
+
+message FirstLevelWithGreeks {
+  LTPC ltpc = 1;
+  Quote firstDepth = 2;
+  OptionGreeks optionGreeks = 3;
+  int64 vtt = 4;
+  double oi = 5;
+  double iv = 6;
 }
 
 message Feed {
+  oneof FeedUnion {
     LTPC ltpc = 1;
+    FullFeed fullFeed = 2;
+    FirstLevelWithGreeks firstLevelWithGreeks = 3;
+  }
+  RequestMode requestMode = 4;
 }
 
-message LTPC {
-    double ltp = 1;
-    int64 ltt = 2;
-    double cp = 3;
+enum RequestMode {
+  ltpc = 0;
+  full_d5 = 1;
+  option_greeks = 2;
+  full_d30 = 3;
+}
+
+message MarketInfo {
+  map<string, int32> segmentStatus = 1;
+}
+
+message FeedResponse {
+  Type type = 1;
+  map<string, Feed> feeds = 2; 
+  int64 currentTs = 3;
+  MarketInfo marketInfo = 4;
 }
 `;
 
@@ -35,8 +129,9 @@ message LTPC {
 let FeedResponse;
 try {
     const root = protobuf.parse(PROTO_DEF).root;
-    FeedResponse = root.lookupType("com.upstox.marketdatafeeder.rpc.proto.FeedResponse");
+    FeedResponse = root.lookupType("com.upstox.marketdatafeederv3udapi.rpc.proto.FeedResponse");
 } catch (e) { console.error("❌ Proto Parse Error:", e); }
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -131,7 +226,7 @@ async function modifyExchangeSL(newTrigger) {
     } catch (e) { /* Likely filled */ }
 }
 
-// --- 🔌 WEBSOCKET (Binary Decoded with Debugging) ---
+// --- 🔌 WEBSOCKET (Debug Mode) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -143,7 +238,7 @@ async function initWebSocket() {
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(wsUrl, { followRedirects: true });
         
-        currentWs.binaryType = "arraybuffer"; // Receive data as Buffer
+        currentWs.binaryType = "arraybuffer"; 
 
         currentWs.onopen = () => {
             console.log("✅ WebSocket Connected! Subscribing...");
@@ -157,34 +252,49 @@ async function initWebSocket() {
 
         currentWs.onmessage = (msg) => {
             try {
-                // Debug: Print size of incoming data
-                // console.log(`📩 Received ${msg.data.byteLength} bytes`); 
-
                 if (!FeedResponse) {
-                    throw new Error("Proto Schema not initialized (Check protobufjs install)");
+                    console.error("❌ Proto Schema is undefined!"); 
+                    return;
                 }
 
+                // 1. Decode Binary
                 const buffer = new Uint8Array(msg.data);
                 const message = FeedResponse.decode(buffer);
                 const object = FeedResponse.toObject(message, { longs: String, enums: String, bytes: String });
-                
-                if (object?.feeds?.[INSTRUMENT_KEY]?.ltpc?.ltp) {
-                    const newPrice = object.feeds[INSTRUMENT_KEY].ltpc.ltp;
-                    
-                    // Only update and log if price CHANGED
-                    if (newPrice !== lastKnownLtp) {
-                        lastKnownLtp = newPrice;
-                        pushToDashboard(); // 🚀 INSTANT UPDATE
-                        // console.log(`⚡ Price Update: ₹${lastKnownLtp}`);
+
+                // Debug: Print the keys Upstox is sending (Only first 5 times to avoid spam)
+                // if (Math.random() < 0.05) console.log("📩 Keys received:", Object.keys(object?.feeds || {}));
+
+                // 2. Safe Search
+                if (object && object.feeds) {
+                    for (const key in object.feeds) {
+                        if (key.includes("458305")) { 
+                            const feed = object.feeds[key];
+                            
+                            // 3. Extract Price
+                            let newPrice = null;
+                            if (feed.ltpc) newPrice = feed.ltpc.ltp;
+                            else if (feed.fullFeed?.marketFF?.ltpc) newPrice = feed.fullFeed.marketFF.ltpc.ltp;
+                            else if (feed.fullFeed?.indexFF?.ltpc) newPrice = feed.fullFeed.indexFF.ltpc.ltp;
+
+                            if (newPrice) {
+                                // Log success so you know it's working
+                                // console.log(`⚡ Decoded Price: ${newPrice}`);
+                                if (newPrice !== lastKnownLtp) {
+                                    lastKnownLtp = newPrice;
+                                    pushToDashboard(); 
+                                }
+                            }
+                        }
                     }
                 }
             } catch (e) { 
-                // 🛑 THIS LOG WILL TELL US THE PROBLEM
+                // ✅ ERROR LOGS ARE NOW ACTIVE
                 console.error("❌ Decode Error:", e.message);
             }
         };
 
-        currentWs.onclose = () => { currentWs = null; };
+        currentWs.onclose = () => { console.log("🔌 WebSocket Disconnected"); currentWs = null; };
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
