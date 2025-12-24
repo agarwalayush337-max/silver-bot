@@ -640,38 +640,34 @@ setInterval(() => {
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
+// --- TRADING ENGINE (Fixed: Uses Live Price & Includes Catch Block) ---
 setInterval(async () => {
+    // 1. Safety Checks
     if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-    
-    // 1. WebSocket Watchdog
-    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
-        initWebSocket();
-        // Wait for next loop; do not trade on 0 price
-        console.log("⏳ Waiting for WebSocket Price..."); 
-        return; 
-    }
+    if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) { initWebSocket(); console.log("⏳ Waiting for WebSocket..."); return; }
 
     try {
+        // 2. Get Data
         const candles = await getMergedCandles();
+        
+        // Debug Log (To see the crossover happening)
+        const e50 = EMA.calculate({period: 50, values: candles.map(c=>c[4])});
+        const curE50 = e50[e50.length-1];
         console.log(`--------------------------------------------------`);
-        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | WS: ${currentWs?'Live':'Off'}`);
+        console.log(`🕒 ${getIST().toLocaleTimeString()} | LTP: ₹${lastKnownLtp} | EMA50: ${curE50.toFixed(0)}`);
 
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
-
-            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
-            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
-
-            console.log(`📈 E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV}`);
+            const vAvg = SMA.calculate({period: 20, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            
+            const curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
 
             if (isMarketOpen()) {
                 if (!botState.positionType) {
-                    // --- ENTRY LOGIC ---
-                    // --- ENTRY LOGIC (FIXED: Uses Live Price) ---
+                    // --- ENTRY LOGIC (Uses LIVE PRICE 'lastKnownLtp') ---
                     
-                    // LONG: LIVE Price > EMA50 + Volume
-                    // We changed 'cl[cl.length-2]' to 'lastKnownLtp'
+                    // LONG: Live Price > EMA50 + Volume Spike
                     if (lastKnownLtp > curE50 && curV > (curAvgV * 1.5)) {
                         console.log("🚀 BUY SIGNAL: Live Price > EMA50 & High Vol");
                         botState.positionType = 'LONG'; 
@@ -681,7 +677,7 @@ setInterval(async () => {
                         await saveState(); 
                         await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                     } 
-                    // SHORT: LIVE Price < EMA50 + Volume
+                    // SHORT: Live Price < EMA50 + Volume Spike
                     else if (lastKnownLtp < curE50 && curV > (curAvgV * 1.5)) {
                         console.log("🚀 SELL SIGNAL: Live Price < EMA50 & High Vol");
                         botState.positionType = 'SHORT'; 
@@ -690,7 +686,6 @@ setInterval(async () => {
                         botState.currentStop = lastKnownLtp + (curA * 3);
                         await saveState(); 
                         await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
-                    }
                     }
                 } else {
                     // --- EXIT / TRAILING LOGIC ---
@@ -727,6 +722,7 @@ setInterval(async () => {
             }
         }
     } catch (e) { 
+        // 🚨 THIS WAS MISSING BEFORE
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 5000);
