@@ -1,7 +1,5 @@
 const express = require('express');
 // --- 🔒 PASSWORD LOCK SCREEN ---
-const cookieParser = require('cookie-parser'); // If you don't have this, we can parse manually
-// actually, let's parse manually to avoid installing new packages for you.
 
 function authMiddleware(req, res, next) {
     const password = process.env.ADMIN_PASSWORD;
