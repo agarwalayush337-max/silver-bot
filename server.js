@@ -1,6 +1,14 @@
 const express = require('express');
+const axios = require('axios');
+const Redis = require('ioredis');
+const puppeteer = require('puppeteer');
+const OTPAuth = require('otpauth');
+const { EMA, SMA, ATR } = require("technicalindicators");
+// ✅ CORRECT IMPORT for Manual WebSocket
+const UpstoxClient = require('upstox-js-sdk');
+const protobuf = require("protobufjs"); // 🆕 REQUIRED
+const app = express();
 // --- 🔒 PASSWORD LOCK SCREEN ---
-
 function authMiddleware(req, res, next) {
     const password = process.env.ADMIN_PASSWORD;
     if (!password) return next(); // No password set? Let everyone in.
@@ -51,17 +59,6 @@ app.post('/login', (req, res) => {
 });
 
 
-const axios = require('axios');
-const Redis = require('ioredis');
-const puppeteer = require('puppeteer');
-const OTPAuth = require('otpauth');
-const { EMA, SMA, ATR } = require("technicalindicators");
-
-// ✅ CORRECT IMPORT for Manual WebSocket
-const UpstoxClient = require('upstox-js-sdk');
-const protobuf = require("protobufjs"); // 🆕 REQUIRED
-
-const app = express();
 // --- 📜 UPSTOX PROTOBUF SCHEMA ---
 // This definition translates the binary stream into readable numbers
 // --- 📜 OFFICIAL UPSTOX PROTO SCHEMA ---
