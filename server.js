@@ -8,6 +8,10 @@ const { EMA, SMA, ATR } = require("technicalindicators");
 const UpstoxClient = require('upstox-js-sdk');
 const protobuf = require("protobufjs"); // 🆕 REQUIRED
 const app = express();
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
 // --- 🔒 PASSWORD LOCK SCREEN ---
 function authMiddleware(req, res, next) {
     const password = process.env.ADMIN_PASSWORD;
@@ -181,8 +185,6 @@ try {
     FeedResponse = root.lookupType("com.upstox.marketdatafeederv3udapi.rpc.proto.FeedResponse");
 } catch (e) { console.error("❌ Proto Parse Error:", e); }
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
 
 // --- ⚙️ CONFIGURATION ---
 const INSTRUMENT_KEY = "MCX_FO|458305"; 
