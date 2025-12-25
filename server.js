@@ -533,15 +533,23 @@ async function placeOrder(type, qty, ltp) {
 // --- CRON & WATCHDOG ---
 setInterval(() => {
     const now = getIST();
-    if (now.getHours() === 8 && now.getMinutes() === 30 && !ACCESS_TOKEN) performAutoLogin();
+    // ✅ FIXED: Removed "!ACCESS_TOKEN" check. We MUST login daily to get a fresh token.
+    // ✅ TEST MODE: Set to 12:30 PM
+    if (now.getHours() === 12 && now.getMinutes() === 38) {
+        console.log("⏰ Scheduled Auto-Login Triggered...");
+        performAutoLogin(); 
+    }
 }, 60000);
-
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
 setInterval(async () => {
+    // ✅ NEW: Run the pulse check first
+    await validateToken(); 
+
     if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-    
+
+  
     // 1. WebSocket Watchdog
     if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
         initWebSocket();
