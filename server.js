@@ -530,12 +530,24 @@ async function placeOrder(type, qty, ltp) {
     }
 }
 
+// --- TOKEN VALIDATION HELPER ---
+async function validateToken() {
+    // 1. If no token exists, we can't validate it
+    if (!ACCESS_TOKEN) {
+        return false;
+    }
+
+    // 2. Optional: You can add logic here to check if the token is expired
+    // For now, just returning true prevents the crash
+    return true;
+}
+
 // --- CRON & WATCHDOG ---
 setInterval(() => {
     const now = getIST();
     // ✅ FIXED: Removed "!ACCESS_TOKEN" check. We MUST login daily to get a fresh token.
     // ✅ TEST MODE: Set to 12:30 PM
-    if (now.getHours() === 12 && now.getMinutes() === 50) {
+    if (now.getHours() === 13 && now.getMinutes() === 13) {
         console.log("⏰ Scheduled Auto-Login Triggered...");
         performAutoLogin(); 
     }
