@@ -535,7 +535,7 @@ setInterval(() => {
     const now = getIST();
     // ✅ FIXED: Removed "!ACCESS_TOKEN" check. We MUST login daily to get a fresh token.
     // ✅ TEST MODE: Set to 12:30 PM
-    if (now.getHours() === 12 && now.getMinutes() === 42) {
+    if (now.getHours() === 12 && now.getMinutes() === 50) {
         console.log("⏰ Scheduled Auto-Login Triggered...");
         performAutoLogin(); 
     }
