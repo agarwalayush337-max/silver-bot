@@ -1,4 +1,58 @@
 const express = require('express');
+// --- 🔒 PASSWORD LOCK SCREEN ---
+const cookieParser = require('cookie-parser'); // If you don't have this, we can parse manually
+// actually, let's parse manually to avoid installing new packages for you.
+
+function authMiddleware(req, res, next) {
+    const password = process.env.ADMIN_PASSWORD;
+    if (!password) return next(); // No password set? Let everyone in.
+
+    // 1. Check if the user has the correct "cookie"
+    const cookieString = req.headers.cookie || "";
+    if (cookieString.includes(`auth=${password}`)) {
+        return next(); // Password matches!
+    }
+
+    // 2. If not authenticated, show the Lock Screen
+    // If this is a POST to /login, let it through so they can actually log in
+    if (req.path === '/login' && req.method === 'POST') return next();
+
+    // 3. Render the Lock Screen HTML
+    res.send(`
+        <!DOCTYPE html>
+        <html style="background:#0f172a; color:white; font-family:sans-serif; height:100%;">
+        <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="display:flex; justify-content:center; align-items:center; height:100%; margin:0;">
+            <form action="/login" method="POST" style="background:#1e293b; padding:40px; border-radius:15px; text-align:center; box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+                <h2 style="margin-top:0; color:#38bdf8;">🛡️ Restricted Access</h2>
+                <p style="color:#94a3b8; margin-bottom:20px;">Enter Admin Password</p>
+                <input type="password" name="password" placeholder="Password" autofocus 
+                    style="width:100%; padding:12px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:white; margin-bottom:15px; outline:none;">
+                <button type="submit" style="width:100%; padding:12px; background:#6366f1; color:white; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Unlock Dashboard 🔓</button>
+            </form>
+        </body>
+        </html>
+    `);
+}
+
+// Apply the lock
+app.use(authMiddleware);
+
+// --- 🔑 LOGIN ROUTE ---
+app.post('/login', (req, res) => {
+    const password = process.env.ADMIN_PASSWORD;
+    const userPassword = req.body.password;
+
+    if (userPassword === password) {
+        // Set a cookie manually (works without extra libraries)
+        res.setHeader('Set-Cookie', `auth=${password}; HttpOnly; Max-Age=2592000; Path=/`); // Logged in for 30 days
+        res.redirect('/');
+    } else {
+        res.send(`<h1 style="color:red; text-align:center; margin-top:50px;">❌ WRONG PASSWORD <br> <a href="/">Try Again</a></h1>`);
+    }
+});
+
+
 const axios = require('axios');
 const Redis = require('ioredis');
 const puppeteer = require('puppeteer');
