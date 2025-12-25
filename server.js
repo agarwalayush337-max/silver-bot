@@ -187,12 +187,16 @@ function calculateLivePnL() {
 }
 
 function pushToDashboard() {
+    // ✅ Check if a position is actually open
+    const hasPosition = botState.positionType && botState.positionType !== 'NONE';
+
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: calculateLivePnL(),
-        historicalPnl: botState.totalPnL.toFixed(2), // ✅ Historical PnL
-        stop: botState.currentStop,
-        slID: botState.slOrderId, // ✅ Exchange Order ID
+        historicalPnl: botState.totalPnL.toFixed(2),
+        // ✅ FIX: Force these to 0/Null if no position exists
+        stop: hasPosition ? botState.currentStop : 0,
+        slID: hasPosition ? botState.slOrderId : null,
         status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE"
     });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
@@ -531,15 +535,35 @@ async function placeOrder(type, qty, ltp) {
 }
 
 // --- TOKEN VALIDATION HELPER ---
+// ✅ UPDATED: REAL TOKEN VALIDATION
 async function validateToken() {
-    // 1. If no token exists, we can't validate it
-    if (!ACCESS_TOKEN) {
-        return false;
-    }
+    if (!ACCESS_TOKEN) return false;
 
-    // 2. Optional: You can add logic here to check if the token is expired
-    // For now, just returning true prevents the crash
-    return true;
+    try {
+        // "Ping" Upstox to check if the token is still valid
+        // We use the User Profile API as a lightweight check
+        await axios.get('https://api.upstox.com/v2/user/profile', {
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        });
+        return true;
+    } catch (e) {
+        // If Upstox returns 401, the token is definitely Invalid/Revoked
+        if (e.response && e.response.status === 401) {
+            console.log("⚠️ Token is Invalid/Revoked. Switching to OFFLINE.");
+            ACCESS_TOKEN = null; // 🚨 This triggers the Dashboard to show OFFLINE
+            
+            // Kill the WebSocket too since the token is dead
+            if (currentWs) {
+                try { currentWs.close(); } catch(err) {}
+                currentWs = null;
+            }
+            
+            pushToDashboard(); // Force immediate UI update
+            return false;
+        }
+        // If it's a different error (like network issue), we assume token is OK for now
+        return true;
+    }
 }
 
 // --- CRON & WATCHDOG ---
@@ -547,7 +571,7 @@ setInterval(() => {
     const now = getIST();
     // ✅ FIXED: Removed "!ACCESS_TOKEN" check. We MUST login daily to get a fresh token.
     // ✅ TEST MODE: Set to 12:30 PM
-    if (now.getHours() === 13 && now.getMinutes() === 13) {
+    if (now.getHours() === 8 && now.getMinutes() === 30) {
         console.log("⏰ Scheduled Auto-Login Triggered...");
         performAutoLogin(); 
     }
@@ -782,7 +806,11 @@ app.post('/sync-price', async (req, res) => {
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
 
         } else { 
+            // ✅ FOUND IT: This is where we clear everything
             botState.positionType = null; 
+            botState.currentStop = 0;    // Clear the SL Price
+            botState.slOrderId = null;   // Clear the Order ID
+            botState.quantity = 0;       // Safety reset
             console.log("🔄 No open position found for ID 458305.");
         }
         await saveState();
