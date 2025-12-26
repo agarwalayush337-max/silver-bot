@@ -860,6 +860,7 @@ app.get('/', (req, res) => {
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
+// --- SYNC PRICE (With PnL Calculation Engine) ---
 // --- SYNC PRICE (Fixed PnL Calculation Logic) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
@@ -972,6 +973,16 @@ app.post('/sync-price', async (req, res) => {
     res.redirect('/');
 });
 
+
+const PORT = process.env.PORT || 10000;
+
+// ✅ NEW ROUTE: One-time PnL Reset
+app.post('/reset-pnl', async (req, res) => {
+    botState.totalPnL = 0;
+    await saveState();
+    pushToDashboard();
+    res.redirect('/');
+});
 
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
