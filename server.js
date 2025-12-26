@@ -311,12 +311,14 @@ async function modifyExchangeSL(newTrigger) {
     try {
         await axios.put("https://api.upstox.com/v2/order/modify", {
             order_id: botState.slOrderId,
-            trigger_price: Math.round(newTrigger),
+            order_type: "SL-M",
             quantity: botState.quantity,
-            order_type: "SL-M"
-        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+            trigger_price: Math.round(newTrigger),
+            price: 0,           // ✅ FIXED: Added required field
+            validity: "DAY",    // ✅ FIXED: Added required field
+            disclosed_quantity: 0
+        }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
     } catch (e) { 
-        // ✅ NEW: Print the error so we know WHY Upstox rejected it
         const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
         console.log(`❌ SL Modify Failed: ${errMsg}`);
     }
