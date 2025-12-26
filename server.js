@@ -860,7 +860,7 @@ app.get('/', (req, res) => {
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
-// --- SYNC PRICE (With PnL Calculation Engine) ---
+// --- SYNC PRICE (Fixed PnL Calculation Logic) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
@@ -869,14 +869,13 @@ app.post('/sync-price', async (req, res) => {
         // 1. FETCH UPSTOX ORDERS
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter Silver orders & Sort by Time (Oldest First for Calculation)
+        // Filter Silver orders & Sort by Time (Oldest First)
         const myOrders = (ordRes.data?.data || [])
             .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        // 2. REPLAY ENGINE: Calculate PnL by walking through the day's trades
-        let netPnL = 0;
-        let openPosition = { type: null, price: 0, qty: 0 };
+        // 2. REPLAY ENGINE: Calculate PnL
+        let openPos = { side: null, price: 0, qty: 0 };
         const processedLogs = [];
 
         myOrders.forEach(order => {
@@ -886,35 +885,35 @@ app.post('/sync-price', async (req, res) => {
             const txnType = order.transaction_type; // 'BUY' or 'SELL'
             const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
             
-            let tradePnL = 0; // Default 0
+            let tradePnL = 0; 
 
             // LOGIC: Only calculate PnL on FILLED orders
             if (order.status === 'complete') {
                 const qty = parseInt(order.quantity) || 1;
 
-                // Case A: Opening a New Position (if flat)
-                if (openPosition.qty === 0) {
-                    openPosition.type = txnType;
-                    openPosition.price = realPrice;
-                    openPosition.qty = qty;
+                // Case A: Opening a New Position
+                if (openPos.qty === 0) {
+                    openPos.side = txnType; // Store 'BUY' or 'SELL'
+                    openPos.price = realPrice;
+                    openPos.qty = qty;
                 }
-                // Case B: Closing (or flipping) a Position
-                else if (openPosition.type !== txnType) {
-                    // Calculate Profit based on the Open Price vs This Close Price
-                    if (openPosition.type === 'LONG' && txnType === 'SELL') {
-                        tradePnL = (realPrice - openPosition.price) * openPosition.qty;
-                    } else if (openPosition.type === 'SHORT' && txnType === 'BUY') {
-                        tradePnL = (openPosition.price - realPrice) * openPosition.qty;
+                // Case B: Closing the Position (Opposite Side)
+                else if (openPos.side !== txnType) {
+                    // ✅ FIXED: Check 'BUY' vs 'SELL' directly (removed 'LONG'/'SHORT' confusion)
+                    if (openPos.side === 'BUY' && txnType === 'SELL') {
+                        tradePnL = (realPrice - openPos.price) * openPos.qty;
+                    } else if (openPos.side === 'SELL' && txnType === 'BUY') {
+                        tradePnL = (openPos.price - realPrice) * openPos.qty;
                     }
                     
-                    // Reset Position (Assuming 1 lot strategy)
-                    openPosition.qty = 0; 
-                    openPosition.type = null;
-                    openPosition.price = 0;
+                    // Reset Position
+                    openPos.qty = 0; 
+                    openPos.side = null;
+                    openPos.price = 0;
                 }
             }
 
-            // Create the Log Object
+            // Create Log
             processedLogs.unshift({
                 time: execTime,
                 type: txnType,
@@ -922,16 +921,18 @@ app.post('/sync-price', async (req, res) => {
                 executedPrice: realPrice,
                 id: order.order_id,
                 status: status,
-                pnl: tradePnL !== 0 ? tradePnL : null // Only save PnL if value exists
+                pnl: tradePnL !== 0 ? tradePnL : null
             });
         });
 
-        // 3. OVERWRITE BOT HISTORY
-        // Keep System/Autologin logs, but replace all trade logs with our new "Calculated" list
+        // 3. UPDATE BOT HISTORY
         botState.history = botState.history.filter(h => h.type === 'SYSTEM' || h.type === 'Autologin');
-        botState.history = [...processedLogs, ...botState.history]; // Add new trade logs at the top
+        botState.history = [...processedLogs, ...botState.history];
 
-        // 4. SYNC ACTIVE POSITION (Standard Upstox Check)
+        // 4. RECALCULATE TOTAL HISTORICAL PNL
+        botState.totalPnL = processedLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+
+        // 5. CHECK ACTIVE POSITION (Standard Upstox Check)
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
@@ -941,7 +942,6 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = Math.abs(qty);
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             
-            // Re-check current price for SL calc
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
@@ -967,21 +967,11 @@ app.post('/sync-price', async (req, res) => {
             console.log("🔄 No open position found (Cleaned).");
         }
         
-        // Recalculate Total Historical PnL from the new logs
-        botState.totalPnL = processedLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
-
         await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
 
-const PORT = process.env.PORT || 10000;
 
-// ✅ NEW ROUTE: One-time PnL Reset
-app.post('/reset-pnl', async (req, res) => {
-    botState.totalPnL = 0;
-    await saveState();
-    pushToDashboard();
-    res.redirect('/');
-});
+
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
