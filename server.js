@@ -663,6 +663,7 @@ setInterval(() => {
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
 // --- TRADING ENGINE (Watcher & Entry) ---
+// --- TRADING ENGINE (Watcher & Entry) ---
 setInterval(async () => {
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
@@ -673,13 +674,7 @@ setInterval(async () => {
         return; 
     }
 
-    // 2. 🔍 PENDING ORDER FIXER (Run every loop)
-    // If we have a log that says "PENDING", try to find the real ID
-    const pendingLog = botState.history.find(h => h.id === "PENDING" || h.status === "SENT");
-    if (pendingLog) {
-        const fixedId = await fetchLatestOrderId(); // Helper to grab latest ID
-        if (fixedId) verifyOrderStatus(fixedId, 'ENTRY');
-    }
+    // ❌ REMOVED "PENDING ORDER FIXER" (Stopped the infinite spam)
 
     try {
         const candles = await getMergedCandles();
@@ -687,32 +682,33 @@ setInterval(async () => {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
 
             const e50 = EMA.calculate({period: 50, values: cl});
+            const e200 = EMA.calculate({period: 200, values: cl}); // ✅ RESTORED E200
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            const curE50=e50[e50.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1];
+            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1];
             const curA = atr[atr.length-1];
             const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
 
             // ✅ UPDATE GLOBAL ATR (For WebSocket to use)
             globalATR = curA; 
 
-            console.log(`LTP: ${lastKnownLtp} | ATR: ${curA.toFixed(0)} | Vol: ${curV}`);
+            // ✅ RESTORED OLD LOG FORMAT (With E200 & AvgVol)
+            console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
 
             if (isMarketOpen() && !botState.positionType) {
-                 // --- ENTRY LOGIC (Keep as is) ---
+                 // --- ENTRY LOGIC ---
                  if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
                     botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                    botState.currentStop = lastKnownLtp - (curA * 1.5); // ✅ Use 1.5x here too
+                    botState.currentStop = lastKnownLtp - (curA * 1.5); 
                     await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                 } 
                 else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
                     botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                    botState.currentStop = lastKnownLtp + (curA * 1.5); // ✅ Use 1.5x here too
+                    botState.currentStop = lastKnownLtp + (curA * 1.5); 
                     await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                 }
             } 
-            // ❌ REMOVED TRAILING LOGIC (It is now in WebSocket)
         }
     } catch (e) { 
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
