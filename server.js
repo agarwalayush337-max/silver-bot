@@ -339,9 +339,7 @@ async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
         console.log("🔌 Initializing WS (V3 Binary Mode)...");
-        const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", {
-            headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' }
-        });
+        const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", { headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' } });
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(response.data.data.authorizedRedirectUri, { followRedirects: true });
         currentWs.binaryType = "arraybuffer"; 
@@ -371,69 +369,77 @@ async function initWebSocket() {
                             if (botState.positionType && botState.positionType !== 'NONE') {
                                 let newStop = botState.currentStop;
                                 let didChange = false;
+                                let forceUpdate = false; // ✅ NEW: Bypass throttle for urgent moves
                                 const now = Date.now();
-                                let trailingGap = globalATR * 1.5; // Default Gap
+                                
+                                // ✅ 1. DYNAMIC GAP CALCULATION
+                                let trailingGap = globalATR * 1.5; 
+                                let profit = 0;
 
-                                // --- LOGIC FOR LONG ---
                                 if (botState.positionType === 'LONG') {
-                                    const profit = newPrice - botState.entryPrice;
+                                    profit = newPrice - botState.entryPrice;
                                     
-                                    // 1. Move to Cost (Profit > 600)
+                                    // Rule: If Profit > 1000, Gap = 500
+                                    if (profit >= 1000) trailingGap = 500;
+
+                                    // Rule: Move to Cost if Profit > 600
                                     if (profit >= 600 && botState.currentStop < botState.entryPrice) {
                                         console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
                                         newStop = botState.entryPrice;
                                         didChange = true;
+                                        forceUpdate = true; // ✅ Urgent!
                                     }
-                                    // 2. Tight Trailing (Profit > 1000 -> Gap 500)
-                                    if (profit >= 1000) trailingGap = 500;
 
-                                    // 3. Calculate Trailing
+                                    // Standard Trailing (Only move UP)
                                     const trailingLevel = newPrice - trailingGap;
-                                    // Only update if change > 50 points
-                                    if (trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
-                                    
-                                    // 4. EXIT DETECTION (If Price drops below SL)
-                                    if (newPrice <= botState.currentStop) {
-                                        console.log("🛑 SL Hit Detected via WS! Verifying...");
-                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                                    // Ensure we don't move stop DOWN (unless it's the initial move-to-cost)
+                                    if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { 
+                                        newStop = trailingLevel; 
+                                        didChange = true; 
                                     }
                                 } 
-                                // --- LOGIC FOR SHORT ---
                                 else if (botState.positionType === 'SHORT') {
-                                    const profit = botState.entryPrice - newPrice;
-                                    
-                                    // 1. Move to Cost (Profit > 600)
+                                    profit = botState.entryPrice - newPrice;
+
+                                    // Rule: If Profit > 1000, Gap = 500
+                                    if (profit >= 1000) trailingGap = 500;
+
+                                    // Rule: Move to Cost if Profit > 600
                                     if (profit >= 600 && botState.currentStop > botState.entryPrice) {
                                         console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
                                         newStop = botState.entryPrice;
                                         didChange = true;
+                                        forceUpdate = true; // ✅ Urgent!
                                     }
-                                    // 2. Tight Trailing (Profit > 1000 -> Gap 500)
-                                    if (profit >= 1000) trailingGap = 500;
 
-                                    // 3. Calculate Trailing
+                                    // Standard Trailing (Only move DOWN)
                                     const trailingLevel = newPrice + trailingGap;
-                                    // Only update if change > 50 points
-                                    if (trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
-
-                                    // 4. EXIT DETECTION (If Price rises above SL)
-                                    if (newPrice >= botState.currentStop) {
-                                        console.log("🛑 SL Hit Detected via WS! Verifying...");
-                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                                    // Ensure we don't move stop UP
+                                    if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { 
+                                        newStop = trailingLevel; 
+                                        didChange = true; 
                                     }
                                 }
 
+                                // 3. EXECUTE UPDATE (Throttle 5s OR Urgent)
                                 if (didChange) {
                                     const oldStop = botState.currentStop;
                                     botState.currentStop = newStop;
                                     pushToDashboard(); 
 
-                                    // Throttle Upstox Calls (Max once every 5s)
-                                    if (now - lastSlUpdateTime > 5000) {
+                                    // ✅ FIX: Allow urgent moves (like Move-to-Cost) to ignore throttle
+                                    if (now - lastSlUpdateTime > 5000 || forceUpdate) {
                                         console.log(`🔄 Trailing SL Updated: ${oldStop.toFixed(0)} ➡️ ${newStop.toFixed(0)}`);
                                         modifyExchangeSL(newStop);
                                         lastSlUpdateTime = now;
                                     }
+                                }
+                                
+                                // 4. EXIT DETECTION (Safety Check)
+                                if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
+                                    (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
+                                     // Verify immediately if price crossed SL
+                                     verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                 }
                             }
                             pushToDashboard(); 
@@ -442,7 +448,6 @@ async function initWebSocket() {
                 }
             } catch (e) { console.error("❌ Decode Logic Error:", e.message); }
         };
-
         currentWs.onclose = () => { currentWs = null; };
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
@@ -544,81 +549,90 @@ async function fetchLatestOrderId() {
     } catch (e) { console.log("ID Fetch Failed: " + e.message); } return null;
 }
 
-// --- VERIFY ORDER (Updates Actual Price & Execution Time) ---
-// --- VERIFY ORDER (Updates Actual Price & PnL in Logs) ---
+// --- VERIFY ORDER (Retry Loop & Real Cost Update) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
     
-    if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
+    // ✅ RETRY LOOP: Check 5 times (spaced 2s apart) to catch the fill
+    let attempts = 0;
+    const maxAttempts = (context === 'ENTRY') ? 5 : 1; 
 
-    try {
-        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
-        const order = res.data.data.find(o => o.order_id === orderId);
-        if (!order) return;
+    while (attempts < maxAttempts) {
+        attempts++;
+        if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
 
-        console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
-        
-        if (order.status === 'complete') {
-            const realPrice = parseFloat(order.average_price);
-            const execTime = new Date(order.order_timestamp).toLocaleTimeString();
-            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice}`);
+        try {
+            const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
+            const order = res.data.data.find(o => o.order_id === orderId);
+            if (!order) break; // Should not happen
 
-            // 1. Update Internal State
-            if (context === 'EXIT_CHECK') {
-                let tradePnL = 0;
-                // ✅ Calculate PnL for this specific trade
-                if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
-                if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
-
-                // Add SL Exit Log WITH PnL
-                botState.history.unshift({ 
-                    time: execTime,
-                    type: order.transaction_type, 
-                    orderedPrice: order.price,    
-                    executedPrice: realPrice,     
-                    id: orderId, 
-                    status: "FILLED",
-                    pnl: tradePnL // ✅ Save PnL here
-                });
-                
-                botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
-            } 
-            else if (botState.positionType) {
-                botState.entryPrice = realPrice;
-            }
-
-            // 2. UPDATE HISTORY LOG (If entry existed)
-            const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
-            if (logIndex !== -1) {
-                botState.history[logIndex].executedPrice = realPrice;
-                botState.history[logIndex].time = execTime;
-                botState.history[logIndex].status = "FILLED";
-                botState.history[logIndex].id = orderId;
-            }
-
-            await saveState();
-            pushToDashboard(); 
+            console.log(`🔎 Verifying Order ${orderId}: ${order.status} (Attempt ${attempts})`);
             
-        } else if (['rejected', 'cancelled'].includes(order.status)) {
-            if (context === 'EXIT_CHECK') botState.slOrderId = null;
-            else if (context !== 'MANUAL_SYNC' && botState.positionType) {
-                botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
-            }
-            const log = botState.history.find(h => h.id === orderId);
-            if (log) log.status = order.status.toUpperCase();
-            await saveState();
-            pushToDashboard();
-        }
-    } catch (e) { console.log("Verification Error: " + e.message); }
-}
+            if (order.status === 'complete') {
+                const realPrice = parseFloat(order.average_price);
+                const execTime = new Date(order.order_timestamp).toLocaleTimeString();
+                
+                // ✅ YOUR REQUESTED LOG
+                console.log(`✅ Order ${orderId} executed at ${realPrice}`);
 
+                // Update State based on Context
+                if (context === 'EXIT_CHECK') {
+                    // (Exit Logic remains same...)
+                    let tradePnL = 0;
+                    if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
+                    if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
+
+                    botState.history.unshift({ 
+                        time: execTime, type: order.transaction_type, orderedPrice: order.price, executedPrice: realPrice, id: orderId, status: "FILLED", pnl: tradePnL 
+                    });
+                    botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
+                } 
+                else {
+                    // ✅ ENTRY LOGIC: Correct the Cost Basis
+                    console.log(`📝 Cost corrected: ${botState.entryPrice} -> ${realPrice}`);
+                    botState.entryPrice = realPrice; 
+                }
+
+                // Update Dashboard Log
+                const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
+                if (logIndex !== -1) {
+                    botState.history[logIndex].executedPrice = realPrice;
+                    botState.history[logIndex].time = execTime;
+                    botState.history[logIndex].status = "FILLED";
+                    botState.history[logIndex].id = orderId;
+                }
+
+                await saveState();
+                pushToDashboard();
+                return; // Stop checking once filled
+
+            } else if (['rejected', 'cancelled'].includes(order.status)) {
+                // Handle Failures
+                if (context === 'EXIT_CHECK') botState.slOrderId = null;
+                else if (context !== 'MANUAL_SYNC') {
+                    botState.positionType = null; botState.entryPrice = 0;
+                }
+                const log = botState.history.find(h => h.id === orderId);
+                if (log) log.status = order.status.toUpperCase();
+                await saveState();
+                pushToDashboard();
+                return;
+            }
+        } catch (e) { console.log("Verification Error: " + e.message); }
+    }
+}
 // --- PLACE ORDER (Robust Logging) ---
 // --- PLACE ORDER (Saves Ordered Price) ---
+// --- PLACE ORDER (Saves Initial State Correctly) ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
+    // Buffer for Limit Order (0.3%)
     const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); 
+    
+    // 1. Calculate Initial Fixed Stop (800 points)
+    const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
 
     try {
         console.log(`🚀 Sending ${type}: ${qty} Lot @ ₹${limitPrice}`);
@@ -629,22 +643,27 @@ async function placeOrder(type, qty, ltp) {
 
         const orderId = res.data?.data?.order_id;
         
-        // ✅ NEW LOG FORMAT: Stores Ordered Price separately
+        // 2. Update State IMMEDIATELY (So WS knows where we are)
+        botState.positionType = type === "BUY" ? 'LONG' : 'SHORT'; // Provisional
+        botState.entryPrice = limitPrice; // Will be corrected by Verify
+        botState.quantity = qty;
+        botState.currentStop = slPrice;   // ✅ FIXED: Save the initial stop
+        
+        // Log to History
         botState.history.unshift({ 
             time: getIST().toLocaleTimeString(), 
             type: type, 
-            orderedPrice: limitPrice,  // 🆕 The price you requested
-            executedPrice: 0,          // 🆕 Will be updated when filled
+            orderedPrice: limitPrice,  
+            executedPrice: 0,          
             id: orderId || "PENDING", 
             status: "SENT" 
         });
         
-        const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
         await manageExchangeSL(type, qty, slPrice);
-
         await saveState();
         pushToDashboard(); 
 
+        // 3. Start Robust Verification (Retry Loop)
         if (orderId) verifyOrderStatus(orderId, 'ENTRY');
         return true;
     } catch (e) {
