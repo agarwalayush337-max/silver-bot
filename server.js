@@ -197,10 +197,16 @@ const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, RED
 const redis = new Redis(REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
 
 // --- GLOBAL VARIABLES ---
+// --- GLOBAL VARIABLES ---
 let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
 let sseClients = []; 
-let currentWs = null; // ✅ Websocket Tracker
+let currentWs = null; 
+// ✅ NEW: Store ATR here so WebSocket can read it instantly
+let globalATR = 800; 
+// ✅ NEW: For Rate Limiting (Throttle)
+let lastSlUpdateTime = 0; 
+
 let botState = { 
     positionType: null, 
     entryPrice: 0, 
@@ -210,6 +216,7 @@ let botState = {
     history: [],
     slOrderId: null 
 };
+
 
 // --- STATE MANAGEMENT ---
 async function loadState() {
@@ -313,6 +320,7 @@ async function modifyExchangeSL(newTrigger) {
 
 // --- 🔌 WEBSOCKET (Universal Decoder) ---
 // --- 🔌 WEBSOCKET (Binary Request & Response) ---
+// --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -320,73 +328,97 @@ async function initWebSocket() {
         const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", {
             headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' }
         });
-        const wsUrl = response.data.data.authorizedRedirectUri;
         const WebSocket = require('ws'); 
-        currentWs = new WebSocket(wsUrl, { followRedirects: true });
-        
+        currentWs = new WebSocket(response.data.data.authorizedRedirectUri, { followRedirects: true });
         currentWs.binaryType = "arraybuffer"; 
 
         currentWs.onopen = () => {
             console.log("✅ WebSocket Connected! Subscribing...");
-            const subRequest = {
-                guid: "bot-" + Date.now(),
-                method: "sub",
-                data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] }
-            };
-            
-            // 🚨 CRITICAL FIX: Send as Binary Buffer, not Text
-            // Upstox V3 ignores text frames for subscriptions
-            const binaryMsg = Buffer.from(JSON.stringify(subRequest));
+            const binaryMsg = Buffer.from(JSON.stringify({ guid: "bot-" + Date.now(), method: "sub", data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] } }));
             currentWs.send(binaryMsg);
         };
 
         currentWs.onmessage = (msg) => {
             try {
                 if (!FeedResponse) return;
-
-                // 1. Decode Response
                 const buffer = new Uint8Array(msg.data);
                 const message = FeedResponse.decode(buffer);
-                const object = FeedResponse.toObject(message, { 
-                    longs: String, 
-                    enums: String, 
-                    bytes: String, 
-                    defaults: true, 
-                    oneofs: true 
-                });
+                const object = FeedResponse.toObject(message, { longs: String, enums: String, bytes: String, defaults: true, oneofs: true });
 
-                // 2. Universal Price Search
-                if (object && object.feeds) {
+                if (object.feeds) {
                     for (const key in object.feeds) {
                         const feed = object.feeds[key];
-                        let newPrice = 0;
+                        let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
-                        // Check all possible locations for price
-                        if (feed.ltpc?.ltp) newPrice = feed.ltpc.ltp;
-                        else if (feed.fullFeed?.marketFF?.ltpc?.ltp) newPrice = feed.fullFeed.marketFF.ltpc.ltp;
-                        else if (feed.fullFeed?.indexFF?.ltpc?.ltp) newPrice = feed.fullFeed.indexFF.ltpc.ltp;
+                        if (newPrice > 0 && (key.includes("458305") || Object.keys(object.feeds).length === 1)) {
+                            lastKnownLtp = newPrice;
+                            
+                            // --- ⚡ INSTANT LOGIC START ---
+                            if (botState.positionType && botState.positionType !== 'NONE') {
+                                let newStop = botState.currentStop;
+                                let didChange = false;
+                                const now = Date.now();
 
-                        // Update Dashboard
-                        if (newPrice > 0) {
-                             // Strict check or fallback if we only have 1 key
-                            if (key.includes("458305") || Object.keys(object.feeds).length === 1) {
-                                if (newPrice !== lastKnownLtp) {
-                                    lastKnownLtp = newPrice;
+                                // 1. MOVE TO COST LOGIC (One-Time Trigger)
+                                if (botState.positionType === 'LONG') {
+                                    if (newPrice - botState.entryPrice >= 600 && botState.currentStop < botState.entryPrice) {
+                                        console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
+                                        newStop = botState.entryPrice;
+                                        didChange = true;
+                                    }
+                                    // 2. TRAILING LOGIC (ATR x 1.5)
+                                    // Only move UP
+                                    const trailingLevel = newPrice - (globalATR * 1.5);
+                                    if (trailingLevel > newStop) {
+                                        newStop = trailingLevel;
+                                        didChange = true;
+                                    }
+                                } 
+                                else if (botState.positionType === 'SHORT') {
+                                    if (botState.entryPrice - newPrice >= 600 && botState.currentStop > botState.entryPrice) {
+                                        console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
+                                        newStop = botState.entryPrice;
+                                        didChange = true;
+                                    }
+                                    // Only move DOWN
+                                    const trailingLevel = newPrice + (globalATR * 1.5);
+                                    if (trailingLevel < newStop) {
+                                        newStop = trailingLevel;
+                                        didChange = true;
+                                    }
+                                }
+
+                                // 3. EXECUTE UPDATE (With Throttling)
+                                if (didChange) {
+                                    const oldStop = botState.currentStop;
+                                    botState.currentStop = newStop;
+                                    
+                                    // Update Dashboard INSTANTLY
                                     pushToDashboard(); 
+
+                                    // Update Exchange (Throttle: Max once every 5 seconds)
+                                    if (now - lastSlUpdateTime > 5000) {
+                                        console.log(`🔄 Trailing SL Updated: ${oldStop.toFixed(0)} ➡️ ${newStop.toFixed(0)}`);
+                                        modifyExchangeSL(newStop);
+                                        lastSlUpdateTime = now;
+                                    }
                                 }
                             }
+                            // --- ⚡ INSTANT LOGIC END ---
+
+                            // Standard Dashboard Push (for price updates)
+                            pushToDashboard(); 
                         }
                     }
                 }
-            } catch (e) { 
-                console.error("❌ Decode Logic Error:", e.message);
-            }
+            } catch (e) { console.error("❌ Decode Logic Error:", e.message); }
         };
 
         currentWs.onclose = () => { currentWs = null; };
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
+
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
@@ -630,19 +662,23 @@ setInterval(() => {
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Prevents Double Orders) ---
 // --- TRADING ENGINE (Strict WebSocket Only) ---
+// --- TRADING ENGINE (Watcher & Entry) ---
 setInterval(async () => {
-    // ✅ NEW: Run the pulse check first
     await validateToken(); 
-
-    if (!ACCESS_TOKEN || !isApiAvailable()) { if (!ACCESS_TOKEN) console.log("📡 Waiting for Token..."); return; }
-
+    if (!ACCESS_TOKEN || !isApiAvailable()) return;
   
     // 1. WebSocket Watchdog
     if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
         initWebSocket();
-        // Wait for next loop; do not trade on 0 price
-        console.log("⏳ Waiting for WebSocket Price..."); 
         return; 
+    }
+
+    // 2. 🔍 PENDING ORDER FIXER (Run every loop)
+    // If we have a log that says "PENDING", try to find the real ID
+    const pendingLog = botState.history.find(h => h.id === "PENDING" || h.status === "SENT");
+    if (pendingLog) {
+        const fixedId = await fetchLatestOrderId(); // Helper to grab latest ID
+        if (fixedId) verifyOrderStatus(fixedId, 'ENTRY');
     }
 
     try {
@@ -650,60 +686,39 @@ setInterval(async () => {
         if (candles.length > 200) {
             const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
 
-            const e50 = EMA.calculate({period: 50, values: cl}), e200 = EMA.calculate({period: 200, values: cl}), vAvg = SMA.calculate({period: 20, values: v}), atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1], curA=atr[atr.length-1];
+            const e50 = EMA.calculate({period: 50, values: cl});
+            const vAvg = SMA.calculate({period: 20, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            
+            const curE50=e50[e50.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1];
+            const curA = atr[atr.length-1];
             const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
 
-            console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Volume: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
-            if (isMarketOpen()) {
-                if (!botState.positionType) {
-                    // --- ENTRY LOGIC ---
-                    if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
-                        botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp - (curA * 3);
-                        await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
-                    } 
-                    else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
-                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; botState.currentStop = lastKnownLtp + (curA * 3);
-                        await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
-                    }
-                } else {
-                    // --- EXIT / TRAILING LOGIC ---
-                    if (botState.positionType === 'LONG') {
-                        let ns = Math.max(lastKnownLtp - (curA * 3), botState.currentStop);
-                        if (ns > botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
-                        
-                        // EXIT TRIGGER
-                        if (lastKnownLtp < botState.currentStop) {
-                            if (botState.slOrderId) {
-                                console.log("🛑 Stop Hit! Waiting for Exchange SL...");
-                                verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
-                            } else {
-                                console.log("🛑 Stop Hit! Emergency Exit.");
-                                await placeOrder("SELL", botState.quantity, lastKnownLtp);
-                            }
-                        }
-                    } else {
-                        let ns = Math.min(lastKnownLtp + (curA * 3), botState.currentStop);
-                        if (ns < botState.currentStop) { botState.currentStop = ns; await modifyExchangeSL(ns); }
-                        
-                        // EXIT TRIGGER
-                        if (lastKnownLtp > botState.currentStop) {
-                            if (botState.slOrderId) {
-                                console.log("🛑 Stop Hit! Waiting for Exchange SL...");
-                                verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
-                            } else {
-                                console.log("🛑 Stop Hit! Emergency Exit.");
-                                await placeOrder("BUY", botState.quantity, lastKnownLtp);
-                            }
-                        }
-                    }
+            // ✅ UPDATE GLOBAL ATR (For WebSocket to use)
+            globalATR = curA; 
+
+            console.log(`LTP: ${lastKnownLtp} | ATR: ${curA.toFixed(0)} | Vol: ${curV}`);
+
+            if (isMarketOpen() && !botState.positionType) {
+                 // --- ENTRY LOGIC (Keep as is) ---
+                 if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
+                    botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
+                    botState.currentStop = lastKnownLtp - (curA * 1.5); // ✅ Use 1.5x here too
+                    await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                } 
+                else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
+                    botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
+                    botState.currentStop = lastKnownLtp + (curA * 1.5); // ✅ Use 1.5x here too
+                    await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                 }
-            }
+            } 
+            // ❌ REMOVED TRAILING LOGIC (It is now in WebSocket)
         }
     } catch (e) { 
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 30000);
+
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
@@ -822,14 +837,12 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // ✅ FIXED: SYNC PRICE ROUTE
 // --- SYNC PRICE ROUTE (With Live Price Fetch) ---
 // --- SYNC PRICE ROUTE (Fixed for Manual Orders) ---
+// --- SYNC PRICE ROUTE ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         console.log("🔄 Syncing Position...");
-        
         const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        
-        // ✅ FIX: Search for the ID "458305" anywhere in the instrument token
         const pos = (response.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
         if (pos && parseInt(pos.quantity) !== 0) {
@@ -837,37 +850,39 @@ app.post('/sync-price', async (req, res) => {
             botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
             botState.quantity = Math.abs(qty);
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
-            botState.totalPnL = 0;
             
-            // Force Price Check to avoid 0-price bug
+            // Force Price Check
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
                     const qRes = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
                     currentLtp = qRes.data.data[INSTRUMENT_KEY].last_price;
-                    lastKnownLtp = currentLtp; 
                 } catch (e) { currentLtp = botState.entryPrice; }
             }
 
-            // Calc SL
+            // ✅ CHANGED TO 1200 (Approx 1.5x ATR)
+            const riskPoints = 1200; 
             const entrySide = qty > 0 ? 'BUY' : 'SELL';
-            const slPrice = botState.positionType === 'LONG' ? (currentLtp - 800) : (currentLtp + 800);
+            const slPrice = botState.positionType === 'LONG' ? (currentLtp - riskPoints) : (currentLtp + riskPoints);
+            
+            // Update Internal State First
+            botState.currentStop = slPrice;
             
             console.log(`🔄 Sync Found: ${botState.positionType} | SL: ${slPrice}`);
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
 
         } else { 
-            // ✅ FOUND IT: This is where we clear everything
             botState.positionType = null; 
-            botState.currentStop = 0;    // Clear the SL Price
-            botState.slOrderId = null;   // Clear the Order ID
-            botState.quantity = 0;       // Safety reset
-            console.log("🔄 No open position found for ID 458305.");
+            botState.currentStop = 0;
+            botState.slOrderId = null;
+            botState.quantity = 0;
+            console.log("🔄 No open position found.");
         }
         await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
+
 
 const PORT = process.env.PORT || 10000;
 
