@@ -535,11 +535,11 @@ async function fetchLatestOrderId() {
 
 // --- VERIFY ORDER (Updates Dashboard Logs) ---
 // --- VERIFY ORDER (Updates Dashboard & Logs Real Execution) ---
+// --- VERIFY ORDER (Updates Actual Price) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
     
-    // Wait for Upstox to process the fill
     if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
 
     try {
@@ -550,32 +550,34 @@ async function verifyOrderStatus(orderId, context) {
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
         
         if (order.status === 'complete') {
-            const realPrice = parseFloat(order.average_price); // ✅ GET REAL TRADED PRICE
-            
-            // 🚨 THIS IS THE LOG YOU REQUESTED:
+            const realPrice = parseFloat(order.average_price); // Actual Traded Price
             console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice}`);
 
-            // 1. Update State (PnL / Position)
+            // 1. Update Internal State
             if (context === 'EXIT_CHECK') {
                 if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
                 if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
                 
                 // Add SL Exit Log
-                botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SL-EXIT", price: realPrice, id: orderId, status: "FILLED" });
+                botState.history.unshift({ 
+                    time: getIST().toLocaleTimeString(), 
+                    type: order.transaction_type, // ✅ Shows BUY/SELL
+                    orderedPrice: order.price,    // Keep 0 for Market orders or Limit price
+                    executedPrice: realPrice,     // ✅ The important part
+                    id: orderId, 
+                    status: "FILLED" 
+                });
                 
-                // Reset State
                 botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
             } 
             else if (botState.positionType) {
-                // Correct the Entry Price in Memory
-                console.log(`📝 Correcting Entry Price in State: ${botState.entryPrice} -> ${realPrice}`);
                 botState.entryPrice = realPrice;
             }
 
-            // 2. FIX DASHBOARD LOGS (Replace Buffer Price with Real Price)
+            // 2. UPDATE HISTORY LOG
             const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
             if (logIndex !== -1) {
-                botState.history[logIndex].price = realPrice; 
+                botState.history[logIndex].executedPrice = realPrice; // ✅ Update Actual Price
                 botState.history[logIndex].status = "FILLED";
                 botState.history[logIndex].id = orderId;
             }
@@ -596,6 +598,7 @@ async function verifyOrderStatus(orderId, context) {
     } catch (e) { console.log("Verification Error: " + e.message); }
 }
 // --- PLACE ORDER (Robust Logging) ---
+// --- PLACE ORDER (Saves Ordered Price) ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     const isAmo = !isMarketOpen();
@@ -610,12 +613,13 @@ async function placeOrder(type, qty, ltp) {
 
         const orderId = res.data?.data?.order_id;
         
-        // Log to History immediately
+        // ✅ NEW LOG FORMAT: Stores Ordered Price separately
         botState.history.unshift({ 
             time: getIST().toLocaleTimeString(), 
-            type, 
-            price: limitPrice, 
-            id: orderId || "PENDING", // If ID is missing, mark as PENDING
+            type: type, 
+            orderedPrice: limitPrice,  // 🆕 The price you requested
+            executedPrice: 0,          // 🆕 Will be updated when filled
+            id: orderId || "PENDING", 
             status: "SENT" 
         });
         
@@ -623,7 +627,7 @@ async function placeOrder(type, qty, ltp) {
         await manageExchangeSL(type, qty, slPrice);
 
         await saveState();
-        pushToDashboard(); // Update UI to show "SENT" immediately
+        pushToDashboard(); 
 
         if (orderId) verifyOrderStatus(orderId, 'ENTRY');
         return true;
@@ -743,15 +747,27 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // ✅ LOG FORMAT: Time | Details | Actual Price | Order ID
-    // ✅ LOG FORMAT: Time | Details | Actual Price | Order ID
-    const historyHTML = botState.history.slice(0, 10).map(t => 
+    // ✅ FILTER: Remove System/Autologin logs
+    // ✅ COLUMNS: Time | Details | Ordered Price | Actual Price | Order ID
+    const historyHTML = botState.history
+        .filter(t => !t.type.includes('SYSTEM') && t.type !== 'Autologin') // 🚫 Remove Auto-Login
+        .slice(0, 15) // Show last 15 relevant trades
+        .map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="flex:1; color:#94a3b8;">${t.time}</span> 
-            <b style="flex:1; text-align:center; color:${t.type.includes('SYSTEM') ? '#60a5fa' : (t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24')}">
-                ${t.type === 'SYSTEM' ? 'Autologin' : t.type}
+            
+            <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">
+                ${t.type}
             </b> 
-            <span style="flex:1; text-align:right; font-weight:bold;">₹${t.price}</span> 
+
+            <span style="flex:1; text-align:right; color:#cbd5e1;">
+                ₹${t.orderedPrice || '-'}
+            </span> 
+
+            <span style="flex:1; text-align:right; font-weight:bold; color:white;">
+                ₹${t.executedPrice || t.price || '-'}
+            </span> 
+
             <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
         </div>`).join('');
 
@@ -777,7 +793,7 @@ app.get('/', (req, res) => {
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:550px; background:#1e293b; padding:25px; border-radius:15px;">
+            <div style="width:100%; max-width:600px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
@@ -787,7 +803,7 @@ app.get('/', (req, res) => {
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${botState.totalPnL.toFixed(2)}</b></div>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL (CALC)</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">EXCHANGE SL</small><br><b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b><br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span></div>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
@@ -800,10 +816,11 @@ app.get('/', (req, res) => {
                 </div>
                 <form action="/reset-pnl" method="POST" style="margin-bottom:20px;"><button style="width:100%; padding:8px; background:#334155; color:#94a3b8; border:1px border-dashed #475569; border-radius:8px; cursor:pointer; font-size:12px;">❌ RESET HISTORICAL PNL (ONE TIME)</button></form>
                 
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between; padding-bottom:5px;">
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between; padding-bottom:5px; font-size:11px;">
                     <span style="flex:1;">Time</span> 
-                    <span style="flex:1; text-align:center;">Details</span> 
-                    <span style="flex:1; text-align:right;">Price</span> 
+                    <span style="flex:0.8; text-align:center;">Type</span> 
+                    <span style="flex:1; text-align:right;">Ordered</span> 
+                    <span style="flex:1; text-align:right;">Actual</span> 
                     <span style="flex:1.5; text-align:right;">Order ID</span>
                 </h4>
                 <div id="logContent">${historyHTML}</div>
@@ -818,16 +835,51 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE ROUTE (Fixed for Manual Orders) ---
 // --- SYNC PRICE ROUTE ---
 // --- SYNC PRICE ROUTE (Smart PnL Update) ---
+// --- SYNC PRICE ROUTE (Self-Healing & Fixes Logs) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
-        console.log("🔄 Syncing Position...");
+        console.log("🔄 Syncing Orders & Position...");
         
-        // 1. Get Net Position from Upstox
-        const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        const pos = (response.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
+        // 1. FETCH ALL ORDERS & REPAIR LOGS
+        const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // CASE A: POSITION IS OPEN
+        // Filter only Silver orders (today)
+        const myOrders = (ordRes.data?.data || []).filter(o => o.instrument_token && o.instrument_token.includes("458305"));
+
+        // Loop through Upstox Orders and FIX bot history
+        myOrders.forEach(upstoxOrder => {
+            const existingLog = botState.history.find(h => h.id === upstoxOrder.order_id);
+            const realPrice = parseFloat(upstoxOrder.average_price) || 0;
+            const limitPrice = parseFloat(upstoxOrder.price) || 0;
+
+            if (!existingLog) {
+                // ⚠️ MISSING ORDER FOUND! Add it.
+                if (upstoxOrder.status === 'complete' || upstoxOrder.status === 'open') {
+                    console.log(`🛠️ Restoring Missing Order: ${upstoxOrder.order_id}`);
+                    botState.history.unshift({
+                        time: new Date(upstoxOrder.order_timestamp).toLocaleTimeString(),
+                        type: upstoxOrder.transaction_type, // ✅ Shows BUY/SELL (not Sync-Exit)
+                        orderedPrice: limitPrice,
+                        executedPrice: realPrice,
+                        id: upstoxOrder.order_id,
+                        status: upstoxOrder.status === 'complete' ? 'FILLED' : upstoxOrder.status.toUpperCase()
+                    });
+                }
+            } else {
+                // ⚠️ WRONG PRICE/STATUS FOUND! Fix it.
+                if (upstoxOrder.status === 'complete' && existingLog.executedPrice !== realPrice) {
+                    console.log(`🛠️ Fixing Price for ${upstoxOrder.order_id}: ${existingLog.executedPrice} -> ${realPrice}`);
+                    existingLog.executedPrice = realPrice;
+                    existingLog.status = 'FILLED';
+                }
+            }
+        });
+        
+        // 2. NOW CHECK ACTIVE POSITIONS (Standard Sync)
+        const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
+        const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
+        
         if (pos && parseInt(pos.quantity) !== 0) {
             const qty = parseInt(pos.quantity);
             botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
@@ -844,65 +896,22 @@ app.post('/sync-price', async (req, res) => {
                 } catch (e) { currentLtp = botState.entryPrice; }
             }
 
-            // Calc SL (1200 points risk)
-            const riskPoints = 1200;
+            const riskPoints = 1200; 
             const entrySide = qty > 0 ? 'BUY' : 'SELL';
             const slPrice = botState.positionType === 'LONG' ? (currentLtp - riskPoints) : (currentLtp + riskPoints);
             
-            // Update Internal State
             botState.currentStop = slPrice;
             console.log(`🔄 Sync Found: ${botState.positionType} | SL: ${slPrice}`);
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
-            await saveState();
-        } 
-        // CASE B: POSITION IS CLOSED (But Bot thinks it's open)
-        else { 
-            if (botState.positionType && botState.positionType !== 'NONE') {
-                console.log("🕵️ Position closed externally. Fetching Exit Details...");
-                
-                // 1. Fetch recent orders to find the exit price
-                try {
-                    const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
-                    
-                    // Find the latest COMPLETED order for this instrument
-                    const lastOrder = ordRes.data.data
-                        .filter(o => o.instrument_token && o.instrument_token.includes("458305") && o.status === 'complete')
-                        .sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp))[0]; // Sort Newest First
 
-                    if (lastOrder) {
-                        const exitPrice = parseFloat(lastOrder.average_price);
-                        
-                        // 2. Calculate PnL
-                        let tradePnL = 0;
-                        if (botState.positionType === 'LONG') tradePnL = (exitPrice - botState.entryPrice) * botState.quantity;
-                        if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - exitPrice) * botState.quantity;
-                        
-                        botState.totalPnL += tradePnL;
-
-                        // 3. Log to History
-                        botState.history.unshift({ 
-                            time: getIST().toLocaleTimeString(), 
-                            type: "SYNC-EXIT", 
-                            price: exitPrice, 
-                            id: lastOrder.order_id, 
-                            status: "FILLED" 
-                        });
-                        
-                        console.log(`✅ Detected Exit @ ${exitPrice} | PnL Added: ${tradePnL}`);
-                    }
-                } catch (err) {
-                    console.error("❌ Failed to fetch exit order details:", err.message);
-                }
-            }
-
-            // 4. Clear State
+        } else { 
             botState.positionType = null; 
             botState.currentStop = 0;
             botState.slOrderId = null;
             botState.quantity = 0;
-            console.log("🔄 Position Cleaned.");
-            await saveState();
+            console.log("🔄 No open position found (Cleaned).");
         }
+        await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
