@@ -834,13 +834,17 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE ROUTE (With Live Price Fetch) ---
 // --- SYNC PRICE ROUTE (Fixed for Manual Orders) ---
 // --- SYNC PRICE ROUTE ---
+// --- SYNC PRICE ROUTE (Smart PnL Update) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         console.log("🔄 Syncing Position...");
+        
+        // 1. Get Net Position from Upstox
         const response = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (response.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
+        // CASE A: POSITION IS OPEN
         if (pos && parseInt(pos.quantity) !== 0) {
             const qty = parseInt(pos.quantity);
             botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
@@ -853,32 +857,72 @@ app.post('/sync-price', async (req, res) => {
                 try {
                     const qRes = await axios.get(`https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(INSTRUMENT_KEY)}`, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
                     currentLtp = qRes.data.data[INSTRUMENT_KEY].last_price;
+                    lastKnownLtp = currentLtp; 
                 } catch (e) { currentLtp = botState.entryPrice; }
             }
 
-            // ✅ CHANGED TO 1200 (Approx 1.5x ATR)
-            const riskPoints = 1200; 
+            // Calc SL (1200 points risk)
+            const riskPoints = 1200;
             const entrySide = qty > 0 ? 'BUY' : 'SELL';
             const slPrice = botState.positionType === 'LONG' ? (currentLtp - riskPoints) : (currentLtp + riskPoints);
             
-            // Update Internal State First
+            // Update Internal State
             botState.currentStop = slPrice;
-            
             console.log(`🔄 Sync Found: ${botState.positionType} | SL: ${slPrice}`);
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
+            await saveState();
+        } 
+        // CASE B: POSITION IS CLOSED (But Bot thinks it's open)
+        else { 
+            if (botState.positionType && botState.positionType !== 'NONE') {
+                console.log("🕵️ Position closed externally. Fetching Exit Details...");
+                
+                // 1. Fetch recent orders to find the exit price
+                try {
+                    const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
+                    
+                    // Find the latest COMPLETED order for this instrument
+                    const lastOrder = ordRes.data.data
+                        .filter(o => o.instrument_token && o.instrument_token.includes("458305") && o.status === 'complete')
+                        .sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp))[0]; // Sort Newest First
 
-        } else { 
+                    if (lastOrder) {
+                        const exitPrice = parseFloat(lastOrder.average_price);
+                        
+                        // 2. Calculate PnL
+                        let tradePnL = 0;
+                        if (botState.positionType === 'LONG') tradePnL = (exitPrice - botState.entryPrice) * botState.quantity;
+                        if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - exitPrice) * botState.quantity;
+                        
+                        botState.totalPnL += tradePnL;
+
+                        // 3. Log to History
+                        botState.history.unshift({ 
+                            time: getIST().toLocaleTimeString(), 
+                            type: "SYNC-EXIT", 
+                            price: exitPrice, 
+                            id: lastOrder.order_id, 
+                            status: "FILLED" 
+                        });
+                        
+                        console.log(`✅ Detected Exit @ ${exitPrice} | PnL Added: ${tradePnL}`);
+                    }
+                } catch (err) {
+                    console.error("❌ Failed to fetch exit order details:", err.message);
+                }
+            }
+
+            // 4. Clear State
             botState.positionType = null; 
             botState.currentStop = 0;
             botState.slOrderId = null;
             botState.quantity = 0;
-            console.log("🔄 No open position found.");
+            console.log("🔄 Position Cleaned.");
+            await saveState();
         }
-        await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
-
 
 const PORT = process.env.PORT || 10000;
 
