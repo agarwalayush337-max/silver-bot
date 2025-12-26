@@ -323,9 +323,6 @@ async function modifyExchangeSL(newTrigger) {
         console.log(`❌ SL Modify Failed: ${errMsg}`);
     }
 }
-// --- 🔌 WEBSOCKET (Universal Decoder) ---
-// --- 🔌 WEBSOCKET (Binary Request & Response) ---
-// --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
 // --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
@@ -364,34 +361,54 @@ async function initWebSocket() {
                                 let newStop = botState.currentStop;
                                 let didChange = false;
                                 const now = Date.now();
+                                let trailingGap = globalATR * 1.5; // Default Gap
 
-                                // 1. MOVE TO COST LOGIC (Priority: Ignores 50 point rule)
+                                // --- LOGIC FOR LONG ---
                                 if (botState.positionType === 'LONG') {
-                                    if (newPrice - botState.entryPrice >= 600 && botState.currentStop < botState.entryPrice) {
+                                    const profit = newPrice - botState.entryPrice;
+                                    
+                                    // 1. Move to Cost (Profit > 600)
+                                    if (profit >= 600 && botState.currentStop < botState.entryPrice) {
                                         console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
                                         newStop = botState.entryPrice;
                                         didChange = true;
                                     }
-                                    // 2. TRAILING LOGIC (With 50 Point Buffer)
-                                    const trailingLevel = newPrice - (globalATR * 1.5);
-                                    // ✅ NEW: Only update if change > 50 points
-                                    if (trailingLevel > botState.currentStop + 50) { 
-                                        newStop = trailingLevel; 
-                                        didChange = true; 
+                                    // 2. Tight Trailing (Profit > 1000 -> Gap 500)
+                                    if (profit >= 1000) trailingGap = 500;
+
+                                    // 3. Calculate Trailing
+                                    const trailingLevel = newPrice - trailingGap;
+                                    // Only update if change > 50 points
+                                    if (trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
+                                    
+                                    // 4. EXIT DETECTION (If Price drops below SL)
+                                    if (newPrice <= botState.currentStop) {
+                                        console.log("🛑 SL Hit Detected via WS! Verifying...");
+                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                     }
                                 } 
+                                // --- LOGIC FOR SHORT ---
                                 else if (botState.positionType === 'SHORT') {
-                                    if (botState.entryPrice - newPrice >= 600 && botState.currentStop > botState.entryPrice) {
+                                    const profit = botState.entryPrice - newPrice;
+                                    
+                                    // 1. Move to Cost (Profit > 600)
+                                    if (profit >= 600 && botState.currentStop > botState.entryPrice) {
                                         console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
                                         newStop = botState.entryPrice;
                                         didChange = true;
                                     }
-                                    // 2. TRAILING LOGIC (With 50 Point Buffer)
-                                    const trailingLevel = newPrice + (globalATR * 1.5);
-                                    // ✅ NEW: Only update if change > 50 points
-                                    if (trailingLevel < botState.currentStop - 50) { 
-                                        newStop = trailingLevel; 
-                                        didChange = true; 
+                                    // 2. Tight Trailing (Profit > 1000 -> Gap 500)
+                                    if (profit >= 1000) trailingGap = 500;
+
+                                    // 3. Calculate Trailing
+                                    const trailingLevel = newPrice + trailingGap;
+                                    // Only update if change > 50 points
+                                    if (trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
+
+                                    // 4. EXIT DETECTION (If Price rises above SL)
+                                    if (newPrice >= botState.currentStop) {
+                                        console.log("🛑 SL Hit Detected via WS! Verifying...");
+                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                     }
                                 }
 
@@ -419,6 +436,7 @@ async function initWebSocket() {
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
+
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
@@ -516,11 +534,12 @@ async function fetchLatestOrderId() {
 }
 
 // --- VERIFY ORDER (Updates Dashboard Logs) ---
+// --- VERIFY ORDER (Updates Dashboard & Logs Real Execution) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
     
-    // Wait a moment for the exchange to process the fill
+    // Wait for Upstox to process the fill
     if (context !== 'MANUAL_SYNC' && context !== 'EXIT_CHECK') await new Promise(r => setTimeout(r, 2000)); 
 
     try {
@@ -531,49 +550,46 @@ async function verifyOrderStatus(orderId, context) {
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
         
         if (order.status === 'complete') {
-            const realPrice = parseFloat(order.average_price);
+            const realPrice = parseFloat(order.average_price); // ✅ GET REAL TRADED PRICE
             
+            // 🚨 THIS IS THE LOG YOU REQUESTED:
+            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice}`);
+
             // 1. Update State (PnL / Position)
             if (context === 'EXIT_CHECK') {
                 if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
                 if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
-                botState.positionType = null;
-                botState.slOrderId = null;
-                botState.currentStop = null;
                 
-                // Add SL Exit Log if missing
-                const exists = botState.history.find(h => h.id === orderId);
-                if (!exists) {
-                     botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SL-EXIT", price: realPrice, id: orderId, status: "FILLED" });
-                }
+                // Add SL Exit Log
+                botState.history.unshift({ time: getIST().toLocaleTimeString(), type: "SL-EXIT", price: realPrice, id: orderId, status: "FILLED" });
+                
+                // Reset State
+                botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
             } 
             else if (botState.positionType) {
+                // Correct the Entry Price in Memory
+                console.log(`📝 Correcting Entry Price in State: ${botState.entryPrice} -> ${realPrice}`);
                 botState.entryPrice = realPrice;
             }
 
-            // 2. FIX DASHBOARD LOGS
-            // Find the log that says "SENT" or has this ID, and update it with REAL data
+            // 2. FIX DASHBOARD LOGS (Replace Buffer Price with Real Price)
             const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
-            
             if (logIndex !== -1) {
-                botState.history[logIndex].price = realPrice; // Set Actual Execution Price
+                botState.history[logIndex].price = realPrice; 
                 botState.history[logIndex].status = "FILLED";
-                botState.history[logIndex].id = orderId;      // Ensure ID is saved
+                botState.history[logIndex].id = orderId;
             }
 
             await saveState();
-            pushToDashboard(); // 🚀 Force UI Update
+            pushToDashboard(); 
             
         } else if (['rejected', 'cancelled'].includes(order.status)) {
             if (context === 'EXIT_CHECK') botState.slOrderId = null;
             else if (context !== 'MANUAL_SYNC' && botState.positionType) {
                 botState.positionType = null; botState.entryPrice = 0; botState.quantity = 0;
             }
-            
-            // Mark log as failed
             const log = botState.history.find(h => h.id === orderId);
             if (log) log.status = order.status.toUpperCase();
-            
             await saveState();
             pushToDashboard();
         }
@@ -728,14 +744,15 @@ app.get('/live-updates', (req, res) => {
 
 app.get('/', (req, res) => {
     // ✅ LOG FORMAT: Time | Details | Actual Price | Order ID
+    // ✅ LOG FORMAT: Time | Details | Actual Price | Order ID
     const historyHTML = botState.history.slice(0, 10).map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-            <span style="width:20%; color:#94a3b8;">${t.time}</span> 
-            <b style="width:20%; color:${t.type.includes('SYSTEM') ? '#60a5fa' : (t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24')}">
+            <span style="flex:1; color:#94a3b8;">${t.time}</span> 
+            <b style="flex:1; text-align:center; color:${t.type.includes('SYSTEM') ? '#60a5fa' : (t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24')}">
                 ${t.type === 'SYSTEM' ? 'Autologin' : t.type}
             </b> 
-            <span style="width:25%; font-weight:bold;">₹${t.price}</span> 
-            <span style="width:35%; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
+            <span style="flex:1; text-align:right; font-weight:bold;">₹${t.price}</span> 
+            <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
         </div>`).join('');
 
     res.send(`
@@ -747,26 +764,12 @@ app.get('/', (req, res) => {
                 source.onmessage = (e) => {
                     const d = JSON.parse(e.data);
                     document.getElementById('live-price').innerText = '₹' + d.price;
-                    
-                    // Live PnL
-                    const pnlEl = document.getElementById('live-pnl');
-                    pnlEl.innerText = '₹' + d.pnl;
-                    pnlEl.style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
-                    
-                    // Historical PnL
-                    const histPnlEl = document.getElementById('hist-pnl');
-                    if(histPnlEl) {
-                        histPnlEl.innerText = '₹' + d.historicalPnl;
-                        histPnlEl.style.color = d.historicalPnl >= 0 ? '#4ade80' : '#f87171';
-                    }
-
-                    // Trailing SL
+                    document.getElementById('live-pnl').innerText = '₹' + d.pnl;
+                    document.getElementById('live-pnl').style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                    document.getElementById('hist-pnl').innerText = '₹' + d.historicalPnl;
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
-                    
-                    // Exchange SL & ID
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
-
                     const stat = document.getElementById('live-status');
                     stat.innerText = d.status;
                     stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
@@ -776,55 +779,35 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:550px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
-                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
-                    <small style="color:#94a3b8;">LIVE PRICE</small><br>
-                    <b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
+                    <small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
-
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${botState.totalPnL.toFixed(2)}</b>
-                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${botState.totalPnL.toFixed(2)}</b></div>
                 </div>
-
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TRAILING SL (CALC)</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">EXCHANGE SL</small><br>
-                        <b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b>
-                        <br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span>
-                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL (CALC)</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">EXCHANGE SL</small><br><b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b><br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span></div>
                 </div>
-
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b>
-                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b></div>
                 </div>
-
                 <div style="display:flex; gap:10px; margin-bottom:10px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
-                <form action="/reset-pnl" method="POST" style="margin-bottom:20px;">
-                    <button style="width:100%; padding:8px; background:#334155; color:#94a3b8; border:1px border-dashed #475569; border-radius:8px; cursor:pointer; font-size:12px;">❌ RESET HISTORICAL PNL (ONE TIME)</button>
-                </form>
+                <form action="/reset-pnl" method="POST" style="margin-bottom:20px;"><button style="width:100%; padding:8px; background:#334155; color:#94a3b8; border:1px border-dashed #475569; border-radius:8px; cursor:pointer; font-size:12px;">❌ RESET HISTORICAL PNL (ONE TIME)</button></form>
                 
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between;">
-                    <span>Time</span> <span>Details</span> <span>Price</span> <span>Order ID</span>
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between; padding-bottom:5px;">
+                    <span style="flex:1;">Time</span> 
+                    <span style="flex:1; text-align:center;">Details</span> 
+                    <span style="flex:1; text-align:right;">Price</span> 
+                    <span style="flex:1.5; text-align:right;">Order ID</span>
                 </h4>
                 <div id="logContent">${historyHTML}</div>
-            </div>
-        </body></html>`);
+            </div></body></html>`);
 });
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
