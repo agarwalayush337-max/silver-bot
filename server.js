@@ -860,48 +860,78 @@ app.get('/', (req, res) => {
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
-// ✅ RESTORED: SYNC PRICE ROUTE
-// ✅ FIXED: SYNC PRICE ROUTE
-// --- SYNC PRICE ROUTE (With Live Price Fetch) ---
-// --- SYNC PRICE ROUTE (Fixed for Manual Orders) ---
-// --- SYNC PRICE ROUTE ---
-// --- SYNC PRICE ROUTE (Smart PnL Update) ---
-// --- SYNC PRICE ROUTE (Self-Healing & Fixes Logs) ---
-// --- SYNC PRICE ROUTE (Removes Old Orders & Sorts by Time) ---
+// --- SYNC PRICE (With PnL Calculation Engine) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
-        console.log("🔄 Syncing Orders & Position...");
+        console.log("🔄 Syncing & Recalculating PnL...");
         
-        // 1. FETCH UPSTOX ORDERS (Returns Today's Orders Only)
+        // 1. FETCH UPSTOX ORDERS
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter Silver orders
+        // Filter Silver orders & Sort by Time (Oldest First for Calculation)
         const myOrders = (ordRes.data?.data || [])
             .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
-            .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp)); // Sort Oldest to Newest first
+            .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        // 2. CLEANUP: Keep "System" logs, but REMOVE old Trade logs to prevent duplicates/old dates
-        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || h.type === 'Autologin');
+        // 2. REPLAY ENGINE: Calculate PnL by walking through the day's trades
+        let netPnL = 0;
+        let openPosition = { type: null, price: 0, qty: 0 };
+        const processedLogs = [];
 
-        // 3. REBUILD HISTORY FROM UPSTOX
         myOrders.forEach(order => {
             const realPrice = parseFloat(order.average_price) || 0;
             const limitPrice = parseFloat(order.price) || 0;
             const execTime = new Date(order.order_timestamp).toLocaleTimeString();
+            const txnType = order.transaction_type; // 'BUY' or 'SELL'
+            const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
+            
+            let tradePnL = 0; // Default 0
 
-            // Push to top (unshift) so Newest is always first
-            botState.history.unshift({
+            // LOGIC: Only calculate PnL on FILLED orders
+            if (order.status === 'complete') {
+                const qty = parseInt(order.quantity) || 1;
+
+                // Case A: Opening a New Position (if flat)
+                if (openPosition.qty === 0) {
+                    openPosition.type = txnType;
+                    openPosition.price = realPrice;
+                    openPosition.qty = qty;
+                }
+                // Case B: Closing (or flipping) a Position
+                else if (openPosition.type !== txnType) {
+                    // Calculate Profit based on the Open Price vs This Close Price
+                    if (openPosition.type === 'LONG' && txnType === 'SELL') {
+                        tradePnL = (realPrice - openPosition.price) * openPosition.qty;
+                    } else if (openPosition.type === 'SHORT' && txnType === 'BUY') {
+                        tradePnL = (openPosition.price - realPrice) * openPosition.qty;
+                    }
+                    
+                    // Reset Position (Assuming 1 lot strategy)
+                    openPosition.qty = 0; 
+                    openPosition.type = null;
+                    openPosition.price = 0;
+                }
+            }
+
+            // Create the Log Object
+            processedLogs.unshift({
                 time: execTime,
-                type: order.transaction_type, 
+                type: txnType,
                 orderedPrice: limitPrice,
                 executedPrice: realPrice,
                 id: order.order_id,
-                status: order.status === 'complete' ? 'FILLED' : order.status.toUpperCase()
+                status: status,
+                pnl: tradePnL !== 0 ? tradePnL : null // Only save PnL if value exists
             });
         });
 
-        // 4. SYNC ACTIVE POSITION
+        // 3. OVERWRITE BOT HISTORY
+        // Keep System/Autologin logs, but replace all trade logs with our new "Calculated" list
+        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || h.type === 'Autologin');
+        botState.history = [...processedLogs, ...botState.history]; // Add new trade logs at the top
+
+        // 4. SYNC ACTIVE POSITION (Standard Upstox Check)
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
@@ -911,7 +941,7 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = Math.abs(qty);
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             
-            // Force Price Check
+            // Re-check current price for SL calc
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
@@ -936,11 +966,14 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = 0;
             console.log("🔄 No open position found (Cleaned).");
         }
+        
+        // Recalculate Total Historical PnL from the new logs
+        botState.totalPnL = processedLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+
         await saveState();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
-
 
 const PORT = process.env.PORT || 10000;
 
