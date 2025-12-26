@@ -533,9 +533,7 @@ async function fetchLatestOrderId() {
     } catch (e) { console.log("ID Fetch Failed: " + e.message); } return null;
 }
 
-// --- VERIFY ORDER (Updates Dashboard Logs) ---
-// --- VERIFY ORDER (Updates Dashboard & Logs Real Execution) ---
-// --- VERIFY ORDER (Updates Actual Price) ---
+// --- VERIFY ORDER (Updates Actual Price & Execution Time) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
@@ -550,8 +548,11 @@ async function verifyOrderStatus(orderId, context) {
         console.log(`🔎 Verifying Order ${orderId}: ${order.status}`);
         
         if (order.status === 'complete') {
-            const realPrice = parseFloat(order.average_price); // Actual Traded Price
-            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice}`);
+            const realPrice = parseFloat(order.average_price);
+            // ✅ FIX: Use Upstox Execution Time (converted to Time String)
+            const execTime = new Date(order.order_timestamp).toLocaleTimeString();
+            
+            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice} on ${execTime}`);
 
             // 1. Update Internal State
             if (context === 'EXIT_CHECK') {
@@ -560,10 +561,10 @@ async function verifyOrderStatus(orderId, context) {
                 
                 // Add SL Exit Log
                 botState.history.unshift({ 
-                    time: getIST().toLocaleTimeString(), 
-                    type: order.transaction_type, // ✅ Shows BUY/SELL
-                    orderedPrice: order.price,    // Keep 0 for Market orders or Limit price
-                    executedPrice: realPrice,     // ✅ The important part
+                    time: execTime,               // ✅ Use Real Time
+                    type: order.transaction_type, 
+                    orderedPrice: order.price,    
+                    executedPrice: realPrice,     
                     id: orderId, 
                     status: "FILLED" 
                 });
@@ -577,7 +578,8 @@ async function verifyOrderStatus(orderId, context) {
             // 2. UPDATE HISTORY LOG
             const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
             if (logIndex !== -1) {
-                botState.history[logIndex].executedPrice = realPrice; // ✅ Update Actual Price
+                botState.history[logIndex].executedPrice = realPrice;
+                botState.history[logIndex].time = execTime; // ✅ Update Time in Log
                 botState.history[logIndex].status = "FILLED";
                 botState.history[logIndex].id = orderId;
             }
@@ -597,6 +599,7 @@ async function verifyOrderStatus(orderId, context) {
         }
     } catch (e) { console.log("Verification Error: " + e.message); }
 }
+
 // --- PLACE ORDER (Robust Logging) ---
 // --- PLACE ORDER (Saves Ordered Price) ---
 async function placeOrder(type, qty, ltp) {
@@ -747,11 +750,11 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // ✅ FILTER: Remove System/Autologin logs
-    // ✅ COLUMNS: Time | Details | Ordered Price | Actual Price | Order ID
+    // ✅ FILTER: Remove System/Autologin
+    // ✅ SORT: Ensure we show logs, assuming history is already sorted by Sync
     const historyHTML = botState.history
-        .filter(t => !t.type.includes('SYSTEM') && t.type !== 'Autologin') // 🚫 Remove Auto-Login
-        .slice(0, 15) // Show last 15 relevant trades
+        .filter(t => !t.type.includes('SYSTEM') && t.type !== 'Autologin') 
+        .slice(0, 15) // Show last 15
         .map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="flex:1; color:#94a3b8;">${t.time}</span> 
@@ -836,47 +839,41 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE ROUTE ---
 // --- SYNC PRICE ROUTE (Smart PnL Update) ---
 // --- SYNC PRICE ROUTE (Self-Healing & Fixes Logs) ---
+// --- SYNC PRICE ROUTE (Removes Old Orders & Sorts by Time) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         console.log("🔄 Syncing Orders & Position...");
         
-        // 1. FETCH ALL ORDERS & REPAIR LOGS
+        // 1. FETCH UPSTOX ORDERS (Returns Today's Orders Only)
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter only Silver orders (today)
-        const myOrders = (ordRes.data?.data || []).filter(o => o.instrument_token && o.instrument_token.includes("458305"));
+        // Filter Silver orders
+        const myOrders = (ordRes.data?.data || [])
+            .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
+            .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp)); // Sort Oldest to Newest first
 
-        // Loop through Upstox Orders and FIX bot history
-        myOrders.forEach(upstoxOrder => {
-            const existingLog = botState.history.find(h => h.id === upstoxOrder.order_id);
-            const realPrice = parseFloat(upstoxOrder.average_price) || 0;
-            const limitPrice = parseFloat(upstoxOrder.price) || 0;
+        // 2. CLEANUP: Keep "System" logs, but REMOVE old Trade logs to prevent duplicates/old dates
+        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || h.type === 'Autologin');
 
-            if (!existingLog) {
-                // ⚠️ MISSING ORDER FOUND! Add it.
-                if (upstoxOrder.status === 'complete' || upstoxOrder.status === 'open') {
-                    console.log(`🛠️ Restoring Missing Order: ${upstoxOrder.order_id}`);
-                    botState.history.unshift({
-                        time: new Date(upstoxOrder.order_timestamp).toLocaleTimeString(),
-                        type: upstoxOrder.transaction_type, // ✅ Shows BUY/SELL (not Sync-Exit)
-                        orderedPrice: limitPrice,
-                        executedPrice: realPrice,
-                        id: upstoxOrder.order_id,
-                        status: upstoxOrder.status === 'complete' ? 'FILLED' : upstoxOrder.status.toUpperCase()
-                    });
-                }
-            } else {
-                // ⚠️ WRONG PRICE/STATUS FOUND! Fix it.
-                if (upstoxOrder.status === 'complete' && existingLog.executedPrice !== realPrice) {
-                    console.log(`🛠️ Fixing Price for ${upstoxOrder.order_id}: ${existingLog.executedPrice} -> ${realPrice}`);
-                    existingLog.executedPrice = realPrice;
-                    existingLog.status = 'FILLED';
-                }
-            }
+        // 3. REBUILD HISTORY FROM UPSTOX
+        myOrders.forEach(order => {
+            const realPrice = parseFloat(order.average_price) || 0;
+            const limitPrice = parseFloat(order.price) || 0;
+            const execTime = new Date(order.order_timestamp).toLocaleTimeString();
+
+            // Push to top (unshift) so Newest is always first
+            botState.history.unshift({
+                time: execTime,
+                type: order.transaction_type, 
+                orderedPrice: limitPrice,
+                executedPrice: realPrice,
+                id: order.order_id,
+                status: order.status === 'complete' ? 'FILLED' : order.status.toUpperCase()
+            });
         });
-        
-        // 2. NOW CHECK ACTIVE POSITIONS (Standard Sync)
+
+        // 4. SYNC ACTIVE POSITION
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
@@ -915,6 +912,7 @@ app.post('/sync-price', async (req, res) => {
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
+
 
 const PORT = process.env.PORT || 10000;
 
