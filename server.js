@@ -244,15 +244,26 @@ function calculateLivePnL() {
     return (parseFloat(botState.totalPnL) + uPnL).toFixed(2);
 }
 
+// --- DASHBOARD HELPERS ---
+function calculateLivePnL() {
+    let uPnL = 0;
+    if (botState.positionType === 'LONG') uPnL = (lastKnownLtp - botState.entryPrice) * botState.quantity;
+    if (botState.positionType === 'SHORT') uPnL = (botState.entryPrice - lastKnownLtp) * botState.quantity;
+    
+    // ✅ NEW: Calculate Historical PnL by summing logs
+    const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
+    
+    return { live: uPnL.toFixed(2), history: historyPnL.toFixed(2) };
+}
+
 function pushToDashboard() {
-    // ✅ Check if a position is actually open
     const hasPosition = botState.positionType && botState.positionType !== 'NONE';
+    const pnlData = calculateLivePnL(); // Get both Live and History
 
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
-        pnl: calculateLivePnL(),
-        historicalPnl: botState.totalPnL.toFixed(2),
-        // ✅ FIX: Force these to 0/Null if no position exists
+        pnl: pnlData.live,
+        historicalPnl: pnlData.history, // ✅ Now dynamic
         stop: hasPosition ? botState.currentStop : 0,
         slID: hasPosition ? botState.slOrderId : null,
         status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE"
@@ -534,6 +545,7 @@ async function fetchLatestOrderId() {
 }
 
 // --- VERIFY ORDER (Updates Actual Price & Execution Time) ---
+// --- VERIFY ORDER (Updates Actual Price & PnL in Logs) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
@@ -549,24 +561,25 @@ async function verifyOrderStatus(orderId, context) {
         
         if (order.status === 'complete') {
             const realPrice = parseFloat(order.average_price);
-            // ✅ FIX: Use Upstox Execution Time (converted to Time String)
             const execTime = new Date(order.order_timestamp).toLocaleTimeString();
-            
-            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice} on ${execTime}`);
+            console.log(`✅ Order ${orderId} EXECUTED at ₹${realPrice}`);
 
             // 1. Update Internal State
             if (context === 'EXIT_CHECK') {
-                if (botState.positionType === 'LONG') botState.totalPnL += (realPrice - botState.entryPrice) * botState.quantity;
-                if (botState.positionType === 'SHORT') botState.totalPnL += (botState.entryPrice - realPrice) * botState.quantity;
-                
-                // Add SL Exit Log
+                let tradePnL = 0;
+                // ✅ Calculate PnL for this specific trade
+                if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
+                if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
+
+                // Add SL Exit Log WITH PnL
                 botState.history.unshift({ 
-                    time: execTime,               // ✅ Use Real Time
+                    time: execTime,
                     type: order.transaction_type, 
                     orderedPrice: order.price,    
                     executedPrice: realPrice,     
                     id: orderId, 
-                    status: "FILLED" 
+                    status: "FILLED",
+                    pnl: tradePnL // ✅ Save PnL here
                 });
                 
                 botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
@@ -575,11 +588,11 @@ async function verifyOrderStatus(orderId, context) {
                 botState.entryPrice = realPrice;
             }
 
-            // 2. UPDATE HISTORY LOG
+            // 2. UPDATE HISTORY LOG (If entry existed)
             const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
             if (logIndex !== -1) {
                 botState.history[logIndex].executedPrice = realPrice;
-                botState.history[logIndex].time = execTime; // ✅ Update Time in Log
+                botState.history[logIndex].time = execTime;
                 botState.history[logIndex].status = "FILLED";
                 botState.history[logIndex].id = orderId;
             }
@@ -750,11 +763,15 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // ✅ FILTER: Remove System/Autologin
-    // ✅ SORT: Ensure we show logs, assuming history is already sorted by Sync
+    // ✅ FILTER: Remove System, Autologin, AND Cancelled/Rejected
+    // ✅ UNRESTRICTED: Removed .slice() to show ALL logs
     const historyHTML = botState.history
-        .filter(t => !t.type.includes('SYSTEM') && t.type !== 'Autologin') 
-        .slice(0, 15) // Show last 15
+        .filter(t => 
+            !t.type.includes('SYSTEM') && 
+            t.type !== 'Autologin' && 
+            t.status !== 'CANCELLED' && 
+            t.status !== 'REJECTED'
+        ) 
         .map(t => 
         `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
             <span style="flex:1; color:#94a3b8;">${t.time}</span> 
@@ -770,9 +787,16 @@ app.get('/', (req, res) => {
             <span style="flex:1; text-align:right; font-weight:bold; color:white;">
                 ₹${t.executedPrice || t.price || '-'}
             </span> 
+            
+            <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
+                ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''}
+            </span>
 
             <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
         </div>`).join('');
+
+    // ✅ RECALCULATE PNL ON LOAD
+    const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
@@ -784,8 +808,11 @@ app.get('/', (req, res) => {
                     const d = JSON.parse(e.data);
                     document.getElementById('live-price').innerText = '₹' + d.price;
                     document.getElementById('live-pnl').innerText = '₹' + d.pnl;
-                    document.getElementById('live-pnl').style.color = d.pnl >= 0 ? '#4ade80' : '#f87171';
+                    document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
+                    
                     document.getElementById('hist-pnl').innerText = '₹' + d.historicalPnl;
+                    document.getElementById('hist-pnl').style.color = parseFloat(d.historicalPnl) >= 0 ? '#4ade80' : '#f87171';
+
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
@@ -796,14 +823,14 @@ app.get('/', (req, res) => {
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
-            <div style="width:100%; max-width:600px; background:#1e293b; padding:25px; border-radius:15px;">
+            <div style="width:100%; max-width:650px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL()}</b></div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${botState.totalPnL.toFixed(2)}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${historyPnL.toFixed(2)}</b></div>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
@@ -824,6 +851,7 @@ app.get('/', (req, res) => {
                     <span style="flex:0.8; text-align:center;">Type</span> 
                     <span style="flex:1; text-align:right;">Ordered</span> 
                     <span style="flex:1; text-align:right;">Actual</span> 
+                    <span style="flex:1; text-align:right;">PnL</span>
                     <span style="flex:1.5; text-align:right;">Order ID</span>
                 </h4>
                 <div id="logContent">${historyHTML}</div>
