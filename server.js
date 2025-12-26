@@ -315,11 +315,15 @@ async function modifyExchangeSL(newTrigger) {
             quantity: botState.quantity,
             order_type: "SL-M"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-    } catch (e) { /* Likely filled */ }
+    } catch (e) { 
+        // ✅ NEW: Print the error so we know WHY Upstox rejected it
+        const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
+        console.log(`❌ SL Modify Failed: ${errMsg}`);
+    }
 }
-
 // --- 🔌 WEBSOCKET (Universal Decoder) ---
 // --- 🔌 WEBSOCKET (Binary Request & Response) ---
+// --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
 // --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
@@ -359,19 +363,19 @@ async function initWebSocket() {
                                 let didChange = false;
                                 const now = Date.now();
 
-                                // 1. MOVE TO COST LOGIC (One-Time Trigger)
+                                // 1. MOVE TO COST LOGIC (Priority: Ignores 50 point rule)
                                 if (botState.positionType === 'LONG') {
                                     if (newPrice - botState.entryPrice >= 600 && botState.currentStop < botState.entryPrice) {
                                         console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
                                         newStop = botState.entryPrice;
                                         didChange = true;
                                     }
-                                    // 2. TRAILING LOGIC (ATR x 1.5)
-                                    // Only move UP
+                                    // 2. TRAILING LOGIC (With 50 Point Buffer)
                                     const trailingLevel = newPrice - (globalATR * 1.5);
-                                    if (trailingLevel > newStop) {
-                                        newStop = trailingLevel;
-                                        didChange = true;
+                                    // ✅ NEW: Only update if change > 50 points
+                                    if (trailingLevel > botState.currentStop + 50) { 
+                                        newStop = trailingLevel; 
+                                        didChange = true; 
                                     }
                                 } 
                                 else if (botState.positionType === 'SHORT') {
@@ -380,23 +384,21 @@ async function initWebSocket() {
                                         newStop = botState.entryPrice;
                                         didChange = true;
                                     }
-                                    // Only move DOWN
+                                    // 2. TRAILING LOGIC (With 50 Point Buffer)
                                     const trailingLevel = newPrice + (globalATR * 1.5);
-                                    if (trailingLevel < newStop) {
-                                        newStop = trailingLevel;
-                                        didChange = true;
+                                    // ✅ NEW: Only update if change > 50 points
+                                    if (trailingLevel < botState.currentStop - 50) { 
+                                        newStop = trailingLevel; 
+                                        didChange = true; 
                                     }
                                 }
 
-                                // 3. EXECUTE UPDATE (With Throttling)
                                 if (didChange) {
                                     const oldStop = botState.currentStop;
                                     botState.currentStop = newStop;
-                                    
-                                    // Update Dashboard INSTANTLY
                                     pushToDashboard(); 
 
-                                    // Update Exchange (Throttle: Max once every 5 seconds)
+                                    // Throttle Upstox Calls (Max once every 5s)
                                     if (now - lastSlUpdateTime > 5000) {
                                         console.log(`🔄 Trailing SL Updated: ${oldStop.toFixed(0)} ➡️ ${newStop.toFixed(0)}`);
                                         modifyExchangeSL(newStop);
@@ -404,9 +406,6 @@ async function initWebSocket() {
                                     }
                                 }
                             }
-                            // --- ⚡ INSTANT LOGIC END ---
-
-                            // Standard Dashboard Push (for price updates)
                             pushToDashboard(); 
                         }
                     }
@@ -418,7 +417,6 @@ async function initWebSocket() {
         currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
-
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
 async function performAutoLogin() {
