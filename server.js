@@ -1205,16 +1205,9 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
 app.get('/restore-yesterday', async (req, res) => {
     // 1. Define the exact trades from your screenshot (Screenshot 317)
     const tradesToRestore = [
-        { time: "9:33:03 PM", type: "SELL", price: 237140, pnl: 540,  id: "251226000282655" },
-        { time: "8:59:47 PM", type: "BUY",  price: 236600, pnl: 0,    id: "251226000282654" },
-        { time: "8:52:32 PM", type: "SELL", price: 234879, pnl: -8,   id: "251226000281805" },
-        { time: "8:38:46 PM", type: "BUY",  price: 234887, pnl: 0,    id: "251226000281804" },
-        { time: "8:00:15 PM", type: "SELL", price: 233404, pnl: -830, id: "251226000279942" },
-        { time: "7:47:16 PM", type: "BUY",  price: 234234, pnl: 0,    id: "251226000279941" },
-        { time: "5:03:02 PM", type: "BUY",  price: 231472, pnl: 585,  id: "251226000274227" },
-        { time: "4:55:56 PM", type: "SELL", price: 232057, pnl: 0,    id: "251226000274225" },
-        { time: "4:05:12 PM", type: "SELL", price: 235000, pnl: 1600, id: "251226000272243" },
-        { time: "2:20:56 PM", type: "BUY",  price: 233400, pnl: 0,    id: "251226000228328" }
+        { time: "12:21:04 AM", type: "SELL", price: 232820, pnl: 433,  id: "251226000142950" },
+        { time: "9:01:26 AM", type: "BUY",  price: 232387, pnl: 0,    id: "251226000002213" },
+        
     ];
 
     const targetDate = "2024-12-26"; // Yesterday
