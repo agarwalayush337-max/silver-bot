@@ -915,60 +915,55 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 
 // --- SYNC PRICE (With PnL Calculation Engine) ---
 // --- SYNC PRICE (Fixed PnL Calculation Logic) ---
+// --- SYNC PRICE (Preserves History & Dates) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
         console.log("🔄 Syncing & Recalculating PnL...");
         
-        // 1. FETCH UPSTOX ORDERS
+        // 1. FETCH UPSTOX ORDERS (Today's Orders Only)
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter Silver orders & Sort by Time (Oldest First)
+        // Filter Silver orders & Sort by Time
         const myOrders = (ordRes.data?.data || [])
             .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        // 2. REPLAY ENGINE: Calculate PnL
+        // 2. REPLAY ENGINE: Calculate PnL for TODAY
         let openPos = { side: null, price: 0, qty: 0 };
         const processedLogs = [];
+        const todayStr = formatDate(getIST()); // Get Today's Date String
 
         myOrders.forEach(order => {
             const realPrice = parseFloat(order.average_price) || 0;
             const limitPrice = parseFloat(order.price) || 0;
             const execTime = new Date(order.order_timestamp).toLocaleTimeString();
-            const txnType = order.transaction_type; // 'BUY' or 'SELL'
+            const txnType = order.transaction_type; 
             const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
             
             let tradePnL = 0; 
 
-            // LOGIC: Only calculate PnL on FILLED orders
             if (order.status === 'complete') {
                 const qty = parseInt(order.quantity) || 1;
-
-                // Case A: Opening a New Position
+                // Replay Position Logic
                 if (openPos.qty === 0) {
-                    openPos.side = txnType; // Store 'BUY' or 'SELL'
+                    openPos.side = txnType;
                     openPos.price = realPrice;
                     openPos.qty = qty;
                 }
-                // Case B: Closing the Position (Opposite Side)
                 else if (openPos.side !== txnType) {
-                    // ✅ FIXED: Check 'BUY' vs 'SELL' directly (removed 'LONG'/'SHORT' confusion)
                     if (openPos.side === 'BUY' && txnType === 'SELL') {
                         tradePnL = (realPrice - openPos.price) * openPos.qty;
                     } else if (openPos.side === 'SELL' && txnType === 'BUY') {
                         tradePnL = (openPos.price - realPrice) * openPos.qty;
                     }
-                    
-                    // Reset Position
-                    openPos.qty = 0; 
-                    openPos.side = null;
-                    openPos.price = 0;
+                    openPos.qty = 0; openPos.side = null; openPos.price = 0;
                 }
             }
 
+            // Create Log WITH DATE
             processedLogs.unshift({
-                date: formatDate(new Date(order.order_timestamp)), // 🆕 NEW FIELD
+                date: todayStr, // ✅ SAVES DATE (Crucial for Reports)
                 time: execTime,
                 type: txnType,
                 orderedPrice: limitPrice,
@@ -979,12 +974,27 @@ app.post('/sync-price', async (req, res) => {
             });
         });
 
-        // 3. UPDATE BOT HISTORY
-        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || h.type === 'Autologin');
+        // 3. INTELLIGENT MERGE (Preserve Yesterday's Logs)
+        botState.history = botState.history.filter(h => {
+            // Keep System logs
+            if (h.type === 'SYSTEM' || h.type === 'Autologin') return true;
+            
+            // ✅ KEEP Old History (If date is NOT today)
+            // If a log has a date and it's NOT today, keep it.
+            if (h.date && h.date !== todayStr) return true;
+            
+            // If a log has NO date (Legacy data from yesterday), KEEP it (Safe mode)
+            if (!h.date) return true;
+
+            // DELETE "Old" versions of Today's logs (so we can replace them with fresh sync)
+            return false; 
+        });
+
+        // Add Fresh "Today" Logs to the top
         botState.history = [...processedLogs, ...botState.history];
 
-        // 4. RECALCULATE TOTAL HISTORICAL PNL
-        botState.totalPnL = processedLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+        // 4. RECALCULATE TOTAL PNL (Sum of ALL logs: Today + Yesterday)
+        botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
         // 5. CHECK ACTIVE POSITION (Standard Upstox Check)
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
@@ -1025,7 +1035,6 @@ app.post('/sync-price', async (req, res) => {
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
-
 
 const PORT = process.env.PORT || 10000;
 
