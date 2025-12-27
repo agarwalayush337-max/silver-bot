@@ -584,7 +584,14 @@ async function verifyOrderStatus(orderId, context) {
                     if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
 
                     botState.history.unshift({ 
-                        time: execTime, type: order.transaction_type, orderedPrice: order.price, executedPrice: realPrice, id: orderId, status: "FILLED", pnl: tradePnL 
+                        date: formatDate(getIST()), // 🆕 NEW FIELD
+                        time: execTime, 
+                        type: order.transaction_type, 
+                        orderedPrice: order.price, 
+                        executedPrice: realPrice, 
+                        id: orderId, 
+                        status: "FILLED", 
+                        pnl: tradePnL 
                     });
                     botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
                 } 
@@ -648,9 +655,11 @@ async function placeOrder(type, qty, ltp) {
         botState.entryPrice = limitPrice; // Will be corrected by Verify
         botState.quantity = qty;
         botState.currentStop = slPrice;   // ✅ FIXED: Save the initial stop
+
         
-        // Log to History
+        // ✅ UPDATED LOGGING: Adds 'date' field
         botState.history.unshift({ 
+            date: formatDate(getIST()), // 🆕 NEW FIELD
             time: getIST().toLocaleTimeString(), 
             type: type, 
             orderedPrice: limitPrice,  
@@ -658,6 +667,7 @@ async function placeOrder(type, qty, ltp) {
             id: orderId || "PENDING", 
             status: "SENT" 
         });
+        // ... rest of function ...
         
         await manageExchangeSL(type, qty, slPrice);
         await saveState();
@@ -782,40 +792,50 @@ app.get('/live-updates', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // ✅ FILTER: Remove System, Autologin, AND Cancelled/Rejected
-    // ✅ UNRESTRICTED: Removed .slice() to show ALL logs
-    const historyHTML = botState.history
+    // 1. CALCULATE TODAY'S PNL
+    // We assume getIST() and formatDate() are defined globally as per previous files
+    const todayStr = formatDate(getIST()); 
+    
+    // Filter history for only today's logs to calculate daily PnL
+    const todayLogs = botState.history.filter(h => h.date === todayStr);
+    const todayPnL = todayLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+
+    // 2. PREPARE LOGS FOR DASHBOARD (Limit to 10 & Add Analysis Link)
+    const displayLogs = botState.history
         .filter(t => 
             !t.type.includes('SYSTEM') && 
             t.type !== 'Autologin' && 
             t.status !== 'CANCELLED' && 
             t.status !== 'REJECTED'
-        ) 
-        .map(t => 
-        `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-            <span style="flex:1; color:#94a3b8;">${t.time}</span> 
-            
-            <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">
-                ${t.type}
-            </b> 
+        )
+        .slice(0, 10) // Show only last 10 activities on home
+        .map(t => {
+            // Logic: If PnL is negative and trade is filled, show "Analyze" button
+            const showAnalyze = (t.pnl < 0 && t.status === 'FILLED'); 
+            const analyzeBtn = showAnalyze ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
 
-            <span style="flex:1; text-align:right; color:#cbd5e1;">
-                ₹${t.orderedPrice || '-'}
-            </span> 
+            return `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
+                <span style="flex:1; color:#94a3b8;">${t.time}</span> 
+                
+                <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">
+                    ${t.type}
+                </b> 
 
-            <span style="flex:1; text-align:right; font-weight:bold; color:white;">
-                ₹${t.executedPrice || t.price || '-'}
-            </span> 
-            
-            <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
-                ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''}
-            </span>
+                <span style="flex:1; text-align:right; color:#cbd5e1;">
+                    ₹${t.orderedPrice || '-'}
+                </span> 
 
-            <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
-        </div>`).join('');
+                <span style="flex:1; text-align:right; font-weight:bold; color:white;">
+                    ₹${t.executedPrice || t.price || '-'}
+                </span> 
+                
+                <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
+                    ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn}
+                </span>
 
-    // ✅ RECALCULATE PNL ON LOAD
-    const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
+                <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
+            </div>`;
+        }).join('');
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
@@ -829,9 +849,9 @@ app.get('/', (req, res) => {
                     document.getElementById('live-pnl').innerText = '₹' + d.pnl;
                     document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
                     
-                    document.getElementById('hist-pnl').innerText = '₹' + d.historicalPnl;
-                    document.getElementById('hist-pnl').style.color = parseFloat(d.historicalPnl) >= 0 ? '#4ade80' : '#f87171';
-
+                    // Note: We don't live-update Today's PnL via SSE here to save bandwidth, 
+                    // it updates on refresh. Live PnL handles the active trade.
+                    
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
@@ -844,21 +864,35 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:650px; background:#1e293b; padding:25px; border-radius:15px;">
                 <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
+                
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b></div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${historyPnL.toFixed(2)}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">LIVE PNL (Active)</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">TODAY'S PNL</small><br>
+                        <b id="todays-pnl" style="color:${todayPnL >= 0 ? '#4ade80' : '#f87171'}">₹${todayPnL.toFixed(2)}</b>
+                    </div>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">EXCHANGE SL</small><br><b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b><br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span></div>
                 </div>
+
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b></div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b></div>
                 </div>
+
+                <div style="margin-bottom:15px;">
+                    <a href="/reports" style="display:block; width:100%; padding:12px; background:#334155; color:white; text-align:center; border-radius:8px; text-decoration:none; font-weight:bold; border:1px solid #475569;">📊 VIEW HISTORICAL REPORTS</a>
+                </div>
+
                 <div style="display:flex; gap:10px; margin-bottom:10px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
@@ -873,7 +907,7 @@ app.get('/', (req, res) => {
                     <span style="flex:1; text-align:right;">PnL</span>
                     <span style="flex:1.5; text-align:right;">Order ID</span>
                 </h4>
-                <div id="logContent">${historyHTML}</div>
+                <div id="logContent">${displayLogs}</div>
             </div></body></html>`);
 });
 
@@ -933,8 +967,8 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
 
-            // Create Log
             processedLogs.unshift({
+                date: formatDate(new Date(order.order_timestamp)), // 🆕 NEW FIELD
                 time: execTime,
                 type: txnType,
                 orderedPrice: limitPrice,
@@ -1001,6 +1035,191 @@ app.post('/reset-pnl', async (req, res) => {
     await saveState();
     pushToDashboard();
     res.redirect('/');
+});
+
+// --- 📊 REPORTS ROUTE ---
+app.get('/reports', (req, res) => {
+    // 1. Group Data by Date
+    const grouped = {};
+    botState.history.forEach(log => {
+        if (!log.date || log.type.includes('SYSTEM')) return;
+        if (!grouped[log.date]) grouped[log.date] = { date: log.date, trades: [], pnl: 0, wins: 0, losses: 0 };
+        
+        grouped[log.date].trades.push(log);
+        if (log.pnl) {
+            grouped[log.date].pnl += log.pnl;
+            if (log.pnl > 0) grouped[log.date].wins++;
+            else grouped[log.date].losses++;
+        }
+    });
+
+    const reportRows = Object.values(grouped).sort((a,b) => new Date(b.date) - new Date(a.date));
+
+    // 2. Check if a specific date is selected
+    const selectedDate = req.query.date;
+    let detailView = "";
+    
+    if (selectedDate && grouped[selectedDate]) {
+        const dayLogs = grouped[selectedDate].trades;
+        const dayRows = dayLogs.map(t => {
+            // Show Analyze button for losses
+            const analyzeBtn = (t.pnl < 0) ? `<a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` : '';
+            return `<div style="padding:10px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; font-size:12px;">
+                <span>${t.time}</span>
+                <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b>
+                <span>₹${t.executedPrice}</span>
+                <span style="color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">₹${(t.pnl||0).toFixed(0)} ${analyzeBtn}</span>
+            </div>`;
+        }).join('');
+
+        detailView = `
+            <div style="margin-top:20px; background:#0f172a; padding:15px; border-radius:10px;">
+                <h3 style="color:#fbbf24; margin-top:0;">📅 Details for ${selectedDate}</h3>
+                ${dayRows}
+            </div>
+        `;
+    }
+
+    // 3. Render Report Page
+    const reportHTML = reportRows.map(r => `
+        <a href="/reports?date=${r.date}" style="text-decoration:none; color:white;">
+            <div style="display:flex; justify-content:space-between; padding:15px; background:#0f172a; margin-bottom:10px; border-radius:8px; border-left:5px solid ${r.pnl>=0?'#4ade80':'#f87171'};">
+                <div><b>${r.date}</b><br><small style="color:#94a3b8;">${r.wins}W / ${r.losses}L</small></div>
+                <div style="text-align:right;"><b style="font-size:16px; color:${r.pnl>=0?'#4ade80':'#f87171'}">₹${r.pnl.toFixed(2)}</b></div>
+            </div>
+        </a>
+    `).join('');
+
+    res.send(`
+        <!DOCTYPE html><html style="background:#1e293b; color:white; font-family:sans-serif;">
+        <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="padding:20px; max-width:600px; margin:auto;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                <h2 style="color:#38bdf8; margin:0;">📊 Historical Reports</h2>
+                <a href="/" style="padding:8px 15px; background:#64748b; color:white; text-decoration:none; border-radius:5px;">🏠 Home</a>
+            </div>
+            
+            <div id="calendar-view">${reportHTML}</div>
+            ${detailView}
+        </body></html>
+    `);
+});
+
+// --- 🔍 SL ANALYSIS ROUTE ---
+app.get('/analyze-sl/:orderId', async (req, res) => {
+    const orderId = req.params.orderId;
+    const trade = botState.history.find(h => h.id === orderId);
+    
+    if (!trade) return res.send("Trade not found.");
+    if (trade.pnl >= 0) return res.send("This trade was profitable. No SL analysis needed.");
+
+    // 1. Fetch Market Data around the trade time
+    const candles = await getMergedCandles();
+    if (candles.length === 0) return res.send("Insufficient market data for analysis.");
+
+    // 2. Find the candle where SL happened
+    // (Simple match: candle time closest to trade time)
+    const tradeTime = new Date(`${trade.date} ${trade.time}`); 
+    const slPrice = trade.executedPrice;
+    
+    // Find index of candle closest to exit
+    let exitIndex = candles.findIndex(c => Math.abs(new Date(c[0]) - tradeTime) < 5 * 60 * 1000);
+    if (exitIndex === -1) exitIndex = candles.length - 1; // Default to last if not found
+
+    // 3. Analyze Next 3 Candles (15 Mins after SL)
+    const nextCandles = candles.slice(exitIndex + 1, exitIndex + 4);
+    let analysis = "";
+    let suggestion = "";
+    let color = "";
+
+    if (nextCandles.length === 0) {
+        analysis = "Trade just happened. Market data for 'future' price action is not yet available. Check back in 15 mins.";
+        color = "#94a3b8";
+    } else {
+        // LOGIC FOR LONG POSITION (SL Triggered via Sell)
+        if (trade.type === 'SELL') { // You Sold to Exit
+            const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low after exit
+            const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High after exit
+
+            if (minAfter < slPrice) {
+                analysis = "✅ <b>Good Exit:</b> Price continued to drop after your SL was hit. You saved money by exiting early.";
+                suggestion = "Strategy Correctness: 100%. The trend was indeed reversing.";
+                color = "#4ade80"; // Green
+            } else if (maxAfter > slPrice + 150) {
+                analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit your SL and immediately reversed back up.";
+                suggestion = "<b>Possible Fix:</b> Your SL might be too tight or placed exactly at a support level. Consider using 'ATR Trailing' instead of fixed points, or wait for a candle Close below level.";
+                color = "#fbbf24"; // Yellow
+            } else {
+                analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways after your exit.";
+                color = "#cbd5e1";
+            }
+        }
+        // LOGIC FOR SHORT POSITION (SL Triggered via Buy)
+        else if (trade.type === 'BUY') { // You Bought to Exit
+            const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High after exit
+            const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low after exit
+
+            if (maxAfter > slPrice) {
+                analysis = "✅ <b>Good Exit:</b> Price continued to rise after your SL. You prevented a bigger loss.";
+                suggestion = "Strategy Correctness: 100%.";
+                color = "#4ade80";
+            } else if (minAfter < slPrice - 150) {
+                analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked up to hit your SL and immediately dropped back down.";
+                suggestion = "<b>Possible Fix:</b> Avoid placing SL exactly at recent Highs. Add a buffer (0.1%).";
+                color = "#fbbf24";
+            } else {
+                analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
+                color = "#cbd5e1";
+            }
+        }
+    }
+
+    res.send(`
+        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
+            <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
+                <h2 style="color:#38bdf8;">🔍 Trade Analysis</h2>
+                <p><b>Trade ID:</b> ${orderId}</p>
+                <p><b>Exit Price:</b> ₹${slPrice}</p>
+                <div style="background:${color}20; border:1px solid ${color}; padding:20px; border-radius:10px; margin-top:20px;">
+                    <p style="font-size:18px; color:${color}; margin:0;">${analysis}</p>
+                    <hr style="border-color:#334155; margin:15px 0;">
+                    <p style="color:#cbd5e1; font-size:14px;">${suggestion}</p>
+                </div>
+                <br>
+                <a href="/reports" style="color:#94a3b8;">Back to Reports</a>
+            </div>
+        </body>
+    `);
+});
+
+// --- 🛠️ BACKFILL TOOL: Fix Old Logs ---
+app.get('/assign-date', async (req, res) => {
+    const targetDate = req.query.date; // Format: YYYY-MM-DD
+    if (!targetDate) return res.send("Please provide a date! Example: /assign-date?date=2025-12-26");
+
+    let count = 0;
+    
+    // Loop through history and fix logs that don't have a date
+    botState.history.forEach(log => {
+        if (!log.date && !log.type.includes('SYSTEM')) {
+            log.date = targetDate; // ✅ Stamp it with the provided date
+            count++;
+        }
+    });
+
+    await saveState(); // Save changes to Redis
+    
+    res.send(`
+        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
+            <div style="max-width:500px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; text-align:center;">
+                <h2 style="color:#4ade80;">✅ Success!</h2>
+                <p>Recovered <b>${count}</b> old logs.</p>
+                <p>Assigned them to date: <b style="color:#fbbf24;">${targetDate}</b></p>
+                <br>
+                <a href="/reports" style="padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:5px;">📊 Check Reports Now</a>
+            </div>
+        </body>
+    `);
 });
 
 
