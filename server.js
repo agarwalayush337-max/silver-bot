@@ -1115,71 +1115,99 @@ app.get('/reports', (req, res) => {
 });
 
 // --- 🔍 SL ANALYSIS ROUTE ---
+// --- 🔍 SL ANALYSIS ROUTE (Fixed for 12-Hour Times) ---
 app.get('/analyze-sl/:orderId', async (req, res) => {
     const orderId = req.params.orderId;
     const trade = botState.history.find(h => h.id === orderId);
     
     if (!trade) return res.send("Trade not found.");
-    if (trade.pnl >= 0) return res.send("This trade was profitable. No SL analysis needed.");
-
-    // 1. Fetch Market Data around the trade time
+    
+    // 1. Fetch Market Data
     const candles = await getMergedCandles();
     if (candles.length === 0) return res.send("Insufficient market data for analysis.");
 
-    // 2. Find the candle where SL happened
-    // (Simple match: candle time closest to trade time)
-    const tradeTime = new Date(`${trade.date} ${trade.time}`); 
-    const slPrice = trade.executedPrice;
-    
-    // Find index of candle closest to exit
-    let exitIndex = candles.findIndex(c => Math.abs(new Date(c[0]) - tradeTime) < 5 * 60 * 1000);
-    if (exitIndex === -1) exitIndex = candles.length - 1; // Default to last if not found
+    // 2. ROBUST DATE PARSING (Handles "8:00 PM" correctly)
+    let tradeTime;
+    try {
+        // Attempt 1: Standard Parse
+        tradeTime = new Date(`${trade.date} ${trade.time}`);
+        
+        // Attempt 2: If Invalid, Parse 12-Hour format manually
+        if (isNaN(tradeTime.getTime())) {
+            const [timePart, modifier] = trade.time.split(' ');
+            let [hours, minutes] = timePart.split(':');
+            if (hours === '12') hours = '00';
+            if (modifier === 'PM') hours = parseInt(hours, 10) + 12;
+            tradeTime = new Date(`${trade.date}T${hours}:${minutes}:00`);
+        }
+    } catch (e) { return res.send("Error parsing trade time."); }
 
-    // 3. Analyze Next 3 Candles (15 Mins after SL)
+    const slPrice = parseFloat(trade.executedPrice);
+    
+    // 3. Find index of candle closest to exit
+    // We look for a candle within 5 mins of the trade
+    let exitIndex = candles.findIndex(c => Math.abs(new Date(c[0]) - tradeTime) < 5 * 60 * 1000);
+    
+    // If exact match not found, find the closest one AFTER the trade
+    if (exitIndex === -1) {
+        exitIndex = candles.findIndex(c => new Date(c[0]) > tradeTime);
+    }
+
+    // Safety: If still not found or it's the very last candle
+    if (exitIndex === -1 || exitIndex >= candles.length - 1) {
+         return res.send(`
+            <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
+                <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
+                    <h2 style="color:#fbbf24;">⏳ Data Pending</h2>
+                    <p>Could not locate the specific candle for <b>${trade.time}</b> in historical data yet.</p>
+                    <p>This happens if the trade is too recent or outside market hours.</p>
+                    <a href="/" style="color:#94a3b8;">Back</a>
+                </div>
+            </body>
+        `);
+    }
+
+    // 4. Analyze Next 3 Candles (15 Mins after SL)
     const nextCandles = candles.slice(exitIndex + 1, exitIndex + 4);
     let analysis = "";
     let suggestion = "";
     let color = "";
 
-    if (nextCandles.length === 0) {
-        analysis = "Trade just happened. Market data for 'future' price action is not yet available. Check back in 15 mins.";
-        color = "#94a3b8";
-    } else {
-        // LOGIC FOR LONG POSITION (SL Triggered via Sell)
-        if (trade.type === 'SELL') { // You Sold to Exit
-            const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low after exit
-            const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High after exit
+    // LOGIC FOR SHORT POSITION (SL Triggered via Buy) - e.g., Your Screenshot
+    if (trade.type === 'BUY') { 
+        // You bought to exit a Short position
+        const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High
+        const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low
 
-            if (minAfter < slPrice) {
-                analysis = "✅ <b>Good Exit:</b> Price continued to drop after your SL was hit. You saved money by exiting early.";
-                suggestion = "Strategy Correctness: 100%. The trend was indeed reversing.";
-                color = "#4ade80"; // Green
-            } else if (maxAfter > slPrice + 150) {
-                analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit your SL and immediately reversed back up.";
-                suggestion = "<b>Possible Fix:</b> Your SL might be too tight or placed exactly at a support level. Consider using 'ATR Trailing' instead of fixed points, or wait for a candle Close below level.";
-                color = "#fbbf24"; // Yellow
-            } else {
-                analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways after your exit.";
-                color = "#cbd5e1";
-            }
+        if (maxAfter > slPrice) {
+            analysis = "✅ <b>Good Exit:</b> Price continued to rise after your SL. You prevented a bigger loss.";
+            suggestion = "Strategy Correctness: 100%. The trend reversed against you.";
+            color = "#4ade80";
+        } else if (minAfter < slPrice - 150) {
+            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked up to hit your SL and immediately dropped back down.";
+            suggestion = "<b>Possible Fix:</b> Use ATR Trailing Stop to give the trade more room to breathe during volatility.";
+            color = "#fbbf24";
+        } else {
+            analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
+            color = "#cbd5e1";
         }
-        // LOGIC FOR SHORT POSITION (SL Triggered via Buy)
-        else if (trade.type === 'BUY') { // You Bought to Exit
-            const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High after exit
-            const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low after exit
+    }
+    // LOGIC FOR LONG POSITION (SL Triggered via Sell)
+    else if (trade.type === 'SELL') {
+        const minAfter = Math.min(...nextCandles.map(c => c[3]));
+        const maxAfter = Math.max(...nextCandles.map(c => c[2]));
 
-            if (maxAfter > slPrice) {
-                analysis = "✅ <b>Good Exit:</b> Price continued to rise after your SL. You prevented a bigger loss.";
-                suggestion = "Strategy Correctness: 100%.";
-                color = "#4ade80";
-            } else if (minAfter < slPrice - 150) {
-                analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked up to hit your SL and immediately dropped back down.";
-                suggestion = "<b>Possible Fix:</b> Avoid placing SL exactly at recent Highs. Add a buffer (0.1%).";
-                color = "#fbbf24";
-            } else {
-                analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
-                color = "#cbd5e1";
-            }
+        if (minAfter < slPrice) {
+            analysis = "✅ <b>Good Exit:</b> Price continued to drop. You saved capital.";
+            suggestion = "Strategy Correctness: 100%.";
+            color = "#4ade80";
+        } else if (maxAfter > slPrice + 150) {
+            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit SL and reversed up.";
+            suggestion = "<b>Possible Fix:</b> Avoid placing SL exactly at round numbers or support levels.";
+            color = "#fbbf24";
+        } else {
+            analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
+            color = "#cbd5e1";
         }
     }
 
@@ -1201,52 +1229,5 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
     `);
 });
 
-// --- 🚑 CUSTOM RESTORE: Inject Yesterday's Data (With Real IDs) ---
-app.get('/restore-yesterday', async (req, res) => {
-    // 1. Define the exact trades from your screenshot (Screenshot 317)
-    const tradesToRestore = [
-        { time: "12:21:04 AM", type: "SELL", price: 232820, pnl: 433,  id: "251226000142950" },
-        { time: "9:01:26 AM", type: "BUY",  price: 232387, pnl: 0,    id: "251226000002213" },
-        
-    ];
-
-    const targetDate = "2024-12-26"; // Yesterday
-    let count = 0;
-
-    // 2. Loop and Inject
-    tradesToRestore.reverse().forEach(t => { 
-        // Check if ID already exists to prevent duplicates
-        const exists = botState.history.find(h => h.id === t.id);
-        if (!exists) {
-            botState.history.unshift({
-                date: targetDate,
-                time: t.time,
-                type: t.type,
-                orderedPrice: t.price,
-                executedPrice: t.price, // Assuming executed = ordered for restoration
-                id: t.id,
-                status: "FILLED",
-                pnl: t.pnl !== 0 ? t.pnl : null
-            });
-            count++;
-        }
-    });
-
-    // 3. Recalculate Total PnL
-    botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
-    await saveState();
-
-    res.send(`
-        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
-            <div style="max-width:500px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
-                <h2 style="color:#4ade80;">✅ Restoration Complete!</h2>
-                <p>Succesfully injected <b>${count}</b> trades.</p>
-                <p>Assigned date: <b style="color:#fbbf24;">${targetDate}</b></p>
-                <br>
-                <a href="/reports" style="padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:5px;">📊 Check Reports Now</a>
-            </div>
-        </body>
-    `);
-});
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
