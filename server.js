@@ -1201,35 +1201,59 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
     `);
 });
 
-// --- 🛠️ BACKFILL TOOL: Fix Old Logs ---
-app.get('/assign-date', async (req, res) => {
-    const targetDate = req.query.date; // Format: YYYY-MM-DD
-    if (!targetDate) return res.send("Please provide a date! Example: /assign-date?date=2025-12-26");
+// --- 🚑 CUSTOM RESTORE: Inject Yesterday's Data (With Real IDs) ---
+app.get('/restore-yesterday', async (req, res) => {
+    // 1. Define the exact trades from your screenshot (Screenshot 317)
+    const tradesToRestore = [
+        { time: "9:33:03 PM", type: "SELL", price: 237140, pnl: 540,  id: "251226000282655" },
+        { time: "8:59:47 PM", type: "BUY",  price: 236600, pnl: 0,    id: "251226000282654" },
+        { time: "8:52:32 PM", type: "SELL", price: 234879, pnl: -8,   id: "251226000281805" },
+        { time: "8:38:46 PM", type: "BUY",  price: 234887, pnl: 0,    id: "251226000281804" },
+        { time: "8:00:15 PM", type: "SELL", price: 233404, pnl: -830, id: "251226000279942" },
+        { time: "7:47:16 PM", type: "BUY",  price: 234234, pnl: 0,    id: "251226000279941" },
+        { time: "5:03:02 PM", type: "BUY",  price: 231472, pnl: 585,  id: "251226000274227" },
+        { time: "4:55:56 PM", type: "SELL", price: 232057, pnl: 0,    id: "251226000274225" },
+        { time: "4:05:12 PM", type: "SELL", price: 235000, pnl: 1600, id: "251226000272243" },
+        { time: "2:20:56 PM", type: "BUY",  price: 233400, pnl: 0,    id: "251226000228328" }
+    ];
 
+    const targetDate = "2024-12-26"; // Yesterday
     let count = 0;
-    
-    // Loop through history and fix logs that don't have a date
-    botState.history.forEach(log => {
-        if (!log.date && !log.type.includes('SYSTEM')) {
-            log.date = targetDate; // ✅ Stamp it with the provided date
+
+    // 2. Loop and Inject
+    tradesToRestore.reverse().forEach(t => { 
+        // Check if ID already exists to prevent duplicates
+        const exists = botState.history.find(h => h.id === t.id);
+        if (!exists) {
+            botState.history.unshift({
+                date: targetDate,
+                time: t.time,
+                type: t.type,
+                orderedPrice: t.price,
+                executedPrice: t.price, // Assuming executed = ordered for restoration
+                id: t.id,
+                status: "FILLED",
+                pnl: t.pnl !== 0 ? t.pnl : null
+            });
             count++;
         }
     });
 
-    await saveState(); // Save changes to Redis
-    
+    // 3. Recalculate Total PnL
+    botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
+    await saveState();
+
     res.send(`
-        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
-            <div style="max-width:500px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; text-align:center;">
-                <h2 style="color:#4ade80;">✅ Success!</h2>
-                <p>Recovered <b>${count}</b> old logs.</p>
-                <p>Assigned them to date: <b style="color:#fbbf24;">${targetDate}</b></p>
+        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
+            <div style="max-width:500px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
+                <h2 style="color:#4ade80;">✅ Restoration Complete!</h2>
+                <p>Succesfully injected <b>${count}</b> trades.</p>
+                <p>Assigned date: <b style="color:#fbbf24;">${targetDate}</b></p>
                 <br>
                 <a href="/reports" style="padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:5px;">📊 Check Reports Now</a>
             </div>
         </body>
     `);
 });
-
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
