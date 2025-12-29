@@ -263,13 +263,14 @@ function generateLogHTML(logs) {
     return logs.map(t => {
         const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
         const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌]</a>` : '';
-        const analyzeBtn = (t.pnl < 0 && t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍</a>` : '';
+        
+        // ✅ CHANGED: Show Analyze button for ALL filled trades (Wins & Losses)
+        const analyzeBtn = (t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍</a>` : '';
         
         // Highlight Logic: Dark gradient for paired trades
         const isPaired = pairedIds.has(t.id);
         const bgStyle = isPaired ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' : 'border-bottom:1px solid #334155;';
 
-        // CSS GRID: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr (Strict Column Widths)
         return `<div style="display:grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
             <span style="color:#94a3b8;">${t.time}</span> 
             <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
@@ -1247,8 +1248,9 @@ app.get('/reports', (req, res) => {
     if (selectedDate && grouped[selectedDate]) {
         const dayLogs = grouped[selectedDate].trades;
         const dayRows = dayLogs.map(t => {
-            // Show Analyze button for losses
-            const analyzeBtn = (t.pnl < 0) ? `<a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` : '';
+            // ✅ CHANGED: Show Analyze button for ALL filled trades
+            const analyzeBtn = (t.status === 'FILLED') ? `<a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` : '';
+            
             return `<div style="padding:10px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; font-size:12px;">
                 <span>${t.time}</span>
                 <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b>
