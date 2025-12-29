@@ -14,10 +14,7 @@ if (serviceAccount && !admin.apps.length) {
 }
 const db = serviceAccount ? admin.firestore() : null;
 
-// --- ⚠️ REDIS (For Migration Only - You can remove this later) ---
-const Redis = require('ioredis');
-// Use the Hardcoded URL as a fallback so migration works!
-const redis = new Redis(process.env.REDIS_URL || "redis://red-d54pc4emcj7s73evgtbg:6379", { maxRetriesPerRequest: null });
+
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
