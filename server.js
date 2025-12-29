@@ -209,8 +209,15 @@ let lastSlUpdateTime = 0;
 
 let botState = { 
     positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0, 
-    history: [], slOrderId: null, isTradingEnabled: true, hiddenLogIds: [] 
+    history: [], slOrderId: null, isTradingEnabled: true, hiddenLogIds: [],
+    
+    // ✅ NEW: Tracks the highest profit seen during the CURRENT active trade
+    maxRunUp: 0, 
+
+    // ✅ NEW: Stores temporary data for trades currently being monitored (for 10 mins)
+    activeMonitors: {} 
 };
+
 
 // ✅ HELPER: Pair Detection (Finds matching Buy+Sell to highlight them)
 function getPairedLogs(logs) {
@@ -386,6 +393,7 @@ async function modifyExchangeSL(newTrigger) {
     }
 }
 // --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
+// --- 🔌 WEBSOCKET (Live Recording & Reflex Logic) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -415,84 +423,92 @@ async function initWebSocket() {
 
                         if (newPrice > 0 && (key.includes("458305") || Object.keys(object.feeds).length === 1)) {
                             lastKnownLtp = newPrice;
-                            
-                            // --- ⚡ INSTANT LOGIC START ---
-                            if (botState.positionType && botState.positionType !== 'NONE') {
+
+                            // ------------------------------------------------------
+                            // 1️⃣ LIVE TRADE TRACKING (Track Max Profit)
+                            // ------------------------------------------------------
+                            if (botState.positionType) {
+                                let currentProfit = 0;
+                                if (botState.positionType === 'LONG') currentProfit = newPrice - botState.entryPrice;
+                                if (botState.positionType === 'SHORT') currentProfit = botState.entryPrice - newPrice;
+                                
+                                // Update Max Run Up (Highest profit seen)
+                                if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
+
+                                // --- TRAILING SL LOGIC (Preserved from your request) ---
                                 let newStop = botState.currentStop;
                                 let didChange = false;
-                                let forceUpdate = false; // ✅ NEW: Bypass throttle for urgent moves
-                                const now = Date.now();
-                                
-                                // ✅ 1. DYNAMIC GAP CALCULATION
                                 let trailingGap = globalATR * 1.5; 
-                                let profit = 0;
 
-                                if (botState.positionType === 'LONG') {
-                                    profit = newPrice - botState.entryPrice;
-                                    
-                                    // Rule: If Profit > 1000, Gap = 500
-                                    if (profit >= 1000) trailingGap = 500;
+                                // Rule: If Profit > 1000, Tighten Gap
+                                if (currentProfit >= 1000) trailingGap = 500;
 
-                                    // Rule: Move to Cost if Profit > 600
-                                    if (profit >= 600 && botState.currentStop < botState.entryPrice) {
-                                        console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
-                                        newStop = botState.entryPrice;
-                                        didChange = true;
-                                        forceUpdate = true; // ✅ Urgent!
-                                    }
-
-                                    // Standard Trailing (Only move UP)
-                                    const trailingLevel = newPrice - trailingGap;
-                                    // Ensure we don't move stop DOWN (unless it's the initial move-to-cost)
-                                    if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { 
-                                        newStop = trailingLevel; 
-                                        didChange = true; 
-                                    }
-                                } 
-                                else if (botState.positionType === 'SHORT') {
-                                    profit = botState.entryPrice - newPrice;
-
-                                    // Rule: If Profit > 1000, Gap = 500
-                                    if (profit >= 1000) trailingGap = 500;
-
-                                    // Rule: Move to Cost if Profit > 600
-                                    if (profit >= 600 && botState.currentStop > botState.entryPrice) {
-                                        console.log(`🚀 Profit > 600! Moving SL to Cost: ${botState.entryPrice}`);
-                                        newStop = botState.entryPrice;
-                                        didChange = true;
-                                        forceUpdate = true; // ✅ Urgent!
-                                    }
-
-                                    // Standard Trailing (Only move DOWN)
-                                    const trailingLevel = newPrice + trailingGap;
-                                    // Ensure we don't move stop UP
-                                    if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { 
-                                        newStop = trailingLevel; 
-                                        didChange = true; 
-                                    }
+                                // Rule: Move to Cost if Profit > 600
+                                if (currentProfit >= 600) {
+                                    const costSL = botState.entryPrice;
+                                    // Only move if we haven't already secured cost or better
+                                    const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
+                                    if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
                                 }
 
-                                // 3. EXECUTE UPDATE (Throttle 5s OR Urgent)
+                                // Standard Trailing
+                                if (botState.positionType === 'LONG') {
+                                    const trailingLevel = newPrice - trailingGap;
+                                    if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
+                                } else {
+                                    const trailingLevel = newPrice + trailingGap;
+                                    if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
+                                }
+
                                 if (didChange) {
-                                    const oldStop = botState.currentStop;
                                     botState.currentStop = newStop;
                                     pushToDashboard(); 
-
-                                    // ✅ FIX: Allow urgent moves (like Move-to-Cost) to ignore throttle
-                                    if (now - lastSlUpdateTime > 5000 || forceUpdate) {
-                                        console.log(`🔄 Trailing SL Updated: ${oldStop.toFixed(0)} ➡️ ${newStop.toFixed(0)}`);
-                                        modifyExchangeSL(newStop);
-                                        lastSlUpdateTime = now;
-                                    }
+                                    modifyExchangeSL(newStop);
                                 }
                                 
-                                // 4. EXIT DETECTION (Safety Check)
+                                // Exit Check
                                 if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
                                     (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
-                                     // Verify immediately if price crossed SL
                                      verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                 }
                             }
+
+                            // ------------------------------------------------------
+                            // 2️⃣ POST-TRADE MONITORING (The "Camera" Logic)
+                            // ------------------------------------------------------
+                            const now = Date.now();
+                            for (const oid in botState.activeMonitors) {
+                                const session = botState.activeMonitors[oid];
+                                
+                                // Record snapshot every 5 seconds (to save memory)
+                                if (now - session.lastRecordTime > 5000) {
+                                    session.data.push({ t: getIST().toLocaleTimeString(), p: newPrice });
+                                    session.lastRecordTime = now;
+                                    
+                                    // Update Min/Max seen AFTER exit
+                                    if (newPrice > session.highestAfterExit) session.highestAfterExit = newPrice;
+                                    if (newPrice < session.lowestAfterExit) session.lowestAfterExit = newPrice;
+                                }
+
+                                // STOP after 10 Minutes (600,000 ms)
+                                if (now - session.startTime > 600000) {
+                                    console.log(`✅ Finished Analyzing Trade ${oid}. Saving Report.`);
+                                    
+                                    // Save analysis to the history log
+                                    const logIndex = botState.history.findIndex(h => h.id === oid);
+                                    if (logIndex !== -1) {
+                                        botState.history[logIndex].analysisData = {
+                                            maxRunUp: session.maxRunUp, // How good was the trade before SL?
+                                            data: session.data,         // 10 min price array
+                                            highAfter: session.highestAfterExit,
+                                            lowAfter: session.lowestAfterExit
+                                        };
+                                        saveState();
+                                    }
+                                    delete botState.activeMonitors[oid]; // Stop monitoring
+                                }
+                            }
+                            
                             pushToDashboard(); 
                         }
                     }
@@ -500,9 +516,9 @@ async function initWebSocket() {
             } catch (e) { console.error("❌ Decode Logic Error:", e.message); }
         };
         currentWs.onclose = () => { currentWs = null; };
-        currentWs.onerror = (err) => { console.error("❌ WS Error:", err.message); currentWs = null; };
     } catch (e) { currentWs = null; }
 }
+
 
 
 // --- 🤖 AUTO-LOGIN SYSTEM ---
@@ -601,12 +617,11 @@ async function fetchLatestOrderId() {
 }
 
 // --- VERIFY ORDER (Retry Loop & Real Cost Update) ---
+// --- VERIFY ORDER (Starts Recording on Exit) ---
 async function verifyOrderStatus(orderId, context) {
-    // ✅ RESTORED: Auto-fetch ID if missing (Safety Net)
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
     
-    // ✅ INCREASED RETRY: 10 attempts (20 seconds) to catch the execution price
     let attempts = 0;
     const maxAttempts = (context === 'ENTRY') ? 10 : 2; 
 
@@ -618,42 +633,45 @@ async function verifyOrderStatus(orderId, context) {
             const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
             const order = res.data.data.find(o => o.order_id === orderId);
             if (!order) break; 
-
-            console.log(`🔎 Verifying Order ${orderId}: ${order.status} (Attempt ${attempts})`);
             
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
                 
-                console.log(`✅ Order ${orderId} executed at ${realPrice}`);
-
                 if (context === 'EXIT_CHECK') {
-                    // PnL Calculation
                     let tradePnL = 0;
                     if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
                     if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
 
-                    // ✅ ADDED TAG: API_BOT
+                    // ✅ START 10-MINUTE RECORDING SESSION
+                    botState.activeMonitors[orderId] = {
+                        startTime: Date.now(),
+                        lastRecordTime: 0,
+                        type: botState.positionType, // 'LONG' or 'SHORT'
+                        exitPrice: realPrice,
+                        entryPrice: botState.entryPrice,
+                        maxRunUp: botState.maxRunUp, // Pass the max profit we saw
+                        highestAfterExit: realPrice,
+                        lowestAfterExit: realPrice,
+                        data: [] // Array to store prices
+                    };
+                    console.log(`🎥 Starting 10-min analysis for Order ${orderId}`);
+
                     botState.history.unshift({ 
-                        date: formatDate(getIST()), 
-                        time: execTime, 
-                        type: order.transaction_type, 
-                        orderedPrice: order.price, 
-                        executedPrice: realPrice, 
-                        id: orderId, 
-                        status: "FILLED", 
-                        pnl: tradePnL,
-                        tag: "API_BOT" 
+                        date: formatDate(getIST()), time: execTime, type: order.transaction_type, 
+                        orderedPrice: order.price, executedPrice: realPrice, id: orderId, 
+                        status: "FILLED", pnl: tradePnL, tag: "API_BOT" 
                     });
-                    botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
+
+                    // Reset State
+                    botState.positionType = null; botState.slOrderId = null; botState.currentStop = null; botState.maxRunUp = 0;
                 } 
                 else {
-                    // Entry Logic
-                    console.log(`📝 Cost corrected: ${botState.entryPrice} -> ${realPrice}`);
                     botState.entryPrice = realPrice; 
+                    botState.maxRunUp = 0; // Reset profit tracker on new entry
                 }
 
-                // Update Dashboard Log
+                // Update Dashboard Log if existing
                 const logIndex = botState.history.findIndex(h => h.id === orderId || (h.status === 'SENT' && h.type === order.transaction_type));
                 if (logIndex !== -1) {
                     botState.history[logIndex].executedPrice = realPrice;
@@ -664,13 +682,11 @@ async function verifyOrderStatus(orderId, context) {
 
                 await saveState();
                 pushToDashboard();
-                return; // Stop checking once filled
+                return;
 
             } else if (['rejected', 'cancelled'].includes(order.status)) {
                 if (context === 'EXIT_CHECK') botState.slOrderId = null;
-                else if (context !== 'MANUAL_SYNC') {
-                    botState.positionType = null; botState.entryPrice = 0;
-                }
+                else if (context !== 'MANUAL_SYNC') { botState.positionType = null; botState.entryPrice = 0; }
                 const log = botState.history.find(h => h.id === orderId);
                 if (log) log.status = order.status.toUpperCase();
                 await saveState();
@@ -1209,107 +1225,113 @@ app.get('/reports', (req, res) => {
     `);
 });
 
-// --- 🔍 SL ANALYSIS ROUTE ---
-// --- 🔍 SL ANALYSIS ROUTE (Fixed for 12-Hour Times) ---
-// --- 🔍 SL ANALYSIS ROUTE (Fuzzy Match Fix) ---
+// --- 🔍 SMART ANALYSIS ROUTE (Live & Recorded Data) ---
 app.get('/analyze-sl/:orderId', async (req, res) => {
     const orderId = req.params.orderId;
     const trade = botState.history.find(h => h.id === orderId);
     if (!trade) return res.send("Trade not found.");
 
-    const candles = await getMergedCandles();
-    if (candles.length === 0) return res.send("Insufficient market data.");
+    // Check if monitoring is still active
+    const activeSession = botState.activeMonitors[orderId];
+    // Check if monitoring finished and saved
+    const savedData = trade.analysisData;
 
-    let tradeTime;
-    try {
-        // Parse time carefully
-        const [timePart, modifier] = trade.time.split(' ');
-        let [hours, minutes] = timePart.split(':');
-        if (hours === '12') hours = '00';
-        if (modifier === 'PM') hours = parseInt(hours, 10) + 12;
-        tradeTime = new Date(`${trade.date}T${hours}:${minutes}:00`);
-    } catch (e) { return res.send("Error parsing trade time."); }
-
-    const slPrice = parseFloat(trade.executedPrice);
-    
-    // ✅ FUZZY SEARCH: Find candle closest to trade time (within 10 mins)
-    // We search through ALL candles to find the one with the smallest time difference
-    let bestCandle = null;
-    let minDiff = 10 * 60 * 1000; // 10 minutes max diff
-    let exitIndex = -1;
-
-    candles.forEach((c, index) => {
-        const cTime = new Date(c[0]);
-        const diff = Math.abs(cTime - tradeTime);
-        if (diff < minDiff) {
-            minDiff = diff;
-            bestCandle = c;
-            exitIndex = index;
-        }
-    });
-
-    if (exitIndex === -1 || exitIndex >= candles.length - 1) {
-         return res.send(`
-            <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
-                <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
-                    <h2 style="color:#fbbf24;">⏳ Data Syncing...</h2>
-                    <p>The chart data for <b>${trade.time}</b> isn't fully ready yet.</p>
-                    <p>Please wait 5-10 minutes for the candle to close and try again.</p>
-                    <a href="/" style="color:#94a3b8;">Back</a>
-                </div>
+    // 1. IF STILL RECORDING
+    if (activeSession) {
+        const elapsedMin = ((Date.now() - activeSession.startTime) / 60000).toFixed(1);
+        return res.send(`
+            <body style="background:#0f172a; color:white; font-family:sans-serif; text-align:center; padding:50px;">
+                <h1 style="color:#fbbf24;">🎥 Analyzing Trade...</h1>
+                <p>The bot is currently recording live price action to find your mistake.</p>
+                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes Recorded</div>
+                <p>Refresh this page in a few minutes.</p>
+                <script>setTimeout(() => window.location.reload(), 10000);</script>
             </body>
         `);
     }
 
-    // (Rest of Analysis Logic - Same as before)
-    const nextCandles = candles.slice(exitIndex + 1, exitIndex + 4);
-    const highestHigh = Math.max(...nextCandles.map(c => c[2])); 
-    const lowestLow = Math.min(...nextCandles.map(c => c[3])); 
-    const finalClose = nextCandles[nextCandles.length-1][4]; 
+    // 2. IF NO DATA (Old Trade or Error)
+    if (!savedData) return res.send("No advanced analysis data available for this trade (Feature was added recently).");
 
-    let analysis = ""; let suggestion = ""; let color = ""; const buffer = 50; 
+    // 3. GENERATE REPORT (The "Opinion" Logic)
+    const { maxRunUp, highAfter, lowAfter, data } = savedData;
+    const exitPrice = parseFloat(trade.executedPrice);
+    const isWin = trade.pnl >= 0;
+    
+    let opinion = "";
+    let color = "#cbd5e1"; // Default Grey
 
-    if (trade.type === 'SELL') { 
-        if (highestHigh > slPrice + buffer) {
-            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit SL, then reversed UP.";
-            suggestion = "Consider using a wider 'ATR Stop' or waiting for candle close.";
-            color = "#fbbf24"; 
-        } else if (lowestLow < slPrice - buffer && finalClose < slPrice) {
-            analysis = "✅ <b>Good Exit:</b> Price continued to drop. You saved capital.";
-            suggestion = "Strategy Correctness: 100%.";
-            color = "#4ade80"; 
-        } else {
-            analysis = "⚖️ <b>Choppy / Neutral:</b> Price hovered around your SL.";
-            color = "#cbd5e1"; 
-        }
+    // --- RULES ENGINE ---
+    
+    // Rule 1: Did we miss "Move to Cost"?
+    if (!isWin && maxRunUp >= 600) {
+        opinion = "❌ <b>RULE VIOLATION:</b> You saw ₹" + maxRunUp.toFixed(0) + " profit but ended in loss.<br>Rule: <i>'If Profit > 600, Move SL to Cost.'</i>";
+        color = "#ef4444"; // Red
     }
-    else if (trade.type === 'BUY') {
-        if (lowestLow < slPrice - buffer) {
-            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked to hit SL, then dropped DOWN.";
-            suggestion = "Consider adding a small buffer (0.1%) to your SL.";
-            color = "#fbbf24"; 
-        } else if (highestHigh > slPrice + buffer && finalClose > slPrice) {
-            analysis = "✅ <b>Good Exit:</b> Price continued to rise. You saved capital.";
-            suggestion = "Strategy Correctness: 100%.";
-            color = "#4ade80"; 
+    // Rule 2: Was it a Stop Hunt? (Price reversed immediately after hitting SL)
+    else if (!isWin) {
+        const tradeType = trade.type === 'BUY' ? 'SELL' : 'BUY'; // Trade was Long, Exit was SELL
+        let isStopHunt = false;
+        
+        // If Long Trade (Exit SELL): Did price go UP after exit?
+        if (tradeType === 'SELL' && highAfter > exitPrice + 200) isStopHunt = true;
+        // If Short Trade (Exit BUY): Did price go DOWN after exit?
+        if (tradeType === 'BUY' && lowAfter < exitPrice - 200) isStopHunt = true;
+
+        if (isStopHunt) {
+            opinion = "⚠️ <b>BAD LUCK / STOP HUNT:</b> Price reversed in your favor shortly after hitting SL.<br>Suggestion: Consider a slightly wider SL or re-entry.";
+            color = "#fbbf24"; // Yellow
         } else {
-            analysis = "⚖️ <b>Choppy / Neutral:</b> Price hovered around your SL.";
-            color = "#cbd5e1"; 
+            opinion = "✅ <b>GOOD EXIT:</b> Price continued against you after SL. You saved capital.";
+            color = "#4ade80"; // Green
         }
+    } else {
+        opinion = "🎉 <b>PROFITABLE TRADE:</b> Strategy worked.";
+        color = "#4ade80";
     }
+
+    // Extract Snapshots (1min, 3min, 5min, 10min)
+    // Data is recorded every 5s. Index 12 = 1min, 36 = 3min, etc.
+    const snap1 = data[11] || data[data.length-1];
+    const snap3 = data[35] || data[data.length-1];
+    const snap5 = data[59] || data[data.length-1];
+    const snap10 = data[data.length-1];
 
     res.send(`
-        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
-            <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
-                <h2 style="color:#38bdf8;">🔍 Trade Analysis</h2>
-                <p><b>Exit Price:</b> ₹${slPrice}</p>
-                <div style="background:${color}20; border:1px solid ${color}; padding:20px; border-radius:10px; margin-top:20px;">
-                    <p style="font-size:18px; color:${color}; margin:0;">${analysis}</p>
-                    <hr style="border-color:#334155; margin:15px 0;">
-                    <p style="color:#cbd5e1; font-size:14px;">${suggestion}</p>
+        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:30px; display:flex; justify-content:center;">
+            <div style="max-width:600px; width:100%; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #334155;">
+                <h2 style="color:#38bdf8; margin-top:0;">📊 Post-Trade Analysis</h2>
+                
+                <div style="background:${color}20; border-left:5px solid ${color}; padding:15px; border-radius:5px; margin-bottom:20px;">
+                    <strong style="color:${color}; font-size:18px;">${opinion}</strong>
+                </div>
+
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:20px;">
+                    <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                        <small style="color:#94a3b8;">MAX PROFIT SEEN</small><br>
+                        <b style="color:#4ade80;">₹${maxRunUp.toFixed(0)}</b>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                        <small style="color:#94a3b8;">EXIT PNL</small><br>
+                        <b style="color:${trade.pnl>=0?'#4ade80':'#ef4444'}">₹${trade.pnl.toFixed(0)}</b>
+                    </div>
+                </div>
+
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; padding-bottom:5px;">Post-Exit Price Action (10 Mins)</h4>
+                <table style="width:100%; border-collapse:collapse; font-size:13px;">
+                    <tr style="color:#64748b; text-align:left;"><th>Time</th><th>Price</th><th>Movement</th></tr>
+                    <tr><td>+1 Min</td><td>₹${snap1?.p || '-'}</td><td>${(snap1?.p - exitPrice).toFixed(0)}</td></tr>
+                    <tr><td>+3 Min</td><td>₹${snap3?.p || '-'}</td><td>${(snap3?.p - exitPrice).toFixed(0)}</td></tr>
+                    <tr><td>+5 Min</td><td>₹${snap5?.p || '-'}</td><td>${(snap5?.p - exitPrice).toFixed(0)}</td></tr>
+                    <tr><td>+10 Min</td><td>₹${snap10?.p || '-'}</td><td>${(snap10?.p - exitPrice).toFixed(0)}</td></tr>
+                </table>
+                <br>
+                <div style="font-size:12px; color:#64748b;">
+                    Lowest after exit: ₹${lowAfter} <br>
+                    Highest after exit: ₹${highAfter}
                 </div>
                 <br>
-                <a href="/" style="color:#94a3b8;">Back to Dashboard</a>
+                <a href="/" style="display:block; text-align:center; padding:10px; background:#334155; color:white; text-decoration:none; border-radius:5px;">Back to Dashboard</a>
             </div>
         </body>
     `);
