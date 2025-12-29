@@ -268,12 +268,24 @@ function generateLogHTML(logs) {
     }).join('');
 }
 // --- STATE MANAGEMENT ---
+// --- STATE MANAGEMENT ---
 async function loadState() {
     try {
         const saved = await redis.get('silver_bot_state');
-        if (saved) botState = JSON.parse(saved);
-        console.log("📂 System State Loaded.");
-    } catch (e) { console.log("Redis sync issue (first run?)"); }
+        if (saved) {
+            const loadedData = JSON.parse(saved);
+            botState = loadedData;
+            
+            // ✅ FIX: Ensure new fields exist even if loading old data
+            if (!botState.activeMonitors) botState.activeMonitors = {}; 
+            if (!botState.hiddenLogIds) botState.hiddenLogIds = [];
+            if (typeof botState.maxRunUp === 'undefined') botState.maxRunUp = 0;
+            
+            console.log("📂 System State Loaded & Patched.");
+        } else {
+            console.log("📂 No saved state found. Starting fresh.");
+        }
+    } catch (e) { console.log("Redis sync issue (first run?):", e.message); }
 }
 loadState();
 
