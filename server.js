@@ -501,7 +501,7 @@ async function initWebSocket() {
             currentWs.send(binaryMsg);
         };
 
-        currentWs.onmessage = (msg) => {
+        currentWs.onmessage = async (msg) => {
             try {
                 if (!FeedResponse) return;
                 const buffer = new Uint8Array(msg.data);
