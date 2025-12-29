@@ -893,6 +893,25 @@ app.get('/live-updates', (req, res) => {
 
 app.get('/toggle-trading', async (req, res) => {
     botState.isTradingEnabled = !botState.isTradingEnabled;
+    
+    // ✅ NEW: Add a visible System Log entry
+    const action = botState.isTradingEnabled ? "RESUMED" : "PAUSED";
+    const colorLog = botState.isTradingEnabled ? "ACTIVE" : "STOPPED";
+    
+    botState.history.unshift({
+        date: formatDate(getIST()),
+        time: getIST().toLocaleTimeString(),
+        type: "SYSTEM",        // Shows up as gray text
+        orderedPrice: 0,
+        executedPrice: 0,
+        id: "CMD-" + Date.now().toString().slice(-6),
+        status: action,        // Will show "PAUSED" or "RESUMED"
+        pnl: 0,
+        tag: "MANUAL"
+    });
+
+    console.log(`🔘 Trading Manually ${action} by User.`);
+    
     await saveState();
     pushToDashboard();
     res.redirect('/');
