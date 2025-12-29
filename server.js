@@ -299,25 +299,24 @@ function calculateLivePnL() {
 }
 
 // ✅ UPDATED DASHBOARD PUSHER (Sends Logs too)
+// ✅ UPDATED DASHBOARD PUSHER (Now sends Position Status)
 function pushToDashboard() {
     const hasPosition = botState.positionType && botState.positionType !== 'NONE';
     const pnlData = calculateLivePnL();
     
     const todayStr = formatDate(getIST());
-    // Filter Today's Logs (Removing System & Cancelled)
     const todayLogs = botState.history.filter(t => t.date === todayStr && !t.type.includes('SYSTEM') && t.status !== 'CANCELLED');
-    
-    // Generate HTML using the Helper (Ensures Consistency)
     const displayLogs = generateLogHTML(todayLogs);
 
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: pnlData.live,
-        historicalPnl: pnlData.history, // Sent but not shown in main card anymore
+        historicalPnl: pnlData.history,
         stop: hasPosition ? botState.currentStop : 0,
         slID: hasPosition ? botState.slOrderId : null,
         status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE",
-        isTrading: botState.isTradingEnabled, 
+        isTrading: botState.isTradingEnabled,
+        position: botState.positionType || 'NONE', // ✅ FIXED: Now sending Position Type
         logsHTML: displayLogs 
     });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
@@ -779,33 +778,31 @@ setInterval(() => {
     }
 }, 60000);
 // TRADING LOOP (Runs every 30s)
-// --- TRADING ENGINE (Prevents Double Orders) ---
-// --- TRADING ENGINE (Strict WebSocket Only) ---
-// --- TRADING ENGINE (Watcher & Entry) ---
-// --- TRADING ENGINE (Watcher & Entry) ---
 // --- TRADING ENGINE (Watcher & Entry) ---
 setInterval(async () => {
+    // 1. Safety Checks
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
   
-    // 1. WebSocket Watchdog
+    // 2. WebSocket Watchdog
     if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
         initWebSocket();
         return; 
     }
 
     try {
+        // 3. Get Data
         const candles = await getMergedCandles();
         if (candles.length > 200) {
-            // Extract Data Arrays
+            // Extract Data
             const cl = candles.map(c => c[4]);
             const h = candles.map(c => c[2]);
             const l = candles.map(c => c[3]);
             const v = candles.map(c => c[5]);
 
-            // Calculate Indicators (Exactly as per server 5)
+            // Calculate Indicators
             const e50 = EMA.calculate({period: 50, values: cl});
-            const e200 = EMA.calculate({period: 200, values: cl}); // ✅ PRESERVED E200
+            const e200 = EMA.calculate({period: 200, values: cl});
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
@@ -816,35 +813,57 @@ setInterval(async () => {
             const curAvgV = vAvg[vAvg.length-1];
             const curA = atr[atr.length-1];
             
-            // Calculate Breakout Levels (Last 10 candles excluding current)
+            // Calculate Breakout Levels
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
 
-            // ✅ UPDATE GLOBAL ATR (For WebSocket to use)
+            // Update Global ATR for Trailing SL
             globalATR = curA; 
 
-            // ✅ PRESERVED LOG FORMAT
+            // 4. Regular Log (Clean, looks exactly like before)
             console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
 
-            // ✅ NEW: Added "botState.isTradingEnabled" check here
-            if (isMarketOpen() && !botState.positionType && botState.isTradingEnabled) {
+            // 5. TRADING LOGIC
+            // ✅ We check for signals FIRST, ignoring the 'Pause' switch for now
+            if (isMarketOpen() && !botState.positionType) {
                  
-                 // --- ENTRY LOGIC (Exact Copy from Server 5) ---
-                 if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
-                    // LONG ENTRY
-                    await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                 // Define the Buy/Sell Conditions
+                 const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
+                 const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
+
+                 // Act on Signals
+                 if (isBuySignal) {
+                     // NOW we check the switch
+                     if (botState.isTradingEnabled) {
+                         // Switch ON: Execute Order
+                         botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
+                         botState.currentStop = lastKnownLtp - (curA * 1.5); 
+                         await saveState(); 
+                         await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                     } else {
+                         // Switch OFF: Log Warning only
+                         console.log(`⚠️ FOUND BUY SIGNAL @ ${lastKnownLtp} -> SKIPPED (Trading Paused in Dashboard)`);
+                     }
                 } 
-                else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
-                    // SHORT ENTRY
-                    await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                else if (isSellSignal) {
+                    if (botState.isTradingEnabled) {
+                        // Switch ON: Execute Order
+                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
+                        botState.currentStop = lastKnownLtp + (curA * 1.5); 
+                        await saveState(); 
+                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    } else {
+                         // Switch OFF: Log Warning only
+                         console.log(`⚠️ FOUND SELL SIGNAL @ ${lastKnownLtp} -> SKIPPED (Trading Paused in Dashboard)`);
+                    }
                 }
             } 
         }
     } catch (e) { 
+        // Auto-login trigger if token expires
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 30000);
-
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -879,6 +898,7 @@ app.get('/delete-log/:id', async (req, res) => {
     res.redirect('/');
 });
 
+// --- 🏠 DASHBOARD ROUTE (Fixed Position Live Update) ---
 app.get('/', (req, res) => {
     // 1. Calculate PnL
     const todayStr = formatDate(getIST()); 
@@ -886,7 +906,7 @@ app.get('/', (req, res) => {
     const todayPnL = todayLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
     const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-    // 2. Prepare Logs using the Shared Helper (Ensures layout never breaks on refresh)
+    // 2. Prepare Logs
     const cleanLogs = todayLogs.filter(t => !t.type.includes('SYSTEM') && t.status !== 'CANCELLED' && t.status !== 'REJECTED');
     const displayLogs = generateLogHTML(cleanLogs);
 
@@ -901,22 +921,25 @@ app.get('/', (req, res) => {
                     document.getElementById('live-price').innerText = '₹' + d.price;
                     document.getElementById('live-pnl').innerText = '₹' + d.pnl;
                     document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
-                    
-                    // ✅ UPDATE BUTTON TEXT (Matches the new location)
                     document.getElementById('hist-btn-pnl').innerText = 'Total: ₹' + d.historicalPnl;
                     
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
+                    
                     const stat = document.getElementById('live-status');
                     stat.innerText = d.status;
                     stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
+
+                    // ✅ FIXED: Update Position Text Live
+                    const pos = document.getElementById('pos-type');
+                    pos.innerText = d.position;
+                    pos.style.color = d.position === 'NONE' ? '#facc15' : (d.position === 'LONG' ? '#4ade80' : '#f87171');
 
                     const btn = document.getElementById('toggle-btn');
                     btn.innerText = d.isTrading ? "🟢 TRADING ON" : "🔴 PAUSED";
                     btn.style.background = d.isTrading ? "#22c55e" : "#ef4444";
 
-                    // ✅ UPDATE LOGS (This uses the same generateLogHTML logic from server)
                     if(d.logsHTML) document.getElementById('logContent').innerHTML = d.logsHTML;
                 };
             </script>
@@ -946,7 +969,10 @@ app.get('/', (req, res) => {
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">POSITION</small><br>
+                        <b id="pos-type" style="color:#facc15;">${botState.positionType || 'NONE'}</b>
+                    </div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b></div>
                 </div>
                 
