@@ -214,9 +214,9 @@ let botState = {
     totalPnL: 0, 
     quantity: 0, 
     history: [],
-    slOrderId: null 
+    slOrderId: null,
+    isTradingEnabled: true // ✅ NEW: Toggle State
 };
-
 
 // --- STATE MANAGEMENT ---
 async function loadState() {
@@ -256,17 +256,38 @@ function calculateLivePnL() {
     return { live: uPnL.toFixed(2), history: historyPnL.toFixed(2) };
 }
 
+// ✅ UPDATED DASHBOARD PUSHER (Sends Logs too)
 function pushToDashboard() {
     const hasPosition = botState.positionType && botState.positionType !== 'NONE';
-    const pnlData = calculateLivePnL(); // Get both Live and History
+    const pnlData = calculateLivePnL();
+    
+    // Generate Log HTML on Server side for real-time updates
+    const todayStr = formatDate(getIST());
+    const displayLogs = botState.history
+        .filter(t => t.date === todayStr && !t.type.includes('SYSTEM')) // Show ALL Today
+        .map(t => {
+            const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
+            const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌ REMOVE]</a>` : '';
+            const analyzeBtn = (t.pnl < 0 && t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
+            
+            return `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
+                <span style="flex:1; color:#94a3b8;">${t.time}</span> 
+                <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
+                <span style="flex:1; text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span> 
+                <span style="flex:1; text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
+                <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
+            </div>`;
+        }).join('');
 
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: pnlData.live,
-        historicalPnl: pnlData.history, // ✅ Now dynamic
+        historicalPnl: pnlData.history,
         stop: hasPosition ? botState.currentStop : 0,
         slID: hasPosition ? botState.slOrderId : null,
-        status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE"
+        status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE",
+        isTrading: botState.isTradingEnabled, // ✅ Send Toggle Status
+        logsHTML: displayLogs // ✅ Send Updated Logs
     });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
 }
@@ -551,12 +572,13 @@ async function fetchLatestOrderId() {
 
 // --- VERIFY ORDER (Retry Loop & Real Cost Update) ---
 async function verifyOrderStatus(orderId, context) {
+    // ✅ RESTORED: Auto-fetch ID if missing (Safety Net)
     if (!orderId) orderId = await fetchLatestOrderId();
     if (!orderId) return;
     
-    // ✅ RETRY LOOP: Check 5 times (spaced 2s apart) to catch the fill
+    // ✅ INCREASED RETRY: 10 attempts (20 seconds) to catch the execution price
     let attempts = 0;
-    const maxAttempts = (context === 'ENTRY') ? 5 : 1; 
+    const maxAttempts = (context === 'ENTRY') ? 10 : 2; 
 
     while (attempts < maxAttempts) {
         attempts++;
@@ -565,7 +587,7 @@ async function verifyOrderStatus(orderId, context) {
         try {
             const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
             const order = res.data.data.find(o => o.order_id === orderId);
-            if (!order) break; // Should not happen
+            if (!order) break; 
 
             console.log(`🔎 Verifying Order ${orderId}: ${order.status} (Attempt ${attempts})`);
             
@@ -573,30 +595,30 @@ async function verifyOrderStatus(orderId, context) {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
                 
-                // ✅ YOUR REQUESTED LOG
                 console.log(`✅ Order ${orderId} executed at ${realPrice}`);
 
-                // Update State based on Context
                 if (context === 'EXIT_CHECK') {
-                    // (Exit Logic remains same...)
+                    // PnL Calculation
                     let tradePnL = 0;
                     if (botState.positionType === 'LONG') tradePnL = (realPrice - botState.entryPrice) * botState.quantity;
                     if (botState.positionType === 'SHORT') tradePnL = (botState.entryPrice - realPrice) * botState.quantity;
 
+                    // ✅ ADDED TAG: API_BOT
                     botState.history.unshift({ 
-                        date: formatDate(getIST()), // 🆕 NEW FIELD
+                        date: formatDate(getIST()), 
                         time: execTime, 
                         type: order.transaction_type, 
                         orderedPrice: order.price, 
                         executedPrice: realPrice, 
                         id: orderId, 
                         status: "FILLED", 
-                        pnl: tradePnL 
+                        pnl: tradePnL,
+                        tag: "API_BOT" 
                     });
                     botState.positionType = null; botState.slOrderId = null; botState.currentStop = null;
                 } 
                 else {
-                    // ✅ ENTRY LOGIC: Correct the Cost Basis
+                    // Entry Logic
                     console.log(`📝 Cost corrected: ${botState.entryPrice} -> ${realPrice}`);
                     botState.entryPrice = realPrice; 
                 }
@@ -615,7 +637,6 @@ async function verifyOrderStatus(orderId, context) {
                 return; // Stop checking once filled
 
             } else if (['rejected', 'cancelled'].includes(order.status)) {
-                // Handle Failures
                 if (context === 'EXIT_CHECK') botState.slOrderId = null;
                 else if (context !== 'MANUAL_SYNC') {
                     botState.positionType = null; botState.entryPrice = 0;
@@ -634,46 +655,48 @@ async function verifyOrderStatus(orderId, context) {
 // --- PLACE ORDER (Saves Initial State Correctly) ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
-    const isAmo = !isMarketOpen();
-    // Buffer for Limit Order (0.3%)
-    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); 
     
-    // 1. Calculate Initial Fixed Stop (800 points)
+    // ✅ NEW: CHECK TRADING SWITCH
+    if (!botState.isTradingEnabled) { console.log("⏸️ Trading Paused by User."); return false; }
+
+    // ✅ RESTORED: AMO Logic
+    const isAmo = !isMarketOpen();
+    
+    const limitPrice = Math.round(type === "BUY" ? (ltp * 1.003) : (ltp * 0.997)); 
     const slPrice = type === "BUY" ? (ltp - 800) : (ltp + 800);
 
     try {
         console.log(`🚀 Sending ${type}: ${qty} Lot @ ₹${limitPrice}`);
         const res = await axios.post("https://api.upstox.com/v3/order/place", {
             quantity: qty, product: "I", validity: "DAY", price: limitPrice, instrument_token: INSTRUMENT_KEY,
-            order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, is_amo: isAmo
+            order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, 
+            is_amo: isAmo, // ✅ USES CALCULATED AMO VARIABLE
+            tag: "API_BOT" // ✅ NEW: TAG FOR IDENTIFICATION
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
         const orderId = res.data?.data?.order_id;
         
-        // 2. Update State IMMEDIATELY (So WS knows where we are)
-        botState.positionType = type === "BUY" ? 'LONG' : 'SHORT'; // Provisional
-        botState.entryPrice = limitPrice; // Will be corrected by Verify
+        botState.positionType = type === "BUY" ? 'LONG' : 'SHORT'; 
+        botState.entryPrice = limitPrice; 
         botState.quantity = qty;
-        botState.currentStop = slPrice;   // ✅ FIXED: Save the initial stop
-
+        botState.currentStop = slPrice;   
         
-        // ✅ UPDATED LOGGING: Adds 'date' field
+        // ✅ ADDED TAG: API_BOT
         botState.history.unshift({ 
-            date: formatDate(getIST()), // 🆕 NEW FIELD
+            date: formatDate(getIST()), 
             time: getIST().toLocaleTimeString(), 
             type: type, 
             orderedPrice: limitPrice,  
             executedPrice: 0,          
             id: orderId || "PENDING", 
-            status: "SENT" 
+            status: "SENT",
+            tag: "API_BOT" 
         });
-        // ... rest of function ...
         
         await manageExchangeSL(type, qty, slPrice);
         await saveState();
         pushToDashboard(); 
 
-        // 3. Start Robust Verification (Retry Loop)
         if (orderId) verifyOrderStatus(orderId, 'ENTRY');
         return true;
     } catch (e) {
@@ -729,6 +752,7 @@ setInterval(() => {
 // --- TRADING ENGINE (Strict WebSocket Only) ---
 // --- TRADING ENGINE (Watcher & Entry) ---
 // --- TRADING ENGINE (Watcher & Entry) ---
+// --- TRADING ENGINE (Watcher & Entry) ---
 setInterval(async () => {
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
@@ -739,39 +763,49 @@ setInterval(async () => {
         return; 
     }
 
-    // ❌ REMOVED "PENDING ORDER FIXER" (Stopped the infinite spam)
-
     try {
         const candles = await getMergedCandles();
         if (candles.length > 200) {
-            const cl = candles.map(c => c[4]), h = candles.map(c => c[2]), l = candles.map(c => c[3]), v = candles.map(c => c[5]);
+            // Extract Data Arrays
+            const cl = candles.map(c => c[4]);
+            const h = candles.map(c => c[2]);
+            const l = candles.map(c => c[3]);
+            const v = candles.map(c => c[5]);
 
+            // Calculate Indicators (Exactly as per server 5)
             const e50 = EMA.calculate({period: 50, values: cl});
-            const e200 = EMA.calculate({period: 200, values: cl}); // ✅ RESTORED E200
+            const e200 = EMA.calculate({period: 200, values: cl}); // ✅ PRESERVED E200
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            const curE50=e50[e50.length-1], curE200=e200[e200.length-1], curV=v[v.length-1], curAvgV=vAvg[vAvg.length-1];
+            // Get Current Values
+            const curE50 = e50[e50.length-1];
+            const curE200 = e200[e200.length-1];
+            const curV = v[v.length-1];
+            const curAvgV = vAvg[vAvg.length-1];
             const curA = atr[atr.length-1];
-            const bH = Math.max(...h.slice(-11, -1)), bL = Math.min(...l.slice(-11, -1));
+            
+            // Calculate Breakout Levels (Last 10 candles excluding current)
+            const bH = Math.max(...h.slice(-11, -1));
+            const bL = Math.min(...l.slice(-11, -1));
 
             // ✅ UPDATE GLOBAL ATR (For WebSocket to use)
             globalATR = curA; 
 
-            // ✅ RESTORED OLD LOG FORMAT (With E200 & AvgVol)
+            // ✅ PRESERVED LOG FORMAT
             console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
 
-            if (isMarketOpen() && !botState.positionType) {
-                 // --- ENTRY LOGIC ---
+            // ✅ NEW: Added "botState.isTradingEnabled" check here
+            if (isMarketOpen() && !botState.positionType && botState.isTradingEnabled) {
+                 
+                 // --- ENTRY LOGIC (Exact Copy from Server 5) ---
                  if (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH) {
-                    botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                    botState.currentStop = lastKnownLtp - (curA * 1.5); 
-                    await saveState(); await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                    // LONG ENTRY
+                    await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                 } 
                 else if (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL) {
-                    botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                    botState.currentStop = lastKnownLtp + (curA * 1.5); 
-                    await saveState(); await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                    // SHORT ENTRY
+                    await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                 }
             } 
         }
@@ -779,7 +813,6 @@ setInterval(async () => {
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 30000);
-
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
@@ -791,26 +824,39 @@ app.get('/live-updates', (req, res) => {
     req.on('close', () => sseClients = sseClients.filter(c => c.id !== id));
 });
 
+app.get('/toggle-trading', async (req, res) => {
+    botState.isTradingEnabled = !botState.isTradingEnabled;
+    await saveState();
+    pushToDashboard();
+    res.redirect('/');
+});
+
+app.get('/delete-log/:id', async (req, res) => {
+    botState.history = botState.history.filter(h => h.id !== req.params.id);
+    await saveState();
+    res.redirect('/');
+});
+
 app.get('/', (req, res) => {
     // 1. CALCULATE TODAY'S PNL
-    // We assume getIST() and formatDate() are defined globally as per previous files
     const todayStr = formatDate(getIST()); 
     
-    // Filter history for only today's logs to calculate daily PnL
+    // Filter history for only today's logs
     const todayLogs = botState.history.filter(h => h.date === todayStr);
     const todayPnL = todayLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+    
+    // Calculate Total Historical PnL (All time)
+    const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-    // 2. PREPARE LOGS FOR DASHBOARD (Limit to 10 & Add Analysis Link)
-    const displayLogs = botState.history
-        .filter(t => 
-            !t.type.includes('SYSTEM') && 
-            t.type !== 'Autologin' && 
-            t.status !== 'CANCELLED' && 
-            t.status !== 'REJECTED'
-        )
-        .slice(0, 10) // Show only last 10 activities on home
+    // 2. PREPARE LOGS FOR DASHBOARD (Show ALL Today's Logs - No Limit)
+    const displayLogs = todayLogs
+        .filter(t => !t.type.includes('SYSTEM')) 
         .map(t => {
-            // Logic: If PnL is negative and trade is filled, show "Analyze" button
+            // Check if manual (No 'API_BOT' tag and is filled)
+            const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
+            const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌ REMOVE]</a>` : '';
+            
+            // Check if loss (for analysis)
             const showAnalyze = (t.pnl < 0 && t.status === 'FILLED'); 
             const analyzeBtn = showAnalyze ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
 
@@ -830,7 +876,7 @@ app.get('/', (req, res) => {
                 </span> 
                 
                 <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
-                    ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn}
+                    ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}
                 </span>
 
                 <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
@@ -849,34 +895,48 @@ app.get('/', (req, res) => {
                     document.getElementById('live-pnl').innerText = '₹' + d.pnl;
                     document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
                     
-                    // Note: We don't live-update Today's PnL via SSE here to save bandwidth, 
-                    // it updates on refresh. Live PnL handles the active trade.
-                    
+                    document.getElementById('hist-pnl').innerText = '₹' + d.historicalPnl;
+                    document.getElementById('hist-pnl').style.color = parseFloat(d.historicalPnl) >= 0 ? '#4ade80' : '#f87171';
+
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
                     const stat = document.getElementById('live-status');
                     stat.innerText = d.status;
                     stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
+
+                    // ✅ UPDATE TOGGLE BUTTON STATE
+                    const btn = document.getElementById('toggle-btn');
+                    btn.innerText = d.isTrading ? "🟢 TRADING ON" : "🔴 PAUSED";
+                    btn.style.background = d.isTrading ? "#22c55e" : "#ef4444";
+
+                    // ✅ AUTO-UPDATE LOG TABLE
+                    if(d.logsHTML) document.getElementById('logContent').innerHTML = d.logsHTML;
                 };
             </script>
         </head>
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:650px; background:#1e293b; padding:25px; border-radius:15px;">
-                <h2 style="color:#38bdf8; text-align:center;">🥈 Silver Prime Auto</h2>
+                
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+                    <h2 style="color:#38bdf8; margin:0;">🥈 Silver Prime Auto</h2>
+                    <a href="/toggle-trading" id="toggle-btn" style="padding:8px 15px; border-radius:8px; text-decoration:none; color:white; font-weight:bold; background:${botState.isTradingEnabled?'#22c55e':'#ef4444'}">
+                        ${botState.isTradingEnabled?'🟢 TRADING ON':'🔴 PAUSED'}
+                    </a>
+                </div>
                 
                 <div style="text-align:center; padding:15px; border:1px solid #334155; border-radius:10px; margin-bottom:15px;">
                     <small style="color:#94a3b8;">LIVE PRICE</small><br><b id="live-price" style="font-size:24px; color:#fbbf24;">₹${lastKnownLtp || '---'}</b>
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">LIVE PNL (Active)</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
-                        <small style="color:#94a3b8;">TODAY'S PNL</small><br>
-                        <b id="todays-pnl" style="color:${todayPnL >= 0 ? '#4ade80' : '#f87171'}">₹${todayPnL.toFixed(2)}</b>
-                    </div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${historyPnL.toFixed(2)}</b></div>
+                </div>
+                
+                <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px; margin-bottom:15px;">
+                    <small style="color:#94a3b8;">TODAY'S NET PNL</small><br>
+                    <b id="todays-pnl" style="color:${todayPnL >= 0 ? '#4ade80' : '#f87171'}">₹${todayPnL.toFixed(2)}</b>
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
@@ -888,7 +948,7 @@ app.get('/', (req, res) => {
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">POSITION</small><br><b style="color:#facc15;">${botState.positionType || 'NONE'}</b></div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">STATUS</small><br><b id="live-status" style="color:${ACCESS_TOKEN?'#4ade80':'#ef4444'}">${ACCESS_TOKEN?'ONLINE':'OFFLINE'}</b></div>
                 </div>
-
+                
                 <div style="margin-bottom:15px;">
                     <a href="/reports" style="display:block; width:100%; padding:12px; background:#334155; color:white; text-align:center; border-radius:8px; text-decoration:none; font-weight:bold; border:1px solid #475569;">📊 VIEW HISTORICAL REPORTS</a>
                 </div>
@@ -916,6 +976,7 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE (With PnL Calculation Engine) ---
 // --- SYNC PRICE (Fixed PnL Calculation Logic) ---
 // --- SYNC PRICE (Preserves History & Dates) ---
+// --- SYNC PRICE (Complete: Replay, History Protection, & Manual Tagging) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
@@ -961,29 +1022,34 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
 
-            // Create Log WITH DATE
+            // ✅ NEW: DETECT IF MANUAL ORDER
+            // If the order has no tag from Upstox, AND we don't have a local tag for it, assume MANUAL.
+            const existingLog = botState.history.find(h => h.id === order.order_id);
+            const tag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
+
+            // Create Log WITH DATE & TAG
             processedLogs.unshift({
-                date: todayStr, // ✅ SAVES DATE (Crucial for Reports)
+                date: todayStr, 
                 time: execTime,
                 type: txnType,
                 orderedPrice: limitPrice,
                 executedPrice: realPrice,
                 id: order.order_id,
                 status: status,
-                pnl: tradePnL !== 0 ? tradePnL : null
+                pnl: tradePnL !== 0 ? tradePnL : null,
+                tag: tag // ✅ Save the Tag
             });
         });
 
-        // 3. INTELLIGENT MERGE (Preserve Yesterday's Logs)
+        // 3. INTELLIGENT MERGE (Preserve History Logic from Script 5)
         botState.history = botState.history.filter(h => {
             // Keep System logs
             if (h.type === 'SYSTEM' || h.type === 'Autologin') return true;
             
             // ✅ KEEP Old History (If date is NOT today)
-            // If a log has a date and it's NOT today, keep it.
             if (h.date && h.date !== todayStr) return true;
             
-            // If a log has NO date (Legacy data from yesterday), KEEP it (Safe mode)
+            // If a log has NO date (Legacy data), KEEP it
             if (!h.date) return true;
 
             // DELETE "Old" versions of Today's logs (so we can replace them with fresh sync)
@@ -996,16 +1062,17 @@ app.post('/sync-price', async (req, res) => {
         // 4. RECALCULATE TOTAL PNL (Sum of ALL logs: Today + Yesterday)
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 5. CHECK ACTIVE POSITION (Standard Upstox Check)
+        // 5. CHECK ACTIVE POSITION & RESTORE SL
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
         if (pos && parseInt(pos.quantity) !== 0) {
-            const qty = parseInt(pos.quantity);
-            botState.positionType = qty > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(qty);
+            const qty = Math.abs(parseInt(pos.quantity));
+            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = qty;
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             
+            // ✅ LTP FALLBACK (From Script 5): If WS is quiet, fetch price manually
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
@@ -1016,7 +1083,7 @@ app.post('/sync-price', async (req, res) => {
             }
 
             const riskPoints = 1200; 
-            const entrySide = qty > 0 ? 'BUY' : 'SELL';
+            const entrySide = parseInt(pos.quantity) > 0 ? 'BUY' : 'SELL';
             const slPrice = botState.positionType === 'LONG' ? (currentLtp - riskPoints) : (currentLtp + riskPoints);
             
             botState.currentStop = slPrice;
