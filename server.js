@@ -1,6 +1,22 @@
 const express = require('express');
 const axios = require('axios');
+// --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
+const admin = require('firebase-admin');
+// We read the JSON string from the Environment Variable
+// ⚠️ MAKE SURE YOU ADDED 'FIREBASE_SERVICE_ACCOUNT' IN RENDER SETTINGS!
+let serviceAccount;
+try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} catch (e) { console.error("❌ Firebase Key Error: Check Render Environment Variable"); }
+
+if (serviceAccount && !admin.apps.length) {
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+}
+const db = serviceAccount ? admin.firestore() : null;
+
+// --- ⚠️ REDIS (For Migration Only - You can remove this later) ---
 const Redis = require('ioredis');
+const redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
 const { EMA, SMA, ATR } = require("technicalindicators");
@@ -267,30 +283,95 @@ function generateLogHTML(logs) {
         </div>`;
     }).join('');
 }
-// --- STATE MANAGEMENT ---
-// --- STATE MANAGEMENT ---
-async function loadState() {
+// --- 💾 DATABASE FUNCTIONS ---
+
+// 1. SAVE SETTINGS (Switch, Position, SL - Fast & Frequent)
+async function saveSettings() {
+    if (!db) return;
     try {
-        const saved = await redis.get('silver_bot_state');
-        if (saved) {
-            const loadedData = JSON.parse(saved);
-            botState = loadedData;
+        const settings = {
+            positionType: botState.positionType,
+            entryPrice: botState.entryPrice,
+            currentStop: botState.currentStop,
+            slOrderId: botState.slOrderId,
+            isTradingEnabled: botState.isTradingEnabled,
+            maxRunUp: botState.maxRunUp,
+            quantity: botState.quantity,
+            totalPnL: botState.totalPnL,
+            hiddenLogIds: botState.hiddenLogIds || [],
+            updatedAt: new Date().toISOString()
+        };
+        await db.collection('bot').doc('main').set(settings, { merge: true });
+    } catch (e) { console.error("❌ Firebase Save Error:", e.message); }
+}
+
+// 2. SAVE TRADE (Logs & Heavy Analysis Data - Permanent)
+async function saveTrade(tradeObj) {
+    if (!db || !tradeObj || !tradeObj.id) return;
+    try {
+        await db.collection('trades').doc(tradeObj.id.toString()).set(tradeObj, { merge: true });
+    } catch (e) { console.error(`❌ Could not save trade ${tradeObj.id}:`, e.message); }
+}
+
+// 3. LOAD STATE (Auto-Migrate from Redis to Firebase)
+async function loadState() {
+    if (!db) return;
+    try {
+        console.log("📂 Checking Database...");
+        
+        // A. Check Firebase First
+        const doc = await db.collection('bot').doc('main').get();
+        
+        if (doc.exists) {
+            console.log("⚡ Loading from Firebase...");
+            const data = doc.data();
+            botState.positionType = data.positionType;
+            botState.entryPrice = data.entryPrice || 0;
+            botState.currentStop = data.currentStop;
+            botState.slOrderId = data.slOrderId;
+            botState.isTradingEnabled = data.isTradingEnabled ?? true;
+            botState.maxRunUp = data.maxRunUp || 0;
+            botState.quantity = data.quantity || 0;
+            botState.hiddenLogIds = data.hiddenLogIds || [];
             
-            // ✅ FIX: Ensure new fields exist even if loading old data
-            if (!botState.activeMonitors) botState.activeMonitors = {}; 
-            if (!botState.hiddenLogIds) botState.hiddenLogIds = [];
-            if (typeof botState.maxRunUp === 'undefined') botState.maxRunUp = 0;
+            // Load History
+            const snapshot = await db.collection('trades').orderBy('date', 'desc').limit(100).get();
+            botState.history = [];
+            snapshot.forEach(d => botState.history.push(d.data()));
+            console.log(`✅ Loaded ${botState.history.length} trades from Firebase.`);
             
-            console.log("📂 System State Loaded & Patched.");
         } else {
-            console.log("📂 No saved state found. Starting fresh.");
+            // ⚠️ FIREBASE EMPTY -> MIGRATE FROM REDIS
+            console.log("📦 Firebase is empty. Attempting migration from Redis...");
+            const saved = await redis.get('silver_bot_state');
+            
+            if (saved) {
+                const loadedData = JSON.parse(saved);
+                console.log(`🔄 Found ${loadedData.history.length} old trades in Redis. Migrating...`);
+
+                // Migrate Settings
+                botState = loadedData;
+                await saveSettings();
+                
+                // Migrate Trades (Batch)
+                let batch = db.batch();
+                let count = 0;
+                
+                for (const trade of botState.history) {
+                    const tradeId = trade.id || "LEGACY-" + Date.now() + Math.random();
+                    const ref = db.collection('trades').doc(tradeId.toString());
+                    batch.set(ref, trade);
+                    count++;
+                    if (count >= 400) { await batch.commit(); batch = db.batch(); count = 0; }
+                }
+                if (count > 0) await batch.commit();
+                console.log("✅ MIGRATION COMPLETE! Your old data is now in Firebase.");
+            }
         }
-    } catch (e) { console.log("Redis sync issue (first run?):", e.message); }
+    } catch (e) { console.error("❌ Load/Migrate Error:", e.message); }
 }
 loadState();
-
-async function saveState() { await redis.set('silver_bot_state', JSON.stringify(botState)); }
-
+async function saveState() { await saveSettings(); } // Backward compatibility wrapper
 // --- TIME HELPERS ---
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
 function formatDate(date) { return date.toISOString().split('T')[0]; }
@@ -492,19 +573,18 @@ async function initWebSocket() {
 
                                 // STOP after 10 Minutes
                                 if (now - session.startTime > 600000) {
-                                    console.log(`✅ Finished Analyzing Trade ${oid}. Saving Report.`);
+                                    console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
                                     
                                     const logIndex = botState.history.findIndex(h => h.id === oid);
                                     if (logIndex !== -1) {
                                         botState.history[logIndex].analysisData = {
                                             maxRunUp: session.maxRunUp,
-                                            // Store start time so we can calculate +1min, +5min relative to it
                                             startTime: session.startTime, 
                                             data: session.data,        
                                             highAfter: session.highestAfterExit,
                                             lowAfter: session.lowestAfterExit
                                         };
-                                        saveState();
+                                        await saveTrade(botState.history[logIndex]); // 🔥 Save Huge Data to Firebase
                                     }
                                     delete botState.activeMonitors[oid]; 
                                 }
@@ -622,12 +702,9 @@ async function verifyOrderStatus(orderId, context) {
     if (!orderId) return { status: 'FAILED' };
 
     console.log(`🔎 Verifying Order ${orderId}...`);
-    let attempts = 0;
     
-    // LOOP FOREVER (until terminal state)
     while (true) {
-        attempts++;
-        // Wait 2s normally, or 10s if we hit a Rate Limit previously
+        // Wait 2s normally
         await new Promise(r => setTimeout(r, 2000));
 
         try {
@@ -638,7 +715,7 @@ async function verifyOrderStatus(orderId, context) {
             const order = res.data.data.find(o => o.order_id === orderId);
             if (!order) {
                 console.log(`⚠️ Order ${orderId} not found yet. Retrying...`);
-                continue; 
+                continue; // Retry indefinitely
             }
 
             // 1. SUCCESS: Order Filled
@@ -648,18 +725,18 @@ async function verifyOrderStatus(orderId, context) {
                 
                 console.log(`✅ Order Confirmed: ${order.transaction_type} @ ₹${realPrice}`);
                 
-                // Update Log in History
+                // Update Log
                 const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
                 if (logIndex !== -1) {
                     botState.history[logIndex].id = orderId;
                     botState.history[logIndex].executedPrice = realPrice;
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
+                    await saveTrade(botState.history[logIndex]); // 🔥 Save to Firebase
                 }
 
                 // If this was an EXIT, start recording
                 if (context === 'EXIT_CHECK') {
-                    // Start 10-min analysis session...
                     botState.activeMonitors[orderId] = {
                         startTime: Date.now(), lastRecordTime: 0, type: botState.positionType,
                         entryPrice: botState.entryPrice, maxRunUp: botState.maxRunUp,
@@ -668,29 +745,28 @@ async function verifyOrderStatus(orderId, context) {
                     botState.positionType = null; botState.slOrderId = null; botState.maxRunUp = 0;
                 }
 
-                await saveState();
+                await saveSettings();
                 pushToDashboard();
-                return { status: 'FILLED', price: realPrice }; // Return Success
+                return { status: 'FILLED', price: realPrice }; 
             }
 
             // 2. FAILURE: Rejected or Cancelled
             if (['rejected', 'cancelled'].includes(order.status)) {
                 console.log(`❌ Order Failed: ${order.status_message}`);
                 
-                // Update Log
                 const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
                 if (logIndex !== -1) {
                     botState.history[logIndex].id = orderId;
                     botState.history[logIndex].status = order.status.toUpperCase();
                     botState.history[logIndex].executedPrice = 0;
+                    await saveTrade(botState.history[logIndex]); // 🔥 Save Failure
                 }
                 
-                // Cleanup
                 if (context !== 'EXIT_CHECK') { botState.positionType = null; }
                 
-                await saveState();
+                await saveSettings();
                 pushToDashboard();
-                return { status: 'FAILED' }; // Return Failure
+                return { status: 'FAILED' }; 
             }
 
         } catch (e) {
@@ -709,7 +785,7 @@ async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     if (!botState.isTradingEnabled) return false;
 
-    // 1. INITIALIZE LOG (PENDING)
+    // 1. INITIALIZE LOG
     const logId = "PENDING";
     botState.history.unshift({ 
         date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
@@ -719,7 +795,7 @@ async function placeOrder(type, qty, ltp) {
     pushToDashboard();
 
     try {
-        // 2. SEND ORDER TO UPSTOX
+        // 2. SEND ORDER
         const res = await axios.post("https://api.upstox.com/v3/order/place", {
             quantity: qty, product: "I", validity: "DAY", price: ltp, instrument_token: INSTRUMENT_KEY,
             order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, 
@@ -734,29 +810,25 @@ async function placeOrder(type, qty, ltp) {
 
         // 4. DECISION TIME
         if (result.status === 'FILLED') {
-            // ✅ Success! Now we set state and place SL
             botState.positionType = type === "BUY" ? 'LONG' : 'SHORT';
-            botState.entryPrice = result.price; // Use REAL price
+            botState.entryPrice = result.price; 
             botState.quantity = qty;
-            botState.maxRunUp = 0; // Reset Runup
+            botState.maxRunUp = 0; 
 
-            // Calculate SL
+            // Calculate SL (800 points)
             const slPrice = type === "BUY" ? (result.price - 800) : (result.price + 800);
             botState.currentStop = slPrice;
             
-            await saveState();
-            await manageExchangeSL(type, qty, slPrice); // Now safe to place SL
+            await saveSettings();
+            await manageExchangeSL(type, qty, slPrice); 
             return true;
-        } 
-        else {
-            // ❌ Failed (Low Funds, etc). Do NOTHING else.
+        } else {
             console.log("⛔ Trade aborted. No SL placed.");
             return false;
         }
 
     } catch (e) {
         console.error(`❌ Order Request Failed: ${e.message}`);
-        // Mark log as Error
         const log = botState.history.find(h => h.id === logId);
         if (log) log.status = "ERROR";
         pushToDashboard();
@@ -905,44 +977,45 @@ app.get('/live-updates', (req, res) => {
 
 app.get('/toggle-trading', async (req, res) => {
     botState.isTradingEnabled = !botState.isTradingEnabled;
-    
-    // ✅ NEW: Add a visible System Log entry
     const action = botState.isTradingEnabled ? "RESUMED" : "PAUSED";
-    const colorLog = botState.isTradingEnabled ? "ACTIVE" : "STOPPED";
     
-    botState.history.unshift({
+    // Create System Log
+    const sysLog = {
         date: formatDate(getIST()),
         time: getIST().toLocaleTimeString(),
-        type: "SYSTEM",        // Shows up as gray text
-        orderedPrice: 0,
-        executedPrice: 0,
+        type: "SYSTEM",
         id: "CMD-" + Date.now().toString().slice(-6),
-        status: action,        // Will show "PAUSED" or "RESUMED"
+        status: action,
         pnl: 0,
-        tag: "MANUAL"
-    });
+        tag: "MANUAL",
+        orderedPrice: 0,
+        executedPrice: 0
+    };
 
-    console.log(`🔘 Trading Manually ${action} by User.`);
+    botState.history.unshift(sysLog);
+    // 🔥 Firebase Save
+    if(db) await saveSettings(); 
     
-    await saveState();
+    console.log(`🔘 Trading Manually ${action} by User.`);
     pushToDashboard();
     res.redirect('/');
 });
 
 app.get('/delete-log/:id', async (req, res) => {
     const idToRemove = req.params.id;
-    
-    // 1. Add to Blacklist (So Sync doesn't bring it back)
-    if (!botState.hiddenLogIds) botState.hiddenLogIds = []; // Safety check
+    if (!botState.hiddenLogIds) botState.hiddenLogIds = [];
     botState.hiddenLogIds.push(idToRemove);
 
-    // 2. Remove from current history immediately
+    // Remove from memory
     botState.history = botState.history.filter(h => h.id !== idToRemove);
-    
-    // 3. Recalculate PnL without this trade
     botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-    await saveState();
+    // 🔥 Firebase Delete
+    try {
+        if(db) await db.collection('trades').doc(idToRemove).delete();
+        await saveSettings();
+    } catch(e) { console.error("Firebase delete error", e); }
+
     res.redirect('/');
 });
 
@@ -1057,128 +1130,92 @@ app.post('/sync-price', async (req, res) => {
     try {
         console.log("🔄 Syncing & Recalculating PnL...");
         
-        // 1. FETCH ORDERS
+        // 1. Fetch from Upstox
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // 2. FILTER & SORT (Chronological)
+        // 2. Filter & Sort
         const myOrders = (ordRes.data?.data || [])
-            .filter(o => o.instrument_token && o.instrument_token.includes("458305")) // Silver Only
-            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected')         // Ignore Garbage
+            .filter(o => o.instrument_token && o.instrument_token.includes("458305")) 
+            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected')
             .filter(o => !botState.hiddenLogIds || !botState.hiddenLogIds.includes(o.order_id)) 
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        // 3. REPLAY ENGINE: Calculate PnL for TODAY (Restored Logic)
         let openPos = { side: null, price: 0, qty: 0 };
         const processedLogs = [];
         const todayStr = formatDate(getIST()); 
 
+        // 3. Replay Engine (Calculates PnL)
         myOrders.forEach(order => {
             const realPrice = parseFloat(order.average_price) || 0;
             const limitPrice = parseFloat(order.price) || 0;
             const execTime = new Date(order.order_timestamp).toLocaleTimeString();
             const txnType = order.transaction_type; 
             const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
-            
             let tradePnL = 0; 
 
-            // PnL Logic: Match Buy with Sell
             if (order.status === 'complete') {
                 const qty = parseInt(order.quantity) || 1;
-                
                 if (openPos.qty === 0) {
-                    // New Position Opening
-                    openPos.side = txnType;
-                    openPos.price = realPrice;
-                    openPos.qty = qty;
-                }
-                else if (openPos.side !== txnType) {
-                    // Position Closing
-                    if (openPos.side === 'BUY' && txnType === 'SELL') {
-                        tradePnL = (realPrice - openPos.price) * openPos.qty;
-                    } else if (openPos.side === 'SELL' && txnType === 'BUY') {
-                        tradePnL = (openPos.price - realPrice) * openPos.qty;
-                    }
+                    openPos.side = txnType; openPos.price = realPrice; openPos.qty = qty;
+                } else if (openPos.side !== txnType) {
+                    if (openPos.side === 'BUY' && txnType === 'SELL') tradePnL = (realPrice - openPos.price) * openPos.qty;
+                    else if (openPos.side === 'SELL' && txnType === 'BUY') tradePnL = (openPos.price - realPrice) * openPos.qty;
                     openPos.qty = 0; openPos.side = null; openPos.price = 0;
                 }
             }
 
-            // 4. SMART MERGE: Preserve Local Data (Runup, Analysis, Tags)
+            // Preserve Data & Tags
             const existingLog = botState.history.find(h => h.id === order.order_id);
             const preservedData = existingLog ? existingLog.analysisData : null;
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
-            // Create Log
-            processedLogs.unshift({
-                date: todayStr, 
-                time: execTime,
-                type: txnType,
-                orderedPrice: limitPrice,
-                executedPrice: realPrice,
-                id: order.order_id,
-                status: status,
-                pnl: tradePnL !== 0 ? tradePnL : null,
-                tag: preservedTag,
-                analysisData: preservedData // ✅ KEEP RECORDING DATA
-            });
+            const tradeLog = {
+                date: todayStr, time: execTime, type: txnType, orderedPrice: limitPrice,
+                executedPrice: realPrice, id: order.order_id, status: status,
+                pnl: tradePnL !== 0 ? tradePnL : null, tag: preservedTag,
+                analysisData: preservedData 
+            };
+            
+            processedLogs.unshift(tradeLog);
+            if(db) saveTrade(tradeLog); // 🔥 Firebase Background Save
         });
 
-        // 5. MERGE HISTORY (Today's fresh logs + Yesterday's old logs)
+        // 4. Merge with History
         botState.history = botState.history.filter(h => {
-            if (h.type === 'SYSTEM' || h.type === 'Autologin') return true; // Keep System Logs
-            if (h.date && h.date !== todayStr) return true; // Keep Yesterday's data
-            if (!h.date) return true; // Keep Legacy data
-            return false; // Remove Today's trade logs (we just rebuilt them)
+            if (h.type === 'SYSTEM' || h.type === 'Autologin') return true; 
+            if (h.date && h.date !== todayStr) return true; 
+            if (!h.date) return true; 
+            return false; 
         });
         
         botState.history = [...processedLogs, ...botState.history];
-
-        // 6. RECALCULATE TOTAL PNL
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 7. CHECK ACTIVE POSITION & RESTORE SL
+        // 5. Check Position & SL
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
         if (pos && parseInt(pos.quantity) !== 0) {
-            const qty = Math.abs(parseInt(pos.quantity));
             botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = qty;
+            botState.quantity = Math.abs(parseInt(pos.quantity));
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
-            
-            // ✅ Preserve Max Runup if it exists
             if (!botState.maxRunUp) botState.maxRunUp = 0;
 
-            // ✅ FIND REAL SL ORDER ON UPSTOX (Don't just calculate it)
-            // We search for a "Trigger Pending" order that matches our symbol
             const openOrders = ordRes.data?.data || [];
-            const existingSL = openOrders.find(o => 
-                o.status === 'trigger pending' && 
-                o.order_type === 'SL-M' && 
-                o.instrument_token.includes("458305")
-            );
+            const existingSL = openOrders.find(o => o.status === 'trigger pending' && o.order_type === 'SL-M' && o.instrument_token.includes("458305"));
 
             if (existingSL) {
-                console.log(`✅ Found Existing SL on Exchange: ${existingSL.trigger_price}`);
                 botState.currentStop = parseFloat(existingSL.trigger_price);
                 botState.slOrderId = existingSL.order_id;
             } else {
-                console.log("⚠️ No Active SL found. Calculating default safety SL...");
-                // Fallback: Calculate Safety SL (only if none exists)
                 const currentLtp = lastKnownLtp || botState.entryPrice;
-                const riskPoints = 1200; 
-                botState.currentStop = botState.positionType === 'LONG' ? (currentLtp - riskPoints) : (currentLtp + riskPoints);
+                botState.currentStop = botState.positionType === 'LONG' ? (currentLtp - 1200) : (currentLtp + 1200);
             }
-
         } else { 
-            // Clean Reset if no position
-            botState.positionType = null; 
-            botState.currentStop = 0;
-            botState.slOrderId = null;
-            botState.quantity = 0;
-            botState.maxRunUp = 0;
+            botState.positionType = null; botState.currentStop = 0; botState.slOrderId = null; botState.quantity = 0; botState.maxRunUp = 0;
         }
         
-        await saveState();
+        if(db) await saveSettings(); // 🔥 Save Settings
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
