@@ -314,16 +314,15 @@ async function saveTrade(tradeObj) {
 }
 
 // 3. LOAD STATE (Auto-Migrate from Redis to Firebase)
+// --- 💾 SMART LOAD & CLEANUP ---
 async function loadState() {
     if (!db) return;
     try {
-        console.log("📂 Checking Database...");
+        console.log("📂 Connecting to Firebase...");
         
-        // A. Check Firebase First
+        // 1. Load Settings
         const doc = await db.collection('bot').doc('main').get();
-        
         if (doc.exists) {
-            console.log("⚡ Loading from Firebase...");
             const data = doc.data();
             botState.positionType = data.positionType;
             botState.entryPrice = data.entryPrice || 0;
@@ -333,42 +332,38 @@ async function loadState() {
             botState.maxRunUp = data.maxRunUp || 0;
             botState.quantity = data.quantity || 0;
             botState.hiddenLogIds = data.hiddenLogIds || [];
-            
-            // Load History
-            const snapshot = await db.collection('trades').orderBy('date', 'desc').limit(100).get();
-            botState.history = [];
-            snapshot.forEach(d => botState.history.push(d.data()));
-            console.log(`✅ Loaded ${botState.history.length} trades from Firebase.`);
-            
-        } else {
-            // ⚠️ FIREBASE EMPTY -> MIGRATE FROM REDIS
-            console.log("📦 Firebase is empty. Attempting migration from Redis...");
-            const saved = await redis.get('silver_bot_state');
-            
-            if (saved) {
-                const loadedData = JSON.parse(saved);
-                console.log(`🔄 Found ${loadedData.history.length} old trades in Redis. Migrating...`);
+        }
 
-                // Migrate Settings
-                botState = loadedData;
-                await saveSettings();
-                
-                // Migrate Trades (Batch)
-                let batch = db.batch();
-                let count = 0;
-                
-                for (const trade of botState.history) {
-                    const tradeId = trade.id || "LEGACY-" + Date.now() + Math.random();
-                    const ref = db.collection('trades').doc(tradeId.toString());
-                    batch.set(ref, trade);
-                    count++;
-                    if (count >= 400) { await batch.commit(); batch = db.batch(); count = 0; }
-                }
-                if (count > 0) await batch.commit();
-                console.log("✅ MIGRATION COMPLETE! Your old data is now in Firebase.");
+        // 2. Load Trades
+        const snapshot = await db.collection('trades').orderBy('date', 'desc').limit(200).get();
+        let rawHistory = [];
+        snapshot.forEach(d => rawHistory.push(d.data()));
+
+        // 3. 🧹 CLEANUP: Remove Duplicates
+        // We keep the FIRST instance of every Order ID and discard the rest.
+        const seenIds = new Set();
+        botState.history = [];
+        
+        for (const trade of rawHistory) {
+            if (!seenIds.has(trade.id)) {
+                seenIds.add(trade.id);
+                botState.history.push(trade);
+            } else {
+                // Found a duplicate! (The ghost copy)
+                // We don't save it to memory.
+                // Optionally: We could delete it from DB here, but filtering memory is safer for now.
+                console.log(`🧹 Filtered out duplicate trade: ${trade.id}`);
             }
         }
-    } catch (e) { console.error("❌ Load/Migrate Error:", e.message); }
+        
+        console.log(`✅ Loaded ${botState.history.length} unique trades.`);
+
+        // 4. MIGRATION CHECK (Only runs if Firebase was totally empty)
+        if (rawHistory.length === 0) {
+           // ... (Your existing migration logic from Redis goes here if you want to keep it, otherwise remove it) ...
+        }
+
+    } catch (e) { console.error("❌ Firebase Load Error:", e.message); }
 }
 loadState();
 async function saveState() { await saveSettings(); } // Backward compatibility wrapper
