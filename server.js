@@ -975,6 +975,7 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE (Fixed PnL Calculation Logic) ---
 // --- SYNC PRICE (Preserves History & Dates) ---
 // --- SYNC PRICE (Complete: Replay, History Protection, & Manual Tagging) ---
+// --- SYNC PRICE (Filters Garbage & Tags Manual Orders) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
@@ -983,9 +984,10 @@ app.post('/sync-price', async (req, res) => {
         // 1. FETCH UPSTOX ORDERS (Today's Orders Only)
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter Silver orders & Sort by Time
+        // Filter: Silver Only AND (Ignore Cancelled/Rejected)
         const myOrders = (ordRes.data?.data || [])
             .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
+            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected') // ❌ THE FIX: Ignore junk
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
         // 2. REPLAY ENGINE: Calculate PnL for TODAY
@@ -1020,12 +1022,14 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
 
-            // ✅ NEW: DETECT IF MANUAL ORDER
-            // If the order has no tag from Upstox, AND we don't have a local tag for it, assume MANUAL.
+            // ✅ SMART TAGGING:
+            // 1. Trust the Tag from Upstox (if "API_BOT" exists).
+            // 2. If no Upstox tag, check our local memory.
+            // 3. If neither, assume it's MANUAL.
             const existingLog = botState.history.find(h => h.id === order.order_id);
             const tag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
-            // Create Log WITH DATE & TAG
+            // Create Log
             processedLogs.unshift({
                 date: todayStr, 
                 time: execTime,
@@ -1035,29 +1039,26 @@ app.post('/sync-price', async (req, res) => {
                 id: order.order_id,
                 status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null,
-                tag: tag // ✅ Save the Tag
+                tag: tag // ✅ Save the correct tag
             });
         });
 
-        // 3. INTELLIGENT MERGE (Preserve History Logic from Script 5)
+        // 3. INTELLIGENT MERGE
         botState.history = botState.history.filter(h => {
             // Keep System logs
             if (h.type === 'SYSTEM' || h.type === 'Autologin') return true;
-            
-            // ✅ KEEP Old History (If date is NOT today)
+            // Keep Old History (Not Today)
             if (h.date && h.date !== todayStr) return true;
-            
-            // If a log has NO date (Legacy data), KEEP it
+            // Keep Legacy Data
             if (!h.date) return true;
-
-            // DELETE "Old" versions of Today's logs (so we can replace them with fresh sync)
+            // DELETE "Old" versions of Today's logs (to replace with fresh clean list)
             return false; 
         });
 
         // Add Fresh "Today" Logs to the top
         botState.history = [...processedLogs, ...botState.history];
 
-        // 4. RECALCULATE TOTAL PNL (Sum of ALL logs: Today + Yesterday)
+        // 4. RECALCULATE TOTAL PNL
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
         // 5. CHECK ACTIVE POSITION & RESTORE SL
@@ -1070,7 +1071,7 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = qty;
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             
-            // ✅ LTP FALLBACK (From Script 5): If WS is quiet, fetch price manually
+            // LTP FALLBACK
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
@@ -1100,6 +1101,7 @@ app.post('/sync-price', async (req, res) => {
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
+
 
 const PORT = process.env.PORT || 10000;
 
