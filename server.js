@@ -840,23 +840,24 @@ app.get('/delete-log/:id', async (req, res) => {
 app.get('/', (req, res) => {
     // 1. CALCULATE TODAY'S PNL
     const todayStr = formatDate(getIST()); 
-    
-    // Filter history for only today's logs
     const todayLogs = botState.history.filter(h => h.date === todayStr);
     const todayPnL = todayLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
-    
-    // Calculate Total Historical PnL (All time)
     const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-    // 2. PREPARE LOGS FOR DASHBOARD (Show ALL Today's Logs - No Limit)
+    // 2. PREPARE LOGS (With Filters & Smart Buttons)
     const displayLogs = todayLogs
-        .filter(t => !t.type.includes('SYSTEM')) 
+        .filter(t => 
+            !t.type.includes('SYSTEM') && 
+            t.status !== 'CANCELLED' &&  // ✅ Hides Cancelled
+            t.status !== 'REJECTED'      // ✅ Hides Rejected
+        ) 
         .map(t => {
-            // Check if manual (No 'API_BOT' tag and is filled)
-            const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
+            // ✅ LOGIC: Only show "Remove" if it is NOT an API Bot order
+            // (Old orders without tags count as Manual so you can clean them up)
+            const isManual = (t.tag !== 'API_BOT'); 
             const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌ REMOVE]</a>` : '';
             
-            // Check if loss (for analysis)
+            // Show Analyze button only for Filled Losses
             const showAnalyze = (t.pnl < 0 && t.status === 'FILLED'); 
             const analyzeBtn = showAnalyze ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
 
@@ -905,12 +906,10 @@ app.get('/', (req, res) => {
                     stat.innerText = d.status;
                     stat.style.color = d.status === 'ONLINE' ? '#4ade80' : '#ef4444';
 
-                    // ✅ UPDATE TOGGLE BUTTON STATE
                     const btn = document.getElementById('toggle-btn');
                     btn.innerText = d.isTrading ? "🟢 TRADING ON" : "🔴 PAUSED";
                     btn.style.background = d.isTrading ? "#22c55e" : "#ef4444";
 
-                    // ✅ AUTO-UPDATE LOG TABLE
                     if(d.logsHTML) document.getElementById('logContent').innerHTML = d.logsHTML;
                 };
             </script>
@@ -970,7 +969,6 @@ app.get('/', (req, res) => {
                 <div id="logContent">${displayLogs}</div>
             </div></body></html>`);
 });
-
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
 // --- SYNC PRICE (With PnL Calculation Engine) ---
