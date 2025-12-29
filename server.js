@@ -392,8 +392,7 @@ async function modifyExchangeSL(newTrigger) {
         console.log(`❌ SL Modify Failed: ${errMsg}`);
     }
 }
-// --- 🔌 WEBSOCKET (Instant Reflex Logic) ---
-// --- 🔌 WEBSOCKET (Live Recording & Reflex Logic) ---
+// --- 🔌 WEBSOCKET (High-Precision Recorder) ---
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
@@ -424,34 +423,26 @@ async function initWebSocket() {
                         if (newPrice > 0 && (key.includes("458305") || Object.keys(object.feeds).length === 1)) {
                             lastKnownLtp = newPrice;
 
-                            // ------------------------------------------------------
-                            // 1️⃣ LIVE TRADE TRACKING (Track Max Profit)
-                            // ------------------------------------------------------
+                            // 1️⃣ LIVE TRADE TRACKING
                             if (botState.positionType) {
                                 let currentProfit = 0;
                                 if (botState.positionType === 'LONG') currentProfit = newPrice - botState.entryPrice;
                                 if (botState.positionType === 'SHORT') currentProfit = botState.entryPrice - newPrice;
                                 
-                                // Update Max Run Up (Highest profit seen)
                                 if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
 
-                                // --- TRAILING SL LOGIC (Preserved from your request) ---
+                                // Trailing SL Logic
                                 let newStop = botState.currentStop;
                                 let didChange = false;
                                 let trailingGap = globalATR * 1.5; 
 
-                                // Rule: If Profit > 1000, Tighten Gap
                                 if (currentProfit >= 1000) trailingGap = 500;
-
-                                // Rule: Move to Cost if Profit > 600
                                 if (currentProfit >= 600) {
                                     const costSL = botState.entryPrice;
-                                    // Only move if we haven't already secured cost or better
                                     const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
                                     if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
                                 }
 
-                                // Standard Trailing
                                 if (botState.positionType === 'LONG') {
                                     const trailingLevel = newPrice - trailingGap;
                                     if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
@@ -466,7 +457,6 @@ async function initWebSocket() {
                                     modifyExchangeSL(newStop);
                                 }
                                 
-                                // Exit Check
                                 if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
                                     (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
                                      verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
@@ -474,38 +464,37 @@ async function initWebSocket() {
                             }
 
                             // ------------------------------------------------------
-                            // 2️⃣ POST-TRADE MONITORING (The "Camera" Logic)
+                            // 2️⃣ POST-TRADE MONITORING (EVERY TICK - NO THROTTLE)
                             // ------------------------------------------------------
                             const now = Date.now();
                             for (const oid in botState.activeMonitors) {
                                 const session = botState.activeMonitors[oid];
                                 
-                                // Record snapshot every 5 seconds (to save memory)
-                                if (now - session.lastRecordTime > 5000) {
-                                    session.data.push({ t: getIST().toLocaleTimeString(), p: newPrice });
-                                    session.lastRecordTime = now;
+                                // ✅ CAPTURE EVERY SINGLE UPDATE
+                                // We store timestamp as raw milliseconds to make searching easier later
+                                session.data.push({ t: now, p: newPrice });
                                     
-                                    // Update Min/Max seen AFTER exit
-                                    if (newPrice > session.highestAfterExit) session.highestAfterExit = newPrice;
-                                    if (newPrice < session.lowestAfterExit) session.lowestAfterExit = newPrice;
-                                }
+                                // Update Min/Max seen AFTER exit
+                                if (newPrice > session.highestAfterExit) session.highestAfterExit = newPrice;
+                                if (newPrice < session.lowestAfterExit) session.lowestAfterExit = newPrice;
 
-                                // STOP after 10 Minutes (600,000 ms)
+                                // STOP after 10 Minutes
                                 if (now - session.startTime > 600000) {
                                     console.log(`✅ Finished Analyzing Trade ${oid}. Saving Report.`);
                                     
-                                    // Save analysis to the history log
                                     const logIndex = botState.history.findIndex(h => h.id === oid);
                                     if (logIndex !== -1) {
                                         botState.history[logIndex].analysisData = {
-                                            maxRunUp: session.maxRunUp, // How good was the trade before SL?
-                                            data: session.data,         // 10 min price array
+                                            maxRunUp: session.maxRunUp,
+                                            // Store start time so we can calculate +1min, +5min relative to it
+                                            startTime: session.startTime, 
+                                            data: session.data,        
                                             highAfter: session.highestAfterExit,
                                             lowAfter: session.lowestAfterExit
                                         };
                                         saveState();
                                     }
-                                    delete botState.activeMonitors[oid]; // Stop monitoring
+                                    delete botState.activeMonitors[oid]; 
                                 }
                             }
                             
@@ -1225,82 +1214,92 @@ app.get('/reports', (req, res) => {
     `);
 });
 
-// --- 🔍 SMART ANALYSIS ROUTE (Live & Recorded Data) ---
+// --- 🔍 SMART ANALYSIS ROUTE (High-Precision Search) ---
 app.get('/analyze-sl/:orderId', async (req, res) => {
     const orderId = req.params.orderId;
     const trade = botState.history.find(h => h.id === orderId);
     if (!trade) return res.send("Trade not found.");
 
-    // Check if monitoring is still active
     const activeSession = botState.activeMonitors[orderId];
-    // Check if monitoring finished and saved
     const savedData = trade.analysisData;
 
-    // 1. IF STILL RECORDING
+    // 1. LIVE RECORDING SCREEN
     if (activeSession) {
         const elapsedMin = ((Date.now() - activeSession.startTime) / 60000).toFixed(1);
+        const dataPoints = activeSession.data.length;
         return res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; text-align:center; padding:50px;">
-                <h1 style="color:#fbbf24;">🎥 Analyzing Trade...</h1>
-                <p>The bot is currently recording live price action to find your mistake.</p>
-                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes Recorded</div>
-                <p>Refresh this page in a few minutes.</p>
-                <script>setTimeout(() => window.location.reload(), 10000);</script>
+                <h1 style="color:#fbbf24;">🎥 Recording Every Tick...</h1>
+                <p>High-Precision Analysis in progress.</p>
+                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes</div>
+                <div style="color:#94a3b8;">${dataPoints} Price Updates Captured</div>
+                <script>setTimeout(() => window.location.reload(), 5000);</script>
             </body>
         `);
     }
 
-    // 2. IF NO DATA (Old Trade or Error)
-    if (!savedData) return res.send("No advanced analysis data available for this trade (Feature was added recently).");
+    if (!savedData) return res.send("No advanced analysis data available.");
 
-    // 3. GENERATE REPORT (The "Opinion" Logic)
-    const { maxRunUp, highAfter, lowAfter, data } = savedData;
+    // 2. GENERATE REPORT
+    const { maxRunUp, highAfter, lowAfter, data, startTime } = savedData;
     const exitPrice = parseFloat(trade.executedPrice);
     const isWin = trade.pnl >= 0;
     
     let opinion = "";
-    let color = "#cbd5e1"; // Default Grey
+    let color = "#cbd5e1"; 
 
-    // --- RULES ENGINE ---
-    
-    // Rule 1: Did we miss "Move to Cost"?
+    // Rules Engine
     if (!isWin && maxRunUp >= 600) {
         opinion = "❌ <b>RULE VIOLATION:</b> You saw ₹" + maxRunUp.toFixed(0) + " profit but ended in loss.<br>Rule: <i>'If Profit > 600, Move SL to Cost.'</i>";
-        color = "#ef4444"; // Red
+        color = "#ef4444"; 
     }
-    // Rule 2: Was it a Stop Hunt? (Price reversed immediately after hitting SL)
     else if (!isWin) {
-        const tradeType = trade.type === 'BUY' ? 'SELL' : 'BUY'; // Trade was Long, Exit was SELL
+        const tradeType = trade.type === 'BUY' ? 'SELL' : 'BUY'; 
         let isStopHunt = false;
-        
-        // If Long Trade (Exit SELL): Did price go UP after exit?
         if (tradeType === 'SELL' && highAfter > exitPrice + 200) isStopHunt = true;
-        // If Short Trade (Exit BUY): Did price go DOWN after exit?
         if (tradeType === 'BUY' && lowAfter < exitPrice - 200) isStopHunt = true;
 
         if (isStopHunt) {
-            opinion = "⚠️ <b>BAD LUCK / STOP HUNT:</b> Price reversed in your favor shortly after hitting SL.<br>Suggestion: Consider a slightly wider SL or re-entry.";
-            color = "#fbbf24"; // Yellow
+            opinion = "⚠️ <b>BAD LUCK / STOP HUNT:</b> Price reversed in your favor shortly after hitting SL.";
+            color = "#fbbf24"; 
         } else {
             opinion = "✅ <b>GOOD EXIT:</b> Price continued against you after SL. You saved capital.";
-            color = "#4ade80"; // Green
+            color = "#4ade80"; 
         }
     } else {
         opinion = "🎉 <b>PROFITABLE TRADE:</b> Strategy worked.";
         color = "#4ade80";
     }
 
-    // Extract Snapshots (1min, 3min, 5min, 10min)
-    // Data is recorded every 5s. Index 12 = 1min, 36 = 3min, etc.
-    const snap1 = data[11] || data[data.length-1];
-    const snap3 = data[35] || data[data.length-1];
-    const snap5 = data[59] || data[data.length-1];
-    const snap10 = data[data.length-1];
+    // ✅ NEW SEARCH LOGIC: Find price closest to specific timestamps
+    // We look for the data point closest to: StartTime + 1 min, +3 min, etc.
+    function findPriceAt(minutes) {
+        if (!data || data.length === 0) return null;
+        const targetTime = startTime + (minutes * 60 * 1000);
+        
+        // Find closest match
+        let closest = data[0];
+        let minDiff = Math.abs(data[0].t - targetTime);
+
+        for (let i = 1; i < data.length; i++) {
+            const diff = Math.abs(data[i].t - targetTime);
+            if (diff < minDiff) {
+                minDiff = diff;
+                closest = data[i];
+            }
+        }
+        return closest;
+    }
+
+    const snap1 = findPriceAt(1);
+    const snap3 = findPriceAt(3);
+    const snap5 = findPriceAt(5);
+    const snap10 = findPriceAt(10);
 
     res.send(`
         <body style="background:#0f172a; color:white; font-family:sans-serif; padding:30px; display:flex; justify-content:center;">
             <div style="max-width:600px; width:100%; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #334155;">
-                <h2 style="color:#38bdf8; margin-top:0;">📊 Post-Trade Analysis</h2>
+                <h2 style="color:#38bdf8; margin-top:0;">📊 High-Precision Analysis</h2>
                 
                 <div style="background:${color}20; border-left:5px solid ${color}; padding:15px; border-radius:5px; margin-bottom:20px;">
                     <strong style="color:${color}; font-size:18px;">${opinion}</strong>
@@ -1319,14 +1318,15 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
 
                 <h4 style="color:#94a3b8; border-bottom:1px solid #334155; padding-bottom:5px;">Post-Exit Price Action (10 Mins)</h4>
                 <table style="width:100%; border-collapse:collapse; font-size:13px;">
-                    <tr style="color:#64748b; text-align:left;"><th>Time</th><th>Price</th><th>Movement</th></tr>
+                    <tr style="color:#64748b; text-align:left;"><th>Time Offset</th><th>Price</th><th>Movement</th></tr>
                     <tr><td>+1 Min</td><td>₹${snap1?.p || '-'}</td><td>${(snap1?.p - exitPrice).toFixed(0)}</td></tr>
                     <tr><td>+3 Min</td><td>₹${snap3?.p || '-'}</td><td>${(snap3?.p - exitPrice).toFixed(0)}</td></tr>
                     <tr><td>+5 Min</td><td>₹${snap5?.p || '-'}</td><td>${(snap5?.p - exitPrice).toFixed(0)}</td></tr>
                     <tr><td>+10 Min</td><td>₹${snap10?.p || '-'}</td><td>${(snap10?.p - exitPrice).toFixed(0)}</td></tr>
                 </table>
                 <br>
-                <div style="font-size:12px; color:#64748b;">
+                <div style="font-size:12px; color:#64748b; background:#0f172a; padding:10px; border-radius:5px;">
+                    <b>Session Stats:</b> ${data.length} ticks analyzed.<br>
                     Lowest after exit: ₹${lowAfter} <br>
                     Highest after exit: ₹${highAfter}
                 </div>
