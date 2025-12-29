@@ -215,7 +215,8 @@ let botState = {
     quantity: 0, 
     history: [],
     slOrderId: null,
-    isTradingEnabled: true // ✅ NEW: Toggle State
+    isTradingEnabled: true,
+    hiddenLogIds: [] // ✅ NEW: Stores IDs of deleted orders
 };
 
 // --- STATE MANAGEMENT ---
@@ -832,7 +833,18 @@ app.get('/toggle-trading', async (req, res) => {
 });
 
 app.get('/delete-log/:id', async (req, res) => {
-    botState.history = botState.history.filter(h => h.id !== req.params.id);
+    const idToRemove = req.params.id;
+    
+    // 1. Add to Blacklist (So Sync doesn't bring it back)
+    if (!botState.hiddenLogIds) botState.hiddenLogIds = []; // Safety check
+    botState.hiddenLogIds.push(idToRemove);
+
+    // 2. Remove from current history immediately
+    botState.history = botState.history.filter(h => h.id !== idToRemove);
+    
+    // 3. Recalculate PnL without this trade
+    botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
+
     await saveState();
     res.redirect('/');
 });
@@ -969,6 +981,8 @@ app.get('/', (req, res) => {
                 <div id="logContent">${displayLogs}</div>
             </div></body></html>`);
 });
+
+
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
 // --- SYNC PRICE (With PnL Calculation Engine) ---
@@ -976,6 +990,7 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SYNC PRICE (Preserves History & Dates) ---
 // --- SYNC PRICE (Complete: Replay, History Protection, & Manual Tagging) ---
 // --- SYNC PRICE (Filters Garbage & Tags Manual Orders) ---
+// --- SYNC PRICE (Complete: Filters, Tags, LTP Fallback & History) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
@@ -984,16 +999,18 @@ app.post('/sync-price', async (req, res) => {
         // 1. FETCH UPSTOX ORDERS (Today's Orders Only)
         const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
         
-        // Filter: Silver Only AND (Ignore Cancelled/Rejected)
+        // 2. FILTERING LOGIC
         const myOrders = (ordRes.data?.data || [])
-            .filter(o => o.instrument_token && o.instrument_token.includes("458305"))
-            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected') // ❌ THE FIX: Ignore junk
+            .filter(o => o.instrument_token && o.instrument_token.includes("458305")) // Silver Only
+            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected')         // Ignore Garbage
+            // ✅ PERMANENT DELETE SUPPORT (Ignore Blacklisted IDs)
+            .filter(o => !botState.hiddenLogIds || !botState.hiddenLogIds.includes(o.order_id)) 
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        // 2. REPLAY ENGINE: Calculate PnL for TODAY
+        // 3. REPLAY ENGINE: Calculate PnL for TODAY
         let openPos = { side: null, price: 0, qty: 0 };
         const processedLogs = [];
-        const todayStr = formatDate(getIST()); // Get Today's Date String
+        const todayStr = formatDate(getIST()); 
 
         myOrders.forEach(order => {
             const realPrice = parseFloat(order.average_price) || 0;
@@ -1022,10 +1039,7 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
 
-            // ✅ SMART TAGGING:
-            // 1. Trust the Tag from Upstox (if "API_BOT" exists).
-            // 2. If no Upstox tag, check our local memory.
-            // 3. If neither, assume it's MANUAL.
+            // ✅ SMART TAGGING (Preserve Tags)
             const existingLog = botState.history.find(h => h.id === order.order_id);
             const tag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
@@ -1039,29 +1053,25 @@ app.post('/sync-price', async (req, res) => {
                 id: order.order_id,
                 status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null,
-                tag: tag // ✅ Save the correct tag
+                tag: tag 
             });
         });
 
-        // 3. INTELLIGENT MERGE
+        // 4. INTELLIGENT MERGE (Preserve System & Old History)
         botState.history = botState.history.filter(h => {
-            // Keep System logs
             if (h.type === 'SYSTEM' || h.type === 'Autologin') return true;
-            // Keep Old History (Not Today)
-            if (h.date && h.date !== todayStr) return true;
-            // Keep Legacy Data
-            if (!h.date) return true;
-            // DELETE "Old" versions of Today's logs (to replace with fresh clean list)
-            return false; 
+            if (h.date && h.date !== todayStr) return true; // Keep Yesterday's data
+            if (!h.date) return true; // Keep Legacy data
+            return false; // Remove Today's old trade logs (replaced by fresh sync)
         });
 
         // Add Fresh "Today" Logs to the top
         botState.history = [...processedLogs, ...botState.history];
 
-        // 4. RECALCULATE TOTAL PNL
+        // 5. RECALCULATE TOTAL PNL
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 5. CHECK ACTIVE POSITION & RESTORE SL
+        // 6. CHECK ACTIVE POSITION & RESTORE SL
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
         const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
         
@@ -1071,7 +1081,7 @@ app.post('/sync-price', async (req, res) => {
             botState.quantity = qty;
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
             
-            // LTP FALLBACK
+            // ✅ LTP FALLBACK (From Script 5): If WebSocket is quiet, fetch API price
             let currentLtp = lastKnownLtp;
             if (!currentLtp || currentLtp === 0) {
                 try {
@@ -1090,6 +1100,7 @@ app.post('/sync-price', async (req, res) => {
             await manageExchangeSL(entrySide, botState.quantity, slPrice);
 
         } else { 
+            // Clean Reset if no position
             botState.positionType = null; 
             botState.currentStop = 0;
             botState.slOrderId = null;
@@ -1101,7 +1112,6 @@ app.post('/sync-price', async (req, res) => {
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
-
 
 const PORT = process.env.PORT || 10000;
 
