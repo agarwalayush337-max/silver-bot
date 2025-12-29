@@ -208,17 +208,58 @@ let globalATR = 800;
 let lastSlUpdateTime = 0; 
 
 let botState = { 
-    positionType: null, 
-    entryPrice: 0, 
-    currentStop: null, 
-    totalPnL: 0, 
-    quantity: 0, 
-    history: [],
-    slOrderId: null,
-    isTradingEnabled: true,
-    hiddenLogIds: [] // ✅ NEW: Stores IDs of deleted orders
+    positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0, 
+    history: [], slOrderId: null, isTradingEnabled: true, hiddenLogIds: [] 
 };
 
+// ✅ HELPER: Pair Detection (Finds matching Buy+Sell to highlight them)
+function getPairedLogs(logs) {
+    const pairedIds = new Set();
+    // Sort by time ascending to match pairs chronologically
+    const sorted = [...logs].sort((a,b) => new Date(a.time) - new Date(b.time)); 
+    
+    let openTrade = null;
+    sorted.forEach(log => {
+        if (log.status !== 'FILLED') return;
+        
+        if (!openTrade) {
+            openTrade = log;
+        } else {
+            // Check if opposite types (Buy vs Sell)
+            if ((openTrade.type === 'BUY' && log.type === 'SELL') || (openTrade.type === 'SELL' && log.type === 'BUY')) {
+                pairedIds.add(openTrade.id);
+                pairedIds.add(log.id);
+                openTrade = null; // Reset pair bucket
+            }
+        }
+    });
+    return pairedIds;
+}
+
+// ✅ HELPER: Generate Consistent Log HTML (Grid Layout Fix)
+function generateLogHTML(logs) {
+    const pairedIds = getPairedLogs(logs);
+
+    return logs.map(t => {
+        const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
+        const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌]</a>` : '';
+        const analyzeBtn = (t.pnl < 0 && t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍</a>` : '';
+        
+        // Highlight Logic: Dark gradient for paired trades
+        const isPaired = pairedIds.has(t.id);
+        const bgStyle = isPaired ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' : 'border-bottom:1px solid #334155;';
+
+        // CSS GRID: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr (Strict Column Widths)
+        return `<div style="display:grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
+            <span style="color:#94a3b8;">${t.time}</span> 
+            <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
+            <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span> 
+            <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
+            <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
+            <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${t.id || '-'}</span>
+        </div>`;
+    }).join('');
+}
 // --- STATE MANAGEMENT ---
 async function loadState() {
     try {
@@ -262,33 +303,22 @@ function pushToDashboard() {
     const hasPosition = botState.positionType && botState.positionType !== 'NONE';
     const pnlData = calculateLivePnL();
     
-    // Generate Log HTML on Server side for real-time updates
     const todayStr = formatDate(getIST());
-    const displayLogs = botState.history
-        .filter(t => t.date === todayStr && !t.type.includes('SYSTEM')) // Show ALL Today
-        .map(t => {
-            const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
-            const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌ REMOVE]</a>` : '';
-            const analyzeBtn = (t.pnl < 0 && t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
-            
-            return `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-                <span style="flex:1; color:#94a3b8;">${t.time}</span> 
-                <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-                <span style="flex:1; text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span> 
-                <span style="flex:1; text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
-                <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
-            </div>`;
-        }).join('');
+    // Filter Today's Logs (Removing System & Cancelled)
+    const todayLogs = botState.history.filter(t => t.date === todayStr && !t.type.includes('SYSTEM') && t.status !== 'CANCELLED');
+    
+    // Generate HTML using the Helper (Ensures Consistency)
+    const displayLogs = generateLogHTML(todayLogs);
 
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: pnlData.live,
-        historicalPnl: pnlData.history,
+        historicalPnl: pnlData.history, // Sent but not shown in main card anymore
         stop: hasPosition ? botState.currentStop : 0,
         slID: hasPosition ? botState.slOrderId : null,
         status: ACCESS_TOKEN ? "ONLINE" : "OFFLINE",
-        isTrading: botState.isTradingEnabled, // ✅ Send Toggle Status
-        logsHTML: displayLogs // ✅ Send Updated Logs
+        isTrading: botState.isTradingEnabled, 
+        logsHTML: displayLogs 
     });
     sseClients.forEach(c => { try { c.res.write(`data: ${data}\n\n`); } catch(e) {} });
 }
@@ -850,51 +880,15 @@ app.get('/delete-log/:id', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // 1. CALCULATE TODAY'S PNL
+    // 1. Calculate PnL
     const todayStr = formatDate(getIST()); 
     const todayLogs = botState.history.filter(h => h.date === todayStr);
     const todayPnL = todayLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
     const historyPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-    // 2. PREPARE LOGS (With Filters & Smart Buttons)
-    const displayLogs = todayLogs
-        .filter(t => 
-            !t.type.includes('SYSTEM') && 
-            t.status !== 'CANCELLED' &&  // ✅ Hides Cancelled
-            t.status !== 'REJECTED'      // ✅ Hides Rejected
-        ) 
-        .map(t => {
-            // ✅ LOGIC: Only show "Remove" if it is NOT an API Bot order
-            // (Old orders without tags count as Manual so you can clean them up)
-            const isManual = (t.tag !== 'API_BOT'); 
-            const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌ REMOVE]</a>` : '';
-            
-            // Show Analyze button only for Filled Losses
-            const showAnalyze = (t.pnl < 0 && t.status === 'FILLED'); 
-            const analyzeBtn = showAnalyze ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍 ANALYZE</a>` : '';
-
-            return `<div style="display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #334155; font-size:12px; align-items:center;">
-                <span style="flex:1; color:#94a3b8;">${t.time}</span> 
-                
-                <b style="flex:0.8; text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">
-                    ${t.type}
-                </b> 
-
-                <span style="flex:1; text-align:right; color:#cbd5e1;">
-                    ₹${t.orderedPrice || '-'}
-                </span> 
-
-                <span style="flex:1; text-align:right; font-weight:bold; color:white;">
-                    ₹${t.executedPrice || t.price || '-'}
-                </span> 
-                
-                <span style="flex:1; text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
-                    ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}
-                </span>
-
-                <span style="flex:1.5; text-align:right; color:#64748b; font-family:monospace;">${t.id || '-'}</span>
-            </div>`;
-        }).join('');
+    // 2. Prepare Logs using the Shared Helper (Ensures layout never breaks on refresh)
+    const cleanLogs = todayLogs.filter(t => !t.type.includes('SYSTEM') && t.status !== 'CANCELLED' && t.status !== 'REJECTED');
+    const displayLogs = generateLogHTML(cleanLogs);
 
     res.send(`
         <!DOCTYPE html><html style="background:#0f172a; color:white; font-family:sans-serif;">
@@ -908,9 +902,9 @@ app.get('/', (req, res) => {
                     document.getElementById('live-pnl').innerText = '₹' + d.pnl;
                     document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
                     
-                    document.getElementById('hist-pnl').innerText = '₹' + d.historicalPnl;
-                    document.getElementById('hist-pnl').style.color = parseFloat(d.historicalPnl) >= 0 ? '#4ade80' : '#f87171';
-
+                    // ✅ UPDATE BUTTON TEXT (Matches the new location)
+                    document.getElementById('hist-btn-pnl').innerText = 'Total: ₹' + d.historicalPnl;
+                    
                     document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
@@ -922,6 +916,7 @@ app.get('/', (req, res) => {
                     btn.innerText = d.isTrading ? "🟢 TRADING ON" : "🔴 PAUSED";
                     btn.style.background = d.isTrading ? "#22c55e" : "#ef4444";
 
+                    // ✅ UPDATE LOGS (This uses the same generateLogHTML logic from server)
                     if(d.logsHTML) document.getElementById('logContent').innerHTML = d.logsHTML;
                 };
             </script>
@@ -942,12 +937,7 @@ app.get('/', (req, res) => {
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">LIVE PNL</small><br><b id="live-pnl">₹${calculateLivePnL().live}</b></div>
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">HISTORICAL PNL</small><br><b id="hist-pnl">₹${historyPnL.toFixed(2)}</b></div>
-                </div>
-                
-                <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px; margin-bottom:15px;">
-                    <small style="color:#94a3b8;">TODAY'S NET PNL</small><br>
-                    <b id="todays-pnl" style="color:${todayPnL >= 0 ? '#4ade80' : '#f87171'}">₹${todayPnL.toFixed(2)}</b>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TODAY'S NET PNL</small><br><b id="todays-pnl" style="color:${todayPnL >= 0 ? '#4ade80' : '#f87171'}">₹${todayPnL.toFixed(2)}</b></div>
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
@@ -961,27 +951,29 @@ app.get('/', (req, res) => {
                 </div>
                 
                 <div style="margin-bottom:15px;">
-                    <a href="/reports" style="display:block; width:100%; padding:12px; background:#334155; color:white; text-align:center; border-radius:8px; text-decoration:none; font-weight:bold; border:1px solid #475569;">📊 VIEW HISTORICAL REPORTS</a>
+                    <a href="/reports" style="display:block; width:100%; padding:15px; background:#334155; color:white; text-align:center; border-radius:8px; text-decoration:none; border:1px solid #475569;">
+                        <b>📊 VIEW HISTORICAL REPORTS</b><br>
+                        <small id="hist-btn-pnl" style="color:${historyPnL>=0?'#4ade80':'#f87171'}">Total: ₹${historyPnL.toFixed(2)}</small>
+                    </a>
                 </div>
 
-                <div style="display:flex; gap:10px; margin-bottom:10px;">
-                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
-                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:10px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
+                <div style="display:flex; gap:10px; margin-bottom:20px;">
+                     <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:12px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
+                     <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:12px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
                 </div>
-                <form action="/reset-pnl" method="POST" style="margin-bottom:20px;"><button style="width:100%; padding:8px; background:#334155; color:#94a3b8; border:1px border-dashed #475569; border-radius:8px; cursor:pointer; font-size:12px;">❌ RESET HISTORICAL PNL (ONE TIME)</button></form>
                 
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; display:flex; justify-content:space-between; padding-bottom:5px; font-size:11px;">
-                    <span style="flex:1;">Time</span> 
-                    <span style="flex:0.8; text-align:center;">Type</span> 
-                    <span style="flex:1; text-align:right;">Ordered</span> 
-                    <span style="flex:1; text-align:right;">Actual</span> 
-                    <span style="flex:1; text-align:right;">PnL</span>
-                    <span style="flex:1.5; text-align:right;">Order ID</span>
-                </h4>
+                <div style="display:grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:5px 10px; color:#94a3b8; border-bottom:1px solid #334155; font-size:11px; margin-bottom:5px;">
+                    <span>Time</span> 
+                    <span style="text-align:center;">Type</span> 
+                    <span style="text-align:right;">Ordered</span> 
+                    <span style="text-align:right;">Actual</span> 
+                    <span style="text-align:right;">PnL</span>
+                    <span style="text-align:right;">Order ID</span>
+                </div>
+                
                 <div id="logContent">${displayLogs}</div>
             </div></body></html>`);
 });
-
 
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
@@ -1193,98 +1185,90 @@ app.get('/reports', (req, res) => {
 
 // --- 🔍 SL ANALYSIS ROUTE ---
 // --- 🔍 SL ANALYSIS ROUTE (Fixed for 12-Hour Times) ---
+// --- 🔍 SL ANALYSIS ROUTE (Fuzzy Match Fix) ---
 app.get('/analyze-sl/:orderId', async (req, res) => {
     const orderId = req.params.orderId;
     const trade = botState.history.find(h => h.id === orderId);
-    
     if (!trade) return res.send("Trade not found.");
-    
-    // 1. Fetch Market Data
-    const candles = await getMergedCandles();
-    if (candles.length === 0) return res.send("Insufficient market data for analysis.");
 
-    // 2. ROBUST DATE PARSING (Handles "8:00 PM" correctly)
+    const candles = await getMergedCandles();
+    if (candles.length === 0) return res.send("Insufficient market data.");
+
     let tradeTime;
     try {
-        // Attempt 1: Standard Parse
-        tradeTime = new Date(`${trade.date} ${trade.time}`);
-        
-        // Attempt 2: If Invalid, Parse 12-Hour format manually
-        if (isNaN(tradeTime.getTime())) {
-            const [timePart, modifier] = trade.time.split(' ');
-            let [hours, minutes] = timePart.split(':');
-            if (hours === '12') hours = '00';
-            if (modifier === 'PM') hours = parseInt(hours, 10) + 12;
-            tradeTime = new Date(`${trade.date}T${hours}:${minutes}:00`);
-        }
+        // Parse time carefully
+        const [timePart, modifier] = trade.time.split(' ');
+        let [hours, minutes] = timePart.split(':');
+        if (hours === '12') hours = '00';
+        if (modifier === 'PM') hours = parseInt(hours, 10) + 12;
+        tradeTime = new Date(`${trade.date}T${hours}:${minutes}:00`);
     } catch (e) { return res.send("Error parsing trade time."); }
 
     const slPrice = parseFloat(trade.executedPrice);
     
-    // 3. Find index of candle closest to exit
-    // We look for a candle within 5 mins of the trade
-    let exitIndex = candles.findIndex(c => Math.abs(new Date(c[0]) - tradeTime) < 5 * 60 * 1000);
-    
-    // If exact match not found, find the closest one AFTER the trade
-    if (exitIndex === -1) {
-        exitIndex = candles.findIndex(c => new Date(c[0]) > tradeTime);
-    }
+    // ✅ FUZZY SEARCH: Find candle closest to trade time (within 10 mins)
+    // We search through ALL candles to find the one with the smallest time difference
+    let bestCandle = null;
+    let minDiff = 10 * 60 * 1000; // 10 minutes max diff
+    let exitIndex = -1;
 
-    // Safety: If still not found or it's the very last candle
+    candles.forEach((c, index) => {
+        const cTime = new Date(c[0]);
+        const diff = Math.abs(cTime - tradeTime);
+        if (diff < minDiff) {
+            minDiff = diff;
+            bestCandle = c;
+            exitIndex = index;
+        }
+    });
+
     if (exitIndex === -1 || exitIndex >= candles.length - 1) {
          return res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
                 <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
-                    <h2 style="color:#fbbf24;">⏳ Data Pending</h2>
-                    <p>Could not locate the specific candle for <b>${trade.time}</b> in historical data yet.</p>
-                    <p>This happens if the trade is too recent or outside market hours.</p>
+                    <h2 style="color:#fbbf24;">⏳ Data Syncing...</h2>
+                    <p>The chart data for <b>${trade.time}</b> isn't fully ready yet.</p>
+                    <p>Please wait 5-10 minutes for the candle to close and try again.</p>
                     <a href="/" style="color:#94a3b8;">Back</a>
                 </div>
             </body>
         `);
     }
 
-    // 4. Analyze Next 3 Candles (15 Mins after SL)
+    // (Rest of Analysis Logic - Same as before)
     const nextCandles = candles.slice(exitIndex + 1, exitIndex + 4);
-    let analysis = "";
-    let suggestion = "";
-    let color = "";
+    const highestHigh = Math.max(...nextCandles.map(c => c[2])); 
+    const lowestLow = Math.min(...nextCandles.map(c => c[3])); 
+    const finalClose = nextCandles[nextCandles.length-1][4]; 
 
-    // LOGIC FOR SHORT POSITION (SL Triggered via Buy) - e.g., Your Screenshot
-    if (trade.type === 'BUY') { 
-        // You bought to exit a Short position
-        const maxAfter = Math.max(...nextCandles.map(c => c[2])); // Highest High
-        const minAfter = Math.min(...nextCandles.map(c => c[3])); // Lowest Low
+    let analysis = ""; let suggestion = ""; let color = ""; const buffer = 50; 
 
-        if (maxAfter > slPrice) {
-            analysis = "✅ <b>Good Exit:</b> Price continued to rise after your SL. You prevented a bigger loss.";
-            suggestion = "Strategy Correctness: 100%. The trend reversed against you.";
-            color = "#4ade80";
-        } else if (minAfter < slPrice - 150) {
-            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked up to hit your SL and immediately dropped back down.";
-            suggestion = "<b>Possible Fix:</b> Use ATR Trailing Stop to give the trade more room to breathe during volatility.";
-            color = "#fbbf24";
-        } else {
-            analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
-            color = "#cbd5e1";
-        }
-    }
-    // LOGIC FOR LONG POSITION (SL Triggered via Sell)
-    else if (trade.type === 'SELL') {
-        const minAfter = Math.min(...nextCandles.map(c => c[3]));
-        const maxAfter = Math.max(...nextCandles.map(c => c[2]));
-
-        if (minAfter < slPrice) {
+    if (trade.type === 'SELL') { 
+        if (highestHigh > slPrice + buffer) {
+            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit SL, then reversed UP.";
+            suggestion = "Consider using a wider 'ATR Stop' or waiting for candle close.";
+            color = "#fbbf24"; 
+        } else if (lowestLow < slPrice - buffer && finalClose < slPrice) {
             analysis = "✅ <b>Good Exit:</b> Price continued to drop. You saved capital.";
             suggestion = "Strategy Correctness: 100%.";
-            color = "#4ade80";
-        } else if (maxAfter > slPrice + 150) {
-            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price dipped to hit SL and reversed up.";
-            suggestion = "<b>Possible Fix:</b> Avoid placing SL exactly at round numbers or support levels.";
-            color = "#fbbf24";
+            color = "#4ade80"; 
         } else {
-            analysis = "⚖️ <b>Choppy Market:</b> Price stayed sideways.";
-            color = "#cbd5e1";
+            analysis = "⚖️ <b>Choppy / Neutral:</b> Price hovered around your SL.";
+            color = "#cbd5e1"; 
+        }
+    }
+    else if (trade.type === 'BUY') {
+        if (lowestLow < slPrice - buffer) {
+            analysis = "⚠️ <b>Stop Hunt / Fakeout:</b> Price spiked to hit SL, then dropped DOWN.";
+            suggestion = "Consider adding a small buffer (0.1%) to your SL.";
+            color = "#fbbf24"; 
+        } else if (highestHigh > slPrice + buffer && finalClose > slPrice) {
+            analysis = "✅ <b>Good Exit:</b> Price continued to rise. You saved capital.";
+            suggestion = "Strategy Correctness: 100%.";
+            color = "#4ade80"; 
+        } else {
+            analysis = "⚖️ <b>Choppy / Neutral:</b> Price hovered around your SL.";
+            color = "#cbd5e1"; 
         }
     }
 
@@ -1292,7 +1276,6 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
         <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px; text-align:center;">
             <div style="max-width:600px; margin:auto; background:#1e293b; padding:30px; border-radius:15px;">
                 <h2 style="color:#38bdf8;">🔍 Trade Analysis</h2>
-                <p><b>Trade ID:</b> ${orderId}</p>
                 <p><b>Exit Price:</b> ₹${slPrice}</p>
                 <div style="background:${color}20; border:1px solid ${color}; padding:20px; border-radius:10px; margin-top:20px;">
                     <p style="font-size:18px; color:${color}; margin:0;">${analysis}</p>
@@ -1300,7 +1283,7 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
                     <p style="color:#cbd5e1; font-size:14px;">${suggestion}</p>
                 </div>
                 <br>
-                <a href="/reports" style="color:#94a3b8;">Back to Reports</a>
+                <a href="/" style="color:#94a3b8;">Back to Dashboard</a>
             </div>
         </body>
     `);
