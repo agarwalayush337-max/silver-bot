@@ -1203,101 +1203,87 @@ app.post('/sync-price', async (req, res) => {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
         
-        // 2. Filter specifically for the ACTIVE contract and COMPLETED orders
+        // 2. Filter orders specifically for the ACTIVE contract
         const myOrders = (ordRes.data?.data || [])
             .filter(o => o.instrument_token && o.instrument_token.includes(activeToken)) 
-            .filter(o => o.status === 'complete') 
+            .filter(o => o.status !== 'cancelled' && o.status !== 'rejected')
+            .filter(o => !botState.hiddenLogIds || !botState.hiddenLogIds.includes(o.order_id)) 
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
 
-        let inventoryQty = 0;
-        let totalCost = 0;
+        let openPos = { side: null, price: 0, qty: 0 };
         const processedLogs = [];
+        const todayStr = formatDate(getIST()); 
 
-        // 3. 🧠 REPLAY ENGINE: Weighted Average Calculation
+        // 3. Replay Engine: Reconstruct trades to calculate PnL
         myOrders.forEach(order => {
-            // ✅ THE DATE FIX: Extract date/time from order_timestamp in IST
-            const orderDateObj = new Date(order.order_timestamp);
-            const tradeDate = orderDateObj.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '.'); 
-            const tradeTime = orderDateObj.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: true });
-
             const realPrice = parseFloat(order.average_price) || 0;
-            const filledQty = parseInt(order.filled_quantity) || 0;
+            const limitPrice = parseFloat(order.price) || 0;
+            const execTime = new Date(order.order_timestamp).toLocaleTimeString();
             const txnType = order.transaction_type; 
-            let tradePnL = null; 
+            const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
+            let tradePnL = 0; 
 
-            if (txnType === 'BUY') {
-                // Add to inventory pool
-                totalCost += (realPrice * filledQty);
-                inventoryQty += filledQty;
-            } 
-            else if (txnType === 'SELL' && inventoryQty > 0) {
-                // Calculate PnL against the weighted average cost
-                const avgEntry = totalCost / inventoryQty;
-                tradePnL = (realPrice - avgEntry) * filledQty;
-                
-                // Reduce inventory (assuming full exit for your current logic)
-                totalCost -= (avgEntry * filledQty);
-                inventoryQty -= filledQty;
+            if (order.status === 'complete') {
+                const qty = parseInt(order.quantity) || 1;
+                if (openPos.qty === 0) {
+                    openPos.side = txnType; openPos.price = realPrice; openPos.qty = qty;
+                } else if (openPos.side !== txnType) {
+                    if (openPos.side === 'BUY' && txnType === 'SELL') tradePnL = (realPrice - openPos.price) * openPos.qty;
+                    else if (openPos.side === 'SELL' && txnType === 'BUY') tradePnL = (openPos.price - realPrice) * openPos.qty;
+                    openPos.qty = 0; openPos.side = null; openPos.price = 0;
+                }
             }
 
-            // Preserve any manual analysis data if it exists in current history
+            // Restore metadata for the trade if it exists
             const existingLog = botState.history.find(h => h.id === order.order_id);
+            const preservedData = existingLog ? existingLog.analysisData : null;
+            const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
+
+            const tradeLog = {
+                date: todayStr, time: execTime, type: txnType, orderedPrice: limitPrice,
+                executedPrice: realPrice, id: order.order_id, status: status,
+                pnl: tradePnL !== 0 ? tradePnL : null, tag: preservedTag,
+                analysisData: preservedData 
+            };
             
-            processedLogs.unshift({
-                date: tradeDate, // ✅ Locked to actual trade day (30.12.2025)
-                time: tradeTime, 
-                type: txnType, 
-                orderedPrice: parseFloat(order.price) || 0,
-                executedPrice: realPrice, 
-                qty: filledQty,
-                id: order.order_id, 
-                status: "FILLED",
-                pnl: tradePnL, 
-                tag: order.tag || (existingLog ? existingLog.tag : "MANUAL"),
-                analysisData: existingLog ? existingLog.analysisData : null 
-            });
+            processedLogs.unshift(tradeLog);
+            if(db) saveTrade(tradeLog); 
         });
 
-        // 4. Update Global State
-        botState.history = processedLogs;
-        botState.totalPnL = processedLogs.reduce((acc, log) => acc + (log.pnl || 0), 0);
+        // 4. Merge system logs back into history
+        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || (h.date && h.date !== todayStr));
+        botState.history = [...processedLogs, ...botState.history];
+        botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 5. Portfolio Status Sync
-        const posRes = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { 
+        // 5. Update Position Status from Portfolio
+        const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { 
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
         });
-        const livePos = (posRes.data?.data || []).find(p => p.instrument_token?.includes(activeToken));
+        const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes(activeToken));
         
-        if (livePos && parseInt(livePos.quantity) !== 0) {
-            botState.positionType = parseInt(livePos.quantity) > 0 ? 'LONG' : 'SHORT';
-            botState.quantity = Math.abs(parseInt(livePos.quantity));
-            botState.entryPrice = parseFloat(livePos.buy_price) || parseFloat(livePos.average_price);
+        if (pos && parseInt(pos.quantity) !== 0) {
+            botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
+            botState.quantity = Math.abs(parseInt(pos.quantity));
+            botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
 
-            // Re-sync Stop Loss ID from Order Book
-            const openSL = (ordRes.data?.data || []).find(o => 
-                o.status === 'trigger pending' && 
-                o.order_type === 'SL-M' && 
-                o.instrument_token.includes(activeToken)
-            );
-            if (openSL) {
-                botState.currentStop = parseFloat(openSL.trigger_price);
-                botState.slOrderId = openSL.order_id;
+            const openOrders = ordRes.data?.data || [];
+            const existingSL = openOrders.find(o => o.status === 'trigger pending' && o.order_type === 'SL-M' && o.instrument_token.includes(activeToken));
+
+            if (existingSL) {
+                botState.currentStop = parseFloat(existingSL.trigger_price);
+                botState.slOrderId = existingSL.order_id;
+            } else {
+                const currentLtp = lastKnownLtp || botState.entryPrice;
+                botState.currentStop = botState.positionType === 'LONG' ? (currentLtp - 1200) : (currentLtp + 1200);
             }
         } else { 
-            botState.positionType = null; botState.quantity = 0; botState.currentStop = 0; botState.slOrderId = null;
+            botState.positionType = null; botState.currentStop = 0; botState.slOrderId = null; botState.quantity = 0;
         }
         
-        // 6. Finalize & Save
         if(db) await saveSettings();
-        pushToDashboard();
-        console.log(`✅ Sync Complete. Total PnL: ₹${botState.totalPnL}`);
-        res.redirect('/');
-    } catch (e) { 
-        console.error("❌ Sync Error:", e.response?.data || e.message);
-        res.status(500).send("Sync Failed");
-    }
+    } catch (e) { console.error("Sync Error:", e.message); }
+    res.redirect('/');
 });
-
 
 const PORT = process.env.PORT || 10000;
 
