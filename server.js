@@ -514,8 +514,21 @@ async function initWebSocket() {
                         const feed = object.feeds[key];
                         let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
-                        if (newPrice > 0 && (key.includes(botState.activeContract.split('|')[1]) || Object.keys(object.feeds).length === 1)) {
-                            lastKnownLtp = newPrice;
+                        // Inside currentWs.onmessage...
+                        if (newPrice > 0) {
+                            // Check if the update belongs to our ACTIVE contract
+                            // We use .includes() on the token part (the number) for safety
+                            const activeToken = botState.activeContract.split('|')[1]; 
+                            
+                            if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
+                                lastKnownLtp = newPrice;
+                                
+                                // ... rest of your tracking logic ...
+                                
+                                // This line prints the logs you see in Render
+                                console.log(`LTP: ${lastKnownLtp} | ${botState.contractName}`); 
+                            }
+                        }
                             // 1️⃣ LIVE TRADE TRACKING
                             if (botState.positionType) {
                                 let currentProfit = 0;
@@ -1481,10 +1494,8 @@ app.get('/switch-contract', async (req, res) => {
     const newId = req.query.id;
     const newName = req.query.name;
 
-    if (botState.positionType) {
-        console.log("⚠️ Switch Denied: Close active position first.");
-        return res.redirect('/?error=close_position');
-    }
+    // 🛑 TEMPORARILY REMOVED: Position check bypassed as requested
+    // if (botState.positionType) { ... }
 
     if (!newId || newId === botState.activeContract) return res.redirect('/');
 
@@ -1503,7 +1514,7 @@ app.get('/switch-contract', async (req, res) => {
     // 2. Update State
     botState.activeContract = newId;
     botState.contractName = newName;
-    lastKnownLtp = 0; // Reset price to prevent old price logic
+    lastKnownLtp = 0; 
 
     // 3. Log the change
     const sysLog = {
@@ -1520,7 +1531,7 @@ app.get('/switch-contract', async (req, res) => {
     };
     botState.history.unshift(sysLog);
 
-    // 4. Resubscribe
+    // 4. Resubscribe to new contract
     if (currentWs && currentWs.readyState === 1) {
         const subMsg = Buffer.from(JSON.stringify({ 
             guid: "sub-" + Date.now(), 
@@ -1534,6 +1545,5 @@ app.get('/switch-contract', async (req, res) => {
     console.log(`🔄 Contract Switched: ${oldName} ➡️ ${newName}`);
     res.redirect('/');
 });
-
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
