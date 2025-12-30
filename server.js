@@ -607,10 +607,14 @@ async function initWebSocket() {
                         }
                     }
                 }
-            } catch (e) { console.error("❌ Decode Logic Error:", e.message); }
+            } catch (e) { 
+                console.error("❌ Decode Logic Error:", e.message); 
+            }
         };
         currentWs.onclose = () => { currentWs = null; };
-    } catch (e) { currentWs = null; }
+    } catch (e) { 
+        currentWs = null; 
+    }
 }
 
 
