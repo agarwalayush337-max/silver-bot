@@ -519,8 +519,7 @@ async function initWebSocket() {
                             
                             if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
                                 lastKnownLtp = newPrice;
-                                console.log(`LTP: ${lastKnownLtp} | ${botState.contractName}`); 
-
+                        
                                 // 1️⃣ LIVE TRADE TRACKING
                                 if (botState.positionType) {
                                     let currentProfit = 0;
@@ -972,8 +971,8 @@ setInterval(async () => {
             const bL = Math.min(...l.slice(-11, -1));
 
             // 4. Detailed Indicator Log
-            console.log(`📊 [${botState.contractName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
-
+            const shortName = botState.contractName.replace("SILVER MIC ", ""); // Turns "SILVER MIC APRIL" into "APRIL"
+            console.log(`📊 [${shortName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
             // 5. Execute Signal Logic
             if (isMarketOpen() && !botState.positionType) {
                  const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
