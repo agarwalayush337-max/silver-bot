@@ -206,7 +206,8 @@ let botState = {
     entryPrice: 0, 
     currentStop: null, 
     totalPnL: 0, 
-    quantity: 0, 
+    quantity: 0,
+    maxTradeQty: 1,
     history: [], 
     slOrderId: null, 
     isTradingEnabled: true, 
@@ -217,7 +218,6 @@ let botState = {
     contractName: "SILVER MIC FEB"   // ✅ New field
 };
 
-const MAX_QUANTITY = 1;
 
 // --- 🔒 ENVIRONMENT VARIABLES ---
 const { UPSTOX_USER_ID, UPSTOX_PIN, UPSTOX_TOTP_SECRET, API_KEY, API_SECRET, REDIRECT_URI, REDIS_URL } = process.env;
@@ -276,10 +276,10 @@ function generateLogHTML(logs) {
         const isPaired = pairedIds.has(t.id);
         const bgStyle = isPaired ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' : 'border-bottom:1px solid #334155;';
 
-        return `<div style="display:grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
+        return `<div style="display:grid; grid-template-columns: 1.2fr 0.6fr 0.5fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
             <span style="color:#94a3b8;">${t.time}</span> 
             <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span> 
+            <span style="text-align:center; color:#cbd5e1;">${t.qty || 1}L</span> <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
             <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
             <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
             <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${t.id || '-'}</span>
@@ -522,18 +522,20 @@ async function initWebSocket() {
                         
                                 // 1️⃣ LIVE TRADE TRACKING
                                 if (botState.positionType) {
+                                    const tradeQty = botState.quantity || 1; // Use current trade quantity
                                     let currentProfit = 0;
-                                    if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * botState.quantity;
-                                    if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * botState.quantity;
+                                    if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * tradeQty;
+                                    if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * tradeQty;
                                     
                                     if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
-
+                                
                                     let newStop = botState.currentStop;
                                     let didChange = false;
                                     let trailingGap = globalATR * 1.5; 
-
-                                    if (currentProfit >= 1000) trailingGap = 500;
-                                    if (currentProfit >= 600) {
+                                
+                                    // ✅ Multiplied Rules: Profit thresholds scale with quantity
+                                    if (currentProfit >= (1000 * tradeQty)) trailingGap = 500;
+                                    if (currentProfit >= (600 * tradeQty)) {
                                         const costSL = botState.entryPrice;
                                         const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
                                         if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
@@ -995,14 +997,14 @@ setInterval(async () => {
 
                  if (isBuySignal) {
                      if (botState.isTradingEnabled) {
-                         await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
+                         await placeOrder("BUY", botState.maxTradeQty, lastKnownLtp);
                      } else {
                          console.log(`⚠️ SIGNAL DETECTED: BUY @ ${lastKnownLtp} (Paused)`);
                      }
                 } 
                 else if (isSellSignal) {
                     if (botState.isTradingEnabled) {
-                        await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
+                        await placeOrder("SELL", botState.maxTradeQty, lastKnownLtp);
                     } else {
                          console.log(`⚠️ SIGNAL DETECTED: SELL @ ${lastKnownLtp} (Paused)`);
                     }
@@ -1167,6 +1169,16 @@ app.get('/', (req, res) => {
                     </a>
                 </div>
 
+                <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:15px; border:1px solid #334155;">
+                    <form action="/update-qty" method="POST" style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="color:#94a3b8; font-size:14px;">TRADE QUANTITY:</span>
+                        <div style="display:flex; gap:5px;">
+                            <input type="number" name="qty" value="${botState.maxTradeQty}" min="1" max="10" 
+                                style="width:50px; background:#1e293b; color:white; border:1px solid #475569; padding:5px; border-radius:4px; text-align:center;">
+                            <button type="submit" style="background:#6366f1; color:white; border:none; padding:5px 10px; border-radius:4px; cursor:pointer; font-size:12px;">SET</button>
+                        </div>
+                    </form>
+                </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                      <form action="/trigger-login" method="POST" style="flex:1;"><button style="width:100%; padding:12px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer;">🤖 AUTO-LOGIN</button></form>
                      <form action="/sync-price" method="POST" style="flex:1;"><button style="width:100%; padding:12px; background:#fbbf24; color:#0f172a; border:none; border-radius:8px; cursor:pointer;">🔄 SYNC PRICE</button></form>
@@ -1540,6 +1552,16 @@ app.get('/switch-contract', async (req, res) => {
 
     await saveSettings();
     console.log(`🔄 Contract Switched: ${oldName} ➡️ ${newName}`);
+    res.redirect('/');
+});
+
+app.post('/update-qty', async (req, res) => {
+    const newQty = parseInt(req.body.qty);
+    if (newQty > 0 && newQty <= 10) {
+        botState.maxTradeQty = newQty;
+        if (db) await saveSettings();
+        console.log(`🔢 Next Trade Qty set to: ${newQty}`);
+    }
     res.redirect('/');
 });
 
