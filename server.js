@@ -448,7 +448,7 @@ async function manageExchangeSL(side, qty, triggerPrice) {
             product: "I", 
             validity: "DAY", 
             price: 0, 
-            instrument_token: INSTRUMENT_KEY, 
+            instrument_token: botState.activeContract,
             order_type: "SL-M", 
             transaction_type: side === "BUY" ? "SELL" : "BUY", 
             trigger_price: Math.round(triggerPrice), 
