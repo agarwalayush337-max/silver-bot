@@ -201,7 +201,13 @@ try {
 
 
 // --- ⚙️ CONFIGURATION ---
-const INSTRUMENT_KEY = "MCX_FO|458305"; 
+// Remove the old const INSTRUMENT_KEY
+let botState = { 
+    // ... existing properties ...
+    activeContract: "MCX_FO|458305", // Default: Feb Micro
+    contractName: "SILVER MIC FEB",
+    // ... existing properties ...
+}; 
 const MAX_QUANTITY = 1;
 
 // --- 🔒 ENVIRONMENT VARIABLES ---
@@ -489,11 +495,14 @@ async function initWebSocket() {
         currentWs.binaryType = "arraybuffer"; 
 
         currentWs.onopen = () => {
-            console.log("✅ WebSocket Connected! Subscribing...");
-            const binaryMsg = Buffer.from(JSON.stringify({ guid: "bot-" + Date.now(), method: "sub", data: { mode: "ltpc", instrumentKeys: [INSTRUMENT_KEY] } }));
+            console.log(`✅ WebSocket Connected! Subscribing to ${botState.activeContract}...`);
+            const binaryMsg = Buffer.from(JSON.stringify({ 
+                guid: "bot-" + Date.now(), 
+                method: "sub", 
+                data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
+            }));
             currentWs.send(binaryMsg);
         };
-
         currentWs.onmessage = async (msg) => {
             try {
                 if (!FeedResponse) return;
@@ -506,9 +515,8 @@ async function initWebSocket() {
                         const feed = object.feeds[key];
                         let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
-                        if (newPrice > 0 && (key.includes("458305") || Object.keys(object.feeds).length === 1)) {
+                        if (newPrice > 0 && (key.includes(botState.activeContract.split('|')[1]) || Object.keys(object.feeds).length === 1)) {
                             lastKnownLtp = newPrice;
-
                             // 1️⃣ LIVE TRADE TRACKING
                             if (botState.positionType) {
                                 let currentProfit = 0;
@@ -1103,10 +1111,23 @@ app.get('/', (req, res) => {
         <body style="display:flex; justify-content:center; padding:20px;">
             <div style="width:100%; max-width:650px; background:#1e293b; padding:25px; border-radius:15px;">
                 
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                    <h2 style="color:#38bdf8; margin:0;">🥈 Silver Prime Auto</h2>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <h2 style="color:#38bdf8; margin:0;">🥈 ${botState.contractName}</h2>
                     <a href="/toggle-trading" id="toggle-btn" style="padding:8px 15px; border-radius:8px; text-decoration:none; color:white; font-weight:bold; background:${botState.isTradingEnabled?'#22c55e':'#ef4444'}">
                         ${botState.isTradingEnabled?'🟢 TRADING ON':'🔴 PAUSED'}
+                    </a>
+                </div>
+
+                <div style="display:flex; gap:5px; margin-bottom:20px;">
+                    <a href="/switch-contract?id=MCX_FO|458305&name=SILVER MIC FEB" 
+                       style="flex:1; padding:8px; text-align:center; font-size:10px; border-radius:5px; text-decoration:none; 
+                       background:${botState.activeContract.includes('458305') ? '#6366f1' : '#334155'}; color:white; border:1px solid #475569;">
+                       FEB CONTRACT
+                    </a>
+                    <a href="/switch-contract?id=MCX_FO|466029&name=SILVER MIC APRIL" 
+                       style="flex:1; padding:8px; text-align:center; font-size:10px; border-radius:5px; text-decoration:none; 
+                       background:${botState.activeContract.includes('466029') ? '#6366f1' : '#334155'}; color:white; border:1px solid #475569;">
+                       APRIL CONTRACT
                     </a>
                 </div>
                 
@@ -1455,6 +1476,64 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
             </div>
         </body>
     `);
+});
+
+app.get('/switch-contract', async (req, res) => {
+    const newId = req.query.id;
+    const newName = req.query.name;
+
+    if (botState.positionType) {
+        console.log("⚠️ Switch Denied: Close active position first.");
+        return res.redirect('/?error=close_position');
+    }
+
+    if (!newId || newId === botState.activeContract) return res.redirect('/');
+
+    const oldName = botState.contractName;
+
+    // 1. Unsubscribe from old contract
+    if (currentWs && currentWs.readyState === 1) {
+        const unsubMsg = Buffer.from(JSON.stringify({ 
+            guid: "unsub-" + Date.now(), 
+            method: "unsub", 
+            data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
+        }));
+        currentWs.send(unsubMsg);
+    }
+
+    // 2. Update State
+    botState.activeContract = newId;
+    botState.contractName = newName;
+    lastKnownLtp = 0; // Reset price to prevent old price logic
+
+    // 3. Log the change
+    const sysLog = {
+        date: formatDate(getIST()),
+        time: getIST().toLocaleTimeString(),
+        type: "SYSTEM",
+        id: "SWITCH-" + Date.now().toString().slice(-4),
+        status: "CONTRACT_CHANGED",
+        pnl: 0,
+        tag: "MANUAL",
+        orderedPrice: 0,
+        executedPrice: 0,
+        reason: `Changed from ${oldName} to ${newName}`
+    };
+    botState.history.unshift(sysLog);
+
+    // 4. Resubscribe
+    if (currentWs && currentWs.readyState === 1) {
+        const subMsg = Buffer.from(JSON.stringify({ 
+            guid: "sub-" + Date.now(), 
+            method: "sub", 
+            data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
+        }));
+        currentWs.send(subMsg);
+    }
+
+    await saveSettings();
+    console.log(`🔄 Contract Switched: ${oldName} ➡️ ${newName}`);
+    res.redirect('/');
 });
 
 
