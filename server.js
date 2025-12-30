@@ -421,18 +421,18 @@ function pushToDashboard() {
 }
 
 // --- EXCHANGE SL MANAGEMENT ---
-// --- MANAGE EXCHANGE SL (With Error Details) ---
 async function manageExchangeSL(side, qty, triggerPrice) {
     if(!ACCESS_TOKEN) return;
 
-    // Safety: Ensure trigger price is valid
-    if (!triggerPrice || triggerPrice <= 0) {
-        console.error("❌ SL Failed: Invalid Trigger Price (" + triggerPrice + ")");
+    // ✅ Safety: Ensure trigger price is a whole number for MCX
+    const roundedTrigger = Math.round(triggerPrice);
+    if (!roundedTrigger || roundedTrigger <= 0) {
+        console.error("❌ SL Failed: Invalid Trigger Price (" + roundedTrigger + ")");
         return;
     }
 
     try {
-        // If an old SL exists, try to cancel it first (don't worry if it fails)
+        // If an old SL exists, try to cancel it first
         if (botState.slOrderId) {
             try {
                 await axios.delete(`https://api.upstox.com/v2/order/cancel?order_id=${botState.slOrderId}`, { 
@@ -441,26 +441,26 @@ async function manageExchangeSL(side, qty, triggerPrice) {
             } catch (ignore) {}
         }
         
-        console.log(`📝 Placing SL-M | Qty: ${qty} | Trigger: ${triggerPrice}`);
+        console.log(`📝 Placing SL-M | Qty: ${qty} | Trigger: ${roundedTrigger} (Rounded for MCX)`);
 
         const res = await axios.post("https://api.upstox.com/v2/order/place", {
             quantity: qty, 
             product: "I", 
             validity: "DAY", 
             price: 0, 
-            instrument_token: botState.activeContract,
+            instrument_token: botState.activeContract, // ✅ Dynamic Contract Support
             order_type: "SL-M", 
             transaction_type: side === "BUY" ? "SELL" : "BUY", 
-            trigger_price: Math.round(triggerPrice), 
+            trigger_price: roundedTrigger, 
             is_amo: false
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
         
-        botState.slOrderId = res.data.data.order_id;
+        // ✅ Correctly capture Order ID for tracking
+        botState.slOrderId = res.data?.data?.order_id || res.data?.order_id;
         console.log("✅ SL Placed Order ID:", botState.slOrderId);
-        await saveState();
+        await saveSettings();
 
     } catch (e) { 
-        // 🚨 PRINT THE REAL ERROR
         const errMsg = e.response?.data?.errors?.[0]?.message || e.message;
         console.error(`❌ Exchange SL Placement Failed: ${errMsg}`); 
     }
