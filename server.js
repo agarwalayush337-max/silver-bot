@@ -798,43 +798,31 @@ async function verifyOrderStatus(orderId, context) {
     return { status: 'TIMEOUT' };
 }
 // --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
+// --- 🚀 ROBUST V3 PLACE ORDER (Array Handling + Circuit Auto-Correction) ---
 async function placeOrder(type, qty, ltp) {
-    if (!ACCESS_TOKEN || !isApiAvailable()) return false;
-    if (!botState.isTradingEnabled) return false;
+    if (!ACCESS_TOKEN || !isApiAvailable() || !botState.isTradingEnabled) return false;
 
-    // 1. Calculate Buffer (0.3%) and Round to nearest 1.00 for MCX
-    const bufferPercent = 0.003; 
-    const bufferAmount = ltp * bufferPercent;
-    
-    // ✅ FIXED: Changed rounding from 0.05 to 1.00 for Silver Micro
-    const limitPrice = type === "BUY" 
-        ? Math.round(ltp + bufferAmount)  
-        : Math.round(ltp - bufferAmount);
+    // 1. Calculate Initial 0.3% Buffer (Rounded to Whole Number for MCX)
+    const bufferAmount = ltp * 0.003;
+    let limitPrice = type === "BUY" ? Math.round(ltp + bufferAmount) : Math.round(ltp - bufferAmount);
 
-    // 2. Clear Intent Log
-    console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit Trigger: ₹${limitPrice}`);
+    console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit: ₹${limitPrice}`);
 
     const logId = "PENDING";
     botState.history.unshift({ 
-        date: formatDate(getIST()), 
-        time: getIST().toLocaleTimeString(), 
-        type: type, 
-        orderedPrice: ltp, 
-        executedPrice: 0, 
-        id: logId, 
-        status: "SENT", 
-        tag: "API_BOT" 
+        date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
+        type: type, orderedPrice: ltp, executedPrice: 0, id: logId, status: "SENT", tag: "API_BOT" 
     });
     pushToDashboard();
 
     try {
-        // 3. V3 Order Placement (Handles v3 Response Path)
+        // 2. PRIMARY ATTEMPT: Send Order to Upstox V3
         const res = await axios.post("https://api.upstox.com/v3/order/place", {
             quantity: qty, 
             product: "I", 
             validity: "DAY", 
-            price: limitPrice, 
-            instrument_token: botState.activeContract,
+            price: limitPrice,
+            instrument_token: botState.activeContract, 
             order_type: "LIMIT", 
             transaction_type: type, 
             disclosed_quantity: 0, 
@@ -843,12 +831,15 @@ async function placeOrder(type, qty, ltp) {
             tag: "API_BOT"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
-        // ✅ FIXED: V3 response parsing
-        const orderId = res.data?.data?.order_id || res.data?.order_id; 
-        
-        if (!orderId) throw new Error("No Order ID returned from Upstox API");
+        // ✅ THE V3 FIX: Capture ID from the plural "order_ids" array
+        let orderId = res.data?.data?.order_ids?.[0] || res.data?.data?.order_id || res.data?.order_id;
 
-        // 4. Confirmation Wait (Robust Loop)
+        if (!orderId) {
+            console.error("❌ ID Captured Failed. Response Body:", JSON.stringify(res.data));
+            throw new Error("No Order ID found in Upstox response.");
+        }
+
+        // 3. START ROBUST VERIFICATION
         const result = await verifyOrderStatus(orderId, 'ENTRY');
 
         if (result.status === 'FILLED') {
@@ -863,19 +854,44 @@ async function placeOrder(type, qty, ltp) {
             await saveSettings();
             await manageExchangeSL(type, qty, slPrice); 
             return true;
-        } 
+        }
         return false;
 
     } catch (e) {
         const errorDetail = e.response?.data?.errors?.[0]?.message || e.message;
-        console.error(`❌ [FAILURE] Order Request Rejected: ${errorDetail}`);
+
+        // 🛡️ CIRCUIT BREACH AUTO-RECOVERY
+        // Scans the error message for "High Price Range:XXXXX.XX" to set the max possible bid
+        const highMatch = errorDetail.match(/High Price Range:(\d+\.?\d*)/);
+        const lowMatch = errorDetail.match(/Low Price Range:(\d+\.?\d*)/);
+
+        if (errorDetail.includes("Circuit breach") && (highMatch || lowMatch)) {
+            const circuitLimitPrice = type === "BUY" ? Math.floor(parseFloat(highMatch[1])) : Math.ceil(parseFloat(lowMatch[1]));
+            
+            console.error(`⚠️ Circuit Breach! Auto-adjusting to Limit: ₹${circuitLimitPrice}`);
+            
+            // SECOND ATTEMPT: Place order at exact circuit limit provided by RMS
+            try {
+                const res2 = await axios.post("https://api.upstox.com/v3/order/place", {
+                    quantity: qty, product: "I", validity: "DAY", price: circuitLimitPrice,
+                    instrument_token: botState.activeContract, order_type: "LIMIT", 
+                    transaction_type: type, tag: "API_BOT"
+                }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
+
+                let orderId2 = res2.data?.data?.order_ids?.[0] || res2.data?.data?.order_id;
+                return await verifyOrderStatus(orderId2, 'ENTRY');
+            } catch (err2) {
+                console.error("❌ Final Circuit Retry Failed:", err2.message);
+            }
+        }
+
+        console.error(`❌ [FAILURE] Order Rejected: ${errorDetail}`);
         botState.positionType = null;
         pushToDashboard();
         await saveSettings();
         return false;
     }
 }
-
 // --- TOKEN VALIDATION HELPER ---
 // ✅ UPDATED: REAL TOKEN VALIDATION
 async function validateToken() {
@@ -1174,6 +1190,7 @@ app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/')
 // --- SMART SYNC (PnL Replay + Data Protection) ---
 // --- SMART SYNC (Full Replay Engine + Dynamic Contract Support) ---
 // --- 🔄 FULL SMART SYNC (PnL Replay Engine + Multi-Contract Support) ---
+// --- 🔄 FULL SMART SYNC (PnL Replay Engine + Multi-Contract Support) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
@@ -1203,28 +1220,28 @@ app.post('/sync-price', async (req, res) => {
             const execTime = new Date(order.order_timestamp).toLocaleTimeString();
             const txnType = order.transaction_type; 
             const status = order.status === 'complete' ? 'FILLED' : order.status.toUpperCase();
+            const filledQty = parseInt(order.filled_quantity) || 0;
             let tradePnL = 0; 
 
-            if (order.status === 'complete') {
-                const qty = parseInt(order.quantity) || 1;
-                // If no open position, this is the entry
+            if (order.status === 'complete' && filledQty > 0) {
+                // If no open position in replay, this is the entry
                 if (openPos.qty === 0) {
                     openPos.side = txnType; 
                     openPos.price = realPrice; 
-                    openPos.qty = qty;
+                    openPos.qty = filledQty;
                 } 
-                // If opposite side, this is an exit -> Calculate PnL
+                // If opposite side, calculate PnL using the weighted average
                 else if (openPos.side !== txnType) {
                     if (openPos.side === 'BUY' && txnType === 'SELL') {
-                        tradePnL = (realPrice - openPos.price) * openPos.qty;
+                        tradePnL = (realPrice - openPos.price) * filledQty;
                     } else if (openPos.side === 'SELL' && txnType === 'BUY') {
-                        tradePnL = (openPos.price - realPrice) * openPos.qty;
+                        tradePnL = (openPos.price - realPrice) * filledQty;
                     }
                     openPos.qty = 0; openPos.side = null; openPos.price = 0;
                 }
             }
 
-            // 4. PRESERVE DATA: Keep metadata for the trade if it already exists
+            // 4. PRESERVE DATA: Don't overwrite existing analysis metadata
             const existingLog = botState.history.find(h => h.id === order.order_id);
             const preservedData = existingLog ? existingLog.analysisData : null;
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
@@ -1235,6 +1252,7 @@ app.post('/sync-price', async (req, res) => {
                 type: txnType, 
                 orderedPrice: limitPrice,
                 executedPrice: realPrice, 
+                qty: filledQty,
                 id: order.order_id, 
                 status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null, 
@@ -1251,7 +1269,7 @@ app.post('/sync-price', async (req, res) => {
         botState.history = [...processedLogs, ...botState.history];
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 6. PORTFOLIO SYNC: Check actual live position
+        // 6. PORTFOLIO SYNC: Check actual live position to sync Dashboard
         const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { 
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
         });
@@ -1269,18 +1287,17 @@ app.post('/sync-price', async (req, res) => {
             if (existingSL) {
                 botState.currentStop = parseFloat(existingSL.trigger_price);
                 botState.slOrderId = existingSL.order_id;
-            } else {
-                const currentLtp = lastKnownLtp || botState.entryPrice;
-                botState.currentStop = botState.positionType === 'LONG' ? (currentLtp - 1200) : (currentLtp + 1200);
             }
         } else { 
             botState.positionType = null; botState.currentStop = 0; botState.slOrderId = null; botState.quantity = 0;
         }
         
         if(db) await saveSettings();
+        pushToDashboard();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
+
 
 const PORT = process.env.PORT || 10000;
 
