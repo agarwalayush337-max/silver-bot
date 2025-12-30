@@ -922,91 +922,85 @@ setInterval(() => {
 }, 60000);
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Watcher & Entry) ---
+// --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
 setInterval(async () => {
-    // 1. Safety Checks
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
   
-    // 2. WebSocket Watchdog
+    // 1. WebSocket Watchdog: Reconnect if dropped
     if ((lastKnownLtp === 0 || !currentWs) && ACCESS_TOKEN) {
         initWebSocket();
         return; 
     }
 
     try {
-        // 3. Get Data
-        const candles = await getMergedCandles();
+        // 2. Fetch Candle Data for ACTIVE contract
+        const today = new Date();
+        const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
+        const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
+        const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
+
+        const [histRes, intraRes] = await Promise.all([
+            axios.get(urlHistory, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } }).catch(e => ({ data: { data: { candles: [] } } })),
+            axios.get(urlIntraday, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } }).catch(e => ({ data: { data: { candles: [] } } }))
+        ]);
+
+        const mergedMap = new Map();
+        (histRes.data?.data?.candles || []).forEach(c => mergedMap.set(c[0], c));
+        (intraRes.data?.data?.candles || []).forEach(c => mergedMap.set(c[0], c));
+        const candles = Array.from(mergedMap.values()).sort((a, b) => new Date(a[0]) - new Date(b[0]));
+
         if (candles.length > 200) {
-            // Extract Data
             const cl = candles.map(c => c[4]);
             const h = candles.map(c => c[2]);
             const l = candles.map(c => c[3]);
             const v = candles.map(c => c[5]);
 
-            // Calculate Indicators
+            // 3. Indicator Calculations
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
             
-            // Get Current Values
             const curE50 = e50[e50.length-1];
             const curE200 = e200[e200.length-1];
             const curV = v[v.length-1];
             const curAvgV = vAvg[vAvg.length-1];
-            const curA = atr[atr.length-1];
+            globalATR = atr[atr.length-1]; 
             
-            // Calculate Breakout Levels
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
 
-            // Update Global ATR for Trailing SL
-            globalATR = curA; 
+            // 4. Detailed Indicator Log
+            console.log(`📊 [${botState.contractName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
 
-            // 4. Regular Log (Clean, looks exactly like before)
-            console.log(`LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
-
-            // 5. TRADING LOGIC
-            // ✅ We check for signals FIRST, ignoring the 'Pause' switch for now
+            // 5. Execute Signal Logic
             if (isMarketOpen() && !botState.positionType) {
-                 
-                 // Define the Buy/Sell Conditions
                  const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
                  const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
 
-                 // Act on Signals
                  if (isBuySignal) {
-                     // NOW we check the switch
                      if (botState.isTradingEnabled) {
-                         // Switch ON: Execute Order
-                         botState.positionType = 'LONG'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                         botState.currentStop = lastKnownLtp - (curA * 1.5); 
-                         await saveState(); 
                          await placeOrder("BUY", MAX_QUANTITY, lastKnownLtp);
                      } else {
-                         // Switch OFF: Log Warning only
-                         console.log(`⚠️ FOUND BUY SIGNAL @ ${lastKnownLtp} -> SKIPPED (Trading Paused in Dashboard)`);
+                         console.log(`⚠️ SIGNAL DETECTED: BUY @ ${lastKnownLtp} (Paused)`);
                      }
                 } 
                 else if (isSellSignal) {
                     if (botState.isTradingEnabled) {
-                        // Switch ON: Execute Order
-                        botState.positionType = 'SHORT'; botState.entryPrice = lastKnownLtp; botState.quantity = MAX_QUANTITY; 
-                        botState.currentStop = lastKnownLtp + (curA * 1.5); 
-                        await saveState(); 
                         await placeOrder("SELL", MAX_QUANTITY, lastKnownLtp);
                     } else {
-                         // Switch OFF: Log Warning only
-                         console.log(`⚠️ FOUND SELL SIGNAL @ ${lastKnownLtp} -> SKIPPED (Trading Paused in Dashboard)`);
+                         console.log(`⚠️ SIGNAL DETECTED: SELL @ ${lastKnownLtp} (Paused)`);
                     }
                 }
             } 
         }
     } catch (e) { 
-        // Auto-login trigger if token expires
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
 }, 30000);
+
+
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -1180,17 +1174,21 @@ app.get('/', (req, res) => {
 app.post('/trigger-login', (req, res) => { performAutoLogin(); res.redirect('/'); });
 
 // --- SMART SYNC (PnL Replay + Data Protection) ---
+// --- SMART SYNC (Full Replay Engine + Dynamic Contract Support) ---
 app.post('/sync-price', async (req, res) => {
     if (!ACCESS_TOKEN) return res.redirect('/');
     try {
-        console.log("🔄 Syncing & Recalculating PnL...");
+        console.log(`🔄 Syncing & Recalculating PnL for ${botState.contractName}...`);
+        const activeToken = botState.activeContract.split('|')[1]; 
+
+        // 1. Fetch all orders from Upstox
+        const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { 
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        });
         
-        // 1. Fetch from Upstox
-        const ordRes = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
-        
-        // 2. Filter & Sort
+        // 2. Filter orders specifically for the ACTIVE contract
         const myOrders = (ordRes.data?.data || [])
-            .filter(o => o.instrument_token && o.instrument_token.includes("458305")) 
+            .filter(o => o.instrument_token && o.instrument_token.includes(activeToken)) 
             .filter(o => o.status !== 'cancelled' && o.status !== 'rejected')
             .filter(o => !botState.hiddenLogIds || !botState.hiddenLogIds.includes(o.order_id)) 
             .sort((a, b) => new Date(a.order_timestamp) - new Date(b.order_timestamp));
@@ -1199,7 +1197,7 @@ app.post('/sync-price', async (req, res) => {
         const processedLogs = [];
         const todayStr = formatDate(getIST()); 
 
-        // 3. Replay Engine (Calculates PnL)
+        // 3. Replay Engine: Reconstruct trades to calculate PnL
         myOrders.forEach(order => {
             const realPrice = parseFloat(order.average_price) || 0;
             const limitPrice = parseFloat(order.price) || 0;
@@ -1219,7 +1217,7 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
 
-            // Preserve Data & Tags
+            // Restore metadata for the trade if it exists
             const existingLog = botState.history.find(h => h.id === order.order_id);
             const preservedData = existingLog ? existingLog.analysisData : null;
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
@@ -1232,32 +1230,27 @@ app.post('/sync-price', async (req, res) => {
             };
             
             processedLogs.unshift(tradeLog);
-            if(db) saveTrade(tradeLog); // 🔥 Firebase Background Save
+            if(db) saveTrade(tradeLog); 
         });
 
-        // 4. Merge with History
-        botState.history = botState.history.filter(h => {
-            if (h.type === 'SYSTEM' || h.type === 'Autologin') return true; 
-            if (h.date && h.date !== todayStr) return true; 
-            if (!h.date) return true; 
-            return false; 
-        });
-        
+        // 4. Merge system logs back into history
+        botState.history = botState.history.filter(h => h.type === 'SYSTEM' || (h.date && h.date !== todayStr));
         botState.history = [...processedLogs, ...botState.history];
         botState.totalPnL = botState.history.reduce((acc, log) => acc + (log.pnl || 0), 0);
 
-        // 5. Check Position & SL
-        const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }});
-        const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes("458305"));
+        // 5. Update Position Status from Portfolio
+        const posResponse = await axios.get('https://api.upstox.com/v2/portfolio/short-term-positions', { 
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+        });
+        const pos = (posResponse.data?.data || []).find(p => p.instrument_token && p.instrument_token.includes(activeToken));
         
         if (pos && parseInt(pos.quantity) !== 0) {
             botState.positionType = parseInt(pos.quantity) > 0 ? 'LONG' : 'SHORT';
             botState.quantity = Math.abs(parseInt(pos.quantity));
             botState.entryPrice = parseFloat(pos.buy_price) || parseFloat(pos.average_price);
-            if (!botState.maxRunUp) botState.maxRunUp = 0;
 
             const openOrders = ordRes.data?.data || [];
-            const existingSL = openOrders.find(o => o.status === 'trigger pending' && o.order_type === 'SL-M' && o.instrument_token.includes("458305"));
+            const existingSL = openOrders.find(o => o.status === 'trigger pending' && o.order_type === 'SL-M' && o.instrument_token.includes(activeToken));
 
             if (existingSL) {
                 botState.currentStop = parseFloat(existingSL.trigger_price);
@@ -1267,10 +1260,10 @@ app.post('/sync-price', async (req, res) => {
                 botState.currentStop = botState.positionType === 'LONG' ? (currentLtp - 1200) : (currentLtp + 1200);
             }
         } else { 
-            botState.positionType = null; botState.currentStop = 0; botState.slOrderId = null; botState.quantity = 0; botState.maxRunUp = 0;
+            botState.positionType = null; botState.currentStop = 0; botState.slOrderId = null; botState.quantity = 0;
         }
         
-        if(db) await saveSettings(); // 🔥 Save Settings
+        if(db) await saveSettings();
     } catch (e) { console.error("Sync Error:", e.message); }
     res.redirect('/');
 });
