@@ -674,8 +674,8 @@ async function performAutoLogin() {
 async function getMergedCandles() {
     const today = new Date();
     const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
-    const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5`;
-    const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(INSTRUMENT_KEY)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
+    const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
+    const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
 
     try {
         const [histRes, intraRes] = await Promise.all([
@@ -810,7 +810,7 @@ async function placeOrder(type, qty, ltp) {
             product: "I", 
             validity: "DAY", 
             price: ltp, 
-            instrument_token: INSTRUMENT_KEY,
+            instrument_token: botState.activeContract,
             order_type: "LIMIT", 
             transaction_type: type, 
             disclosed_quantity: 0, 
