@@ -533,7 +533,7 @@ async function initWebSocket() {
                                     let didChange = false;
                                     let trailingGap = globalATR * 1.5; 
                                 
-                                    // ✅ Multiplied Rules: Profit thresholds scale with quantity
+                                    const tradeQty = botState.quantity || 1; // Add this line
                                     if (currentProfit >= (1000 * tradeQty)) trailingGap = 500;
                                     if (currentProfit >= (600 * tradeQty)) {
                                         const costSL = botState.entryPrice;
