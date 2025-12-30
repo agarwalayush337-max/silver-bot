@@ -514,96 +514,79 @@ async function initWebSocket() {
                         const feed = object.feeds[key];
                         let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
-                        // Inside currentWs.onmessage...
                         if (newPrice > 0) {
-                            // Check if the update belongs to our ACTIVE contract
-                            // We use .includes() on the token part (the number) for safety
                             const activeToken = botState.activeContract.split('|')[1]; 
                             
                             if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
                                 lastKnownLtp = newPrice;
-                                
-                                // ... rest of your tracking logic ...
-                                
-                                // This line prints the logs you see in Render
                                 console.log(`LTP: ${lastKnownLtp} | ${botState.contractName}`); 
-                            }
-                        }
-                            // 1️⃣ LIVE TRADE TRACKING
-                            if (botState.positionType) {
-                                let currentProfit = 0;
-                                if (botState.positionType === 'LONG') currentProfit = newPrice - botState.entryPrice;
-                                if (botState.positionType === 'SHORT') currentProfit = botState.entryPrice - newPrice;
-                                
-                                if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
 
-                                // Trailing SL Logic
-                                let newStop = botState.currentStop;
-                                let didChange = false;
-                                let trailingGap = globalATR * 1.5; 
-
-                                if (currentProfit >= 1000) trailingGap = 500;
-                                if (currentProfit >= 600) {
-                                    const costSL = botState.entryPrice;
-                                    const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
-                                    if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
-                                }
-
-                                if (botState.positionType === 'LONG') {
-                                    const trailingLevel = newPrice - trailingGap;
-                                    if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
-                                } else {
-                                    const trailingLevel = newPrice + trailingGap;
-                                    if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
-                                }
-
-                                if (didChange) {
-                                    botState.currentStop = newStop;
-                                    pushToDashboard(); 
-                                    modifyExchangeSL(newStop);
-                                }
-                                
-                                if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
-                                    (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
-                                     verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
-                                }
-                            }
-
-                            // ------------------------------------------------------
-                            // 2️⃣ POST-TRADE MONITORING (EVERY TICK - NO THROTTLE)
-                            // ------------------------------------------------------
-                            const now = Date.now();
-                            for (const oid in botState.activeMonitors) {
-                                const session = botState.activeMonitors[oid];
-                                
-                                // ✅ CAPTURE EVERY SINGLE UPDATE
-                                // We store timestamp as raw milliseconds to make searching easier later
-                                session.data.push({ t: now, p: newPrice });
+                                // 1️⃣ LIVE TRADE TRACKING
+                                if (botState.positionType) {
+                                    let currentProfit = 0;
+                                    if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * botState.quantity;
+                                    if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * botState.quantity;
                                     
-                                // Update Min/Max seen AFTER exit
-                                if (newPrice > session.highestAfterExit) session.highestAfterExit = newPrice;
-                                if (newPrice < session.lowestAfterExit) session.lowestAfterExit = newPrice;
+                                    if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
 
-                                // STOP after 10 Minutes
-                                if (now - session.startTime > 600000) {
-                                    console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
-                                    
-                                    const logIndex = botState.history.findIndex(h => h.id === oid);
-                                    if (logIndex !== -1) {
-                                        botState.history[logIndex].analysisData = {
-                                            maxRunUp: session.maxRunUp,
-                                            startTime: session.startTime, 
-                                            data: session.data,        
-                                            highAfter: session.highestAfterExit,
-                                            lowAfter: session.lowestAfterExit
-                                        };
-                                        await saveTrade(botState.history[logIndex]); // 🔥 Save Huge Data to Firebase
+                                    let newStop = botState.currentStop;
+                                    let didChange = false;
+                                    let trailingGap = globalATR * 1.5; 
+
+                                    if (currentProfit >= 1000) trailingGap = 500;
+                                    if (currentProfit >= 600) {
+                                        const costSL = botState.entryPrice;
+                                        const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
+                                        if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
                                     }
-                                    delete botState.activeMonitors[oid]; 
+
+                                    if (botState.positionType === 'LONG') {
+                                        const trailingLevel = newPrice - trailingGap;
+                                        if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
+                                    } else {
+                                        const trailingLevel = newPrice + trailingGap;
+                                        if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
+                                    }
+
+                                    if (didChange) {
+                                        botState.currentStop = newStop;
+                                        pushToDashboard(); 
+                                        modifyExchangeSL(newStop);
+                                    }
+                                    
+                                    if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
+                                        (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
+                                         verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                                    }
                                 }
+
+                                // 2️⃣ POST-TRADE MONITORING
+                                const now = Date.now();
+                                for (const oid in botState.activeMonitors) {
+                                    const session = botState.activeMonitors[oid];
+                                    session.data.push({ t: now, p: newPrice });
+                                        
+                                    if (newPrice > session.highestAfterExit) session.highestAfterExit = newPrice;
+                                    if (newPrice < session.lowestAfterExit) session.lowestAfterExit = newPrice;
+
+                                    if (now - session.startTime > 600000) {
+                                        console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
+                                        const logIndex = botState.history.findIndex(h => h.id === oid);
+                                        if (logIndex !== -1) {
+                                            botState.history[logIndex].analysisData = {
+                                                maxRunUp: session.maxRunUp,
+                                                startTime: session.startTime, 
+                                                data: session.data,        
+                                                highAfter: session.highestAfterExit,
+                                                lowAfter: session.lowestAfterExit
+                                            };
+                                            await saveTrade(botState.history[logIndex]);
+                                        }
+                                        delete botState.activeMonitors[oid]; 
+                                    }
+                                }
+                                pushToDashboard(); 
                             }
-                            
-                            pushToDashboard(); 
                         }
                     }
                 }
