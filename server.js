@@ -798,24 +798,22 @@ async function verifyOrderStatus(orderId, context) {
     return { status: 'TIMEOUT' };
 }
 // --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
-// --- 🚀 UPDATED PLACE ORDER: With 0.3% Buffer & Trigger Log ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     if (!botState.isTradingEnabled) return false;
 
-    // ✅ STEP 1: Calculate Buffer (0.3%) for Limit Price
-    // For BUY: We bid 0.3% HIGHER to ensure immediate fill
-    // For SELL: We bid 0.3% LOWER to ensure immediate fill
+    // 1. Calculate Buffer (0.3%) and Round to nearest 1.00 for MCX
     const bufferPercent = 0.003; 
     const bufferAmount = ltp * bufferPercent;
+    
+    // ✅ FIXED: Changed rounding from 0.05 to 1.00 for Silver Micro
     const limitPrice = type === "BUY" 
-        ? Math.round((ltp + bufferAmount) * 20) / 20  // Round to nearest 0.05
-        : Math.round((ltp - bufferAmount) * 20) / 20;
+        ? Math.round(ltp + bufferAmount)  
+        : Math.round(ltp - bufferAmount);
 
-    // ✅ STEP 2: LOG INTENT (As requested: LTP and Trigger Price)
+    // 2. Clear Intent Log
     console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit Trigger: ₹${limitPrice}`);
 
-    // Initialize Log (PENDING)
     const logId = "PENDING";
     botState.history.unshift({ 
         date: formatDate(getIST()), 
@@ -830,12 +828,12 @@ async function placeOrder(type, qty, ltp) {
     pushToDashboard();
 
     try {
-        // ✅ STEP 3: SEND ORDER (Using Calculated Limit Price)
+        // 3. V3 Order Placement (Handles v3 Response Path)
         const res = await axios.post("https://api.upstox.com/v3/order/place", {
             quantity: qty, 
             product: "I", 
             validity: "DAY", 
-            price: limitPrice, // Using buffer price here
+            price: limitPrice, 
             instrument_token: botState.activeContract,
             order_type: "LIMIT", 
             transaction_type: type, 
@@ -845,11 +843,12 @@ async function placeOrder(type, qty, ltp) {
             tag: "API_BOT"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
-        const orderId = res.data?.data?.order_id || res.data?.order_id;
+        // ✅ FIXED: V3 response parsing
+        const orderId = res.data?.data?.order_id || res.data?.order_id; 
         
         if (!orderId) throw new Error("No Order ID returned from Upstox API");
 
-        // ✅ STEP 4: VERIFY FILLED STATUS
+        // 4. Confirmation Wait (Robust Loop)
         const result = await verifyOrderStatus(orderId, 'ENTRY');
 
         if (result.status === 'FILLED') {
@@ -858,8 +857,7 @@ async function placeOrder(type, qty, ltp) {
             botState.quantity = qty;
             botState.maxRunUp = 0; 
 
-            // Calculate Stop Loss (Using globalATR)
-            const slPrice = type === "BUY" ? (result.price - 800) : (result.price + 800);
+            const slPrice = type === "BUY" ? Math.round(result.price - 800) : Math.round(result.price + 800);
             botState.currentStop = slPrice;
             
             await saveSettings();
