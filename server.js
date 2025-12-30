@@ -201,13 +201,22 @@ try {
 
 
 // --- ⚙️ CONFIGURATION ---
-// Remove the old const INSTRUMENT_KEY
 let botState = { 
-    // ... existing properties ...
-    activeContract: "MCX_FO|458305", // Default: Feb Micro
-    contractName: "SILVER MIC FEB",
-    // ... existing properties ...
-}; 
+    positionType: null, 
+    entryPrice: 0, 
+    currentStop: null, 
+    totalPnL: 0, 
+    quantity: 0, 
+    history: [], 
+    slOrderId: null, 
+    isTradingEnabled: true, 
+    hiddenLogIds: [],
+    maxRunUp: 0, 
+    activeMonitors: {},
+    activeContract: "MCX_FO|458305", // ✅ New field
+    contractName: "SILVER MIC FEB"   // ✅ New field
+};
+
 const MAX_QUANTITY = 1;
 
 // --- 🔒 ENVIRONMENT VARIABLES ---
@@ -226,16 +235,6 @@ let globalATR = 800;
 // ✅ NEW: For Rate Limiting (Throttle)
 let lastSlUpdateTime = 0; 
 
-let botState = { 
-    positionType: null, entryPrice: 0, currentStop: null, totalPnL: 0, quantity: 0, 
-    history: [], slOrderId: null, isTradingEnabled: true, hiddenLogIds: [],
-    
-    // ✅ NEW: Tracks the highest profit seen during the CURRENT active trade
-    maxRunUp: 0, 
-
-    // ✅ NEW: Stores temporary data for trades currently being monitored (for 10 mins)
-    activeMonitors: {} 
-};
 
 
 // ✅ HELPER: Pair Detection (Finds matching Buy+Sell to highlight them)
