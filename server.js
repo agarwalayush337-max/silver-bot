@@ -773,61 +773,103 @@ async function verifyOrderStatus(orderId, context) {
         }
     }
 }
-// --- STRICT PLACE ORDER (Wait -> Confirm -> SL) ---
+// --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable()) return false;
     if (!botState.isTradingEnabled) return false;
 
-    // 1. INITIALIZE LOG
+    // 1. INTENT LOGGING
+    // This ensures you see what the bot is TRYING to do in the console
+    console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp}`);
+
+    // 2. INITIALIZE LOG (PENDING)
     const logId = "PENDING";
     botState.history.unshift({ 
-        date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
-        type: type, orderedPrice: ltp, executedPrice: 0, 
-        id: logId, status: "SENT", tag: "API_BOT" 
+        date: formatDate(getIST()), 
+        time: getIST().toLocaleTimeString(), 
+        type: type, 
+        orderedPrice: ltp, 
+        executedPrice: 0, 
+        id: logId, 
+        status: "SENT", 
+        tag: "API_BOT" 
     });
     pushToDashboard();
 
     try {
-        // 2. SEND ORDER
+        // 3. SEND ORDER TO UPSTOX
         const res = await axios.post("https://api.upstox.com/v3/order/place", {
-            quantity: qty, product: "I", validity: "DAY", price: ltp, instrument_token: INSTRUMENT_KEY,
-            order_type: "LIMIT", transaction_type: type, disclosed_quantity: 0, trigger_price: 0, 
-            is_amo: !isMarketOpen(), tag: "API_BOT"
+            quantity: qty, 
+            product: "I", 
+            validity: "DAY", 
+            price: ltp, 
+            instrument_token: INSTRUMENT_KEY,
+            order_type: "LIMIT", 
+            transaction_type: type, 
+            disclosed_quantity: 0, 
+            trigger_price: 0, 
+            is_amo: !isMarketOpen(), 
+            tag: "API_BOT"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
         const orderId = res.data?.data?.order_id;
-        if (!orderId) throw new Error("No Order ID returned");
+        
+        // If no Order ID, it likely means a rejection at the API level (e.g. invalid params)
+        if (!orderId) {
+            throw new Error("No Order ID returned from Upstox API");
+        }
 
-        // 3. 🛑 STOP & WAIT FOR CONFIRMATION
+        // 4. 🛑 STOP & WAIT FOR CONFIRMATION
+        // We do NOT update botState.positionType yet. We wait for REAL confirmation.
         const result = await verifyOrderStatus(orderId, 'ENTRY');
 
-        // 4. DECISION TIME
+        // 5. FINAL DECISION
         if (result.status === 'FILLED') {
+            console.log(`🎯 [CONFIRMED] ${type} Order Filled at ₹${result.price}. Setting state to ${type === "BUY" ? 'LONG' : 'SHORT'}.`);
+            
+            // ✅ NOW it is safe to update the state
             botState.positionType = type === "BUY" ? 'LONG' : 'SHORT';
             botState.entryPrice = result.price; 
             botState.quantity = qty;
             botState.maxRunUp = 0; 
 
-            // Calculate SL (800 points)
             const slPrice = type === "BUY" ? (result.price - 800) : (result.price + 800);
             botState.currentStop = slPrice;
             
             await saveSettings();
             await manageExchangeSL(type, qty, slPrice); 
             return true;
-        } else {
-            console.log("⛔ Trade aborted. No SL placed.");
+        } 
+        else {
+            // Rejection happened during verification (e.g. Low Funds found by OMS)
+            console.log("⛔ [ABORTED] Trade failed verification. Resetting position state.");
+            botState.positionType = null; // Ensure dashboard doesn't show a ghost position
+            await saveSettings();
             return false;
         }
 
     } catch (e) {
-        console.error(`❌ Order Request Failed: ${e.message}`);
+        // 🚨 EXTRACT REAL FAILURE REASON
+        // This grabs the specific error from Upstox (like "Margin Insufficient")
+        const errorDetail = e.response?.data?.errors?.[0]?.message || e.message;
+        console.error(`❌ [FAILURE] Order Request Rejected: ${errorDetail}`);
+
+        // Update the log entry with the real reason
         const log = botState.history.find(h => h.id === logId);
-        if (log) log.status = "ERROR";
+        if (log) {
+            log.status = "FAILED";
+            log.reason = errorDetail; // Optionally store reason
+        }
+
+        // 🛡️ EMERGENCY RESET: Ensure no ghost position is left in memory
+        botState.positionType = null;
+        
         pushToDashboard();
+        await saveSettings();
         return false;
     }
 }
+
 
 // --- TOKEN VALIDATION HELPER ---
 // ✅ UPDATED: REAL TOKEN VALIDATION
