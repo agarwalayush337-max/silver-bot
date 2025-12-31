@@ -212,7 +212,8 @@ let botState = {
     slOrderId: null, 
     isTradingEnabled: true, 
     hiddenLogIds: [],
-    maxRunUp: 0, 
+    maxRunUp: 0,
+    lastExitTime: 0,
     activeMonitors: {},
     activeContract: "MCX_FO|458305", // ✅ New field
     contractName: "SILVER MIC FEB"   // ✅ New field
@@ -797,6 +798,8 @@ async function verifyOrderStatus(orderId, context) {
 
                 // EXIT LOGIC: Start high-precision monitoring if this was a trade exit
                 if (context === 'EXIT_CHECK') {
+                    botState.lastExitTime = Date.now(); // ✅ NEW: Start cooling period now
+                    console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
                     botState.activeMonitors[orderId] = {
                         startTime: Date.now(), 
                         lastRecordTime: 0, 
@@ -1049,7 +1052,17 @@ setInterval(async () => {
             const shortName = botState.contractName.replace("SILVER MIC ", ""); // Turns "SILVER MIC APRIL" into "APRIL"
             console.log(`📊 [${shortName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
             // 5. Execute Signal Logic
+            // 5. Execute Signal Logic
             if (isMarketOpen() && !botState.positionType) {
+                 
+                 // ✅ NEW: 2-Minute Cooling Period Check
+                 const msSinceExit = Date.now() - botState.lastExitTime;
+                 if (msSinceExit < 120000) {
+                     const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
+                     console.log(`⏳ Cooling Period Active: Waiting ${waitSec}s more...`);
+                     return; // Skip signal detection
+                 }
+                
                  const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
                  const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
 
