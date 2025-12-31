@@ -1327,16 +1327,17 @@ app.post('/sync-price', async (req, res) => {
 
             // Restore metadata for the trade if it exists
             const existingLog = botState.history.find(h => h.id === order.order_id);
-            const preservedData = existingLog ? existingLog.analysisData : null;
+            const preservedData = (existingLog && existingLog.analysisData) ? existingLog.analysisData : null;
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
             const tradeLog = {
                 date: todayStr, time: execTime, type: txnType, 
-                qty: parseInt(order.quantity), // ✅ Added: Sync the actual quantity from the exchange
+                qty: parseInt(order.quantity) || 1, // ✅ Dynamic Qty Sync
                 orderedPrice: limitPrice,
                 executedPrice: realPrice, id: order.order_id, status: status,
-                pnl: tradePnL !== 0 ? tradePnL : null, tag: preservedTag,
-                analysisData: preservedData 
+                pnl: tradePnL !== 0 ? tradePnL : null, 
+                tag: preservedTag,
+                analysisData: preservedData // ✅ Now guaranteed to be null or an object
             };
             
             processedLogs.unshift(tradeLog);
