@@ -561,10 +561,12 @@ async function initWebSocket() {
                                         modifyExchangeSL(newStop);
                                     }
                                     
+                                    // ✅ FIXED: Added proper braces to wrap the console.log and function call
                                     if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
+                                        (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
+                                        
                                         console.log("🛑 Stop Loss Hit. Verifying Exit Pair...");
-                                        // Pass 'EXIT_PAIR' context to tell the function this completes a trade
-                                        verifyOrderStatus(botState.slOrderId, 'EXIT_PAIR'); 
+                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                     }
                                 }
 
