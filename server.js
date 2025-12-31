@@ -280,7 +280,7 @@ function generateLogHTML(logs) {
         return `<div style="display:grid; grid-template-columns: 1.2fr 0.6fr 0.5fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
             <span style="color:#94a3b8;">${t.time}</span> 
             <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="text-align:center; color:#cbd5e1;">${t.qty || 1}L</span> <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
+            <span style="text-align:center; color:#cbd5e1;">${t.qty || botState.maxTradeQty}L</span> <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
             <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
             <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
             <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${t.id || '-'}</span>
@@ -567,11 +567,30 @@ async function initWebSocket() {
                                     if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
                                         (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
                                         
-                                        console.log("🛑 Stop Loss Hit. Verifying Exit Pair...");
-                                        // ✅ Fix: Set position to NONE immediately and push to UI
-                                        botState.positionType = 'NONE'; 
-                                        pushToDashboard(); 
-                                        verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                                        if (botState.positionType !== 'EXITING' && botState.positionType !== 'NONE') {
+                                            console.log(`🛑 Stop Loss Hit. Verifying ${botState.quantity}L Exit...`);
+                                            
+                                            const exitOrderId = botState.slOrderId;
+                                            const exitType = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
+                                            const currentTradeQty = botState.quantity; // ✅ Capture current quantity
+
+                                            // ✅ Placeholder with Dynamic Quantity
+                                            botState.history.unshift({ 
+                                                date: formatDate(getIST()), 
+                                                time: getIST().toLocaleTimeString(), 
+                                                type: exitType, 
+                                                qty: currentTradeQty, // ✅ Added this line
+                                                orderedPrice: botState.currentStop, 
+                                                executedPrice: 0, 
+                                                id: exitOrderId, 
+                                                status: "EXITING", 
+                                                tag: "API_BOT" 
+                                            });
+
+                                            botState.positionType = 'EXITING'; 
+                                            pushToDashboard(); 
+                                            verifyOrderStatus(exitOrderId, 'EXIT_CHECK');
+                                        }
                                     }
                                 }
 
@@ -720,13 +739,14 @@ async function fetchLatestOrderId() {
 }
 
 // --- 🔎 FULL ROBUST VERIFICATION (Blocking Mode) ---
+// --- 🔎 INTELLIGENT VERIFICATION (Handles Slippage & Gaps) ---
 async function verifyOrderStatus(orderId, context) {
     if (!orderId) return { status: 'FAILED' };
 
     console.log(`🔎 Verifying Order ${orderId}...`);
     
     let retryCount = 0;
-    const maxRetries = 20; 
+    const maxRetries = 15; // Checks for ~30 seconds total
 
     while (retryCount < maxRetries) {
         // Wait 2s between checks to avoid rate limits
@@ -741,11 +761,11 @@ async function verifyOrderStatus(orderId, context) {
             const order = res.data.data.find(o => o.order_id === orderId);
             
             if (!order) {
-                console.log(`⚠️ Order ${orderId} not found yet. Retrying (${retryCount}/${maxRetries})...`);
+                console.log(`⚠️ Order ${orderId} not found in exchange history. Retrying...`);
                 continue; 
             }
 
-            // 1. SUCCESS: Order Filled
+            // 1️⃣ SUCCESS: Order is officially filled
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
@@ -759,23 +779,20 @@ async function verifyOrderStatus(orderId, context) {
                     botState.history[logIndex].executedPrice = realPrice;
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
-                    // ✅ Preserve Qty in Logs
                     botState.history[logIndex].qty = parseInt(order.filled_quantity) || botState.quantity;
                     await saveTrade(botState.history[logIndex]); 
                 }
 
-                // ✅ EXIT LOGIC: Standardized to 'EXIT_CHECK'
+                // EXIT LOGIC: Standardized to 'EXIT_CHECK'
                 if (context === 'EXIT_CHECK') {
-                    // Record exit time for the 2-minute cooling period
-                    botState.lastExitTime = Date.now(); 
+                    botState.lastExitTime = Date.now(); // Start 2-Min Cooling
                     console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
                     
-                    // Start the 10-minute high-precision monitor
                     console.log(`🎥 Starting 10-Min Analysis for Exit Order: ${orderId}`);
                     botState.activeMonitors[orderId] = {
                         startTime: Date.now(), 
                         lastRecordTime: 0, 
-                        type: botState.positionType,
+                        type: botState.positionType === 'EXITING' ? (order.transaction_type === 'BUY' ? 'SHORT' : 'LONG') : botState.positionType,
                         entryPrice: botState.entryPrice, 
                         maxRunUp: botState.maxRunUp,
                         highestAfterExit: realPrice, 
@@ -783,7 +800,7 @@ async function verifyOrderStatus(orderId, context) {
                         data: []
                     };
                     
-                    // Reset State so Dashboard shows "NONE"
+                    // Clear state for Dashboard "NONE"
                     botState.positionType = null; 
                     botState.slOrderId = null; 
                     botState.maxRunUp = 0;
@@ -792,11 +809,26 @@ async function verifyOrderStatus(orderId, context) {
                 }
 
                 await saveSettings();
-                pushToDashboard(); // Updates UI to "NONE"
+                pushToDashboard();
                 return { status: 'FILLED', price: realPrice }; 
             }
 
-            // 2. FAILURE: Rejected or Cancelled
+            // 2️⃣ SLIPPAGE HANDLING: Order is still open/pending after several checks
+            if (order.status === 'trigger pending' || order.status === 'open') {
+                if (retryCount >= 6) { // If still open after ~12 seconds
+                    console.log(`⚠️ SLIPPAGE DETECTED: Order ${orderId} is still ${order.status}. Price likely gapped.`);
+                    
+                    // ✅ REVERT STATE: Tell the bot it's still in the trade
+                    // If the SL order was a 'BUY', it means our position is 'SHORT'
+                    botState.positionType = (order.transaction_type === 'BUY') ? 'SHORT' : 'LONG';
+                    
+                    console.log(`🔄 State Reverted to ${botState.positionType}. WebSocket will resume monitoring.`);
+                    pushToDashboard();
+                    return { status: 'SLIPPAGE' }; 
+                }
+            }
+
+            // 3️⃣ FAILURE: Rejected or Cancelled
             if (['rejected', 'cancelled'].includes(order.status)) {
                 console.log(`❌ Order Failed: ${order.status_message}`);
                 
@@ -807,12 +839,9 @@ async function verifyOrderStatus(orderId, context) {
                     await saveTrade(botState.history[logIndex]); 
                 }
                 
-                // If entry fails, reset tracking
                 if (context !== 'EXIT_CHECK') { 
                     botState.positionType = null; 
                     botState.quantity = 0;
-                    botState.entryPrice = 0;
-                    botState.slOrderId = null;
                 }
                 
                 await saveSettings();
@@ -821,17 +850,20 @@ async function verifyOrderStatus(orderId, context) {
             }
 
         } catch (e) {
-            // ✅ Handles the "Missing catch" error
             if (e.response && e.response.status === 429) {
-                console.log("⚠️ Upstox Rate Limit (429) hit. Pausing 5 seconds...");
+                console.log("⚠️ Upstox Rate Limit hit. Pausing 5s...");
                 await new Promise(r => setTimeout(r, 5000));
             } else {
-                console.log("Verification Network Error: " + e.message);
+                console.log("Verification Error: " + e.message);
             }
         }
     }
     
-    console.log(`🛑 Verification TIMEOUT for ${orderId}`);
+    // Safety Fallback: Unlock state if we timeout to prevent the bot from staying "EXITING"
+    if (botState.positionType === 'EXITING') {
+        console.log("🛑 Verification TIMEOUT. Reverting state to allow recovery.");
+        botState.positionType = null; 
+    }
     return { status: 'TIMEOUT' };
 }
 // --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
@@ -848,7 +880,9 @@ async function placeOrder(type, qty, ltp) {
     const logId = "PENDING";
     botState.history.unshift({ 
         date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
-        type: type, orderedPrice: ltp, executedPrice: 0, id: logId, status: "SENT", tag: "API_BOT" 
+        type: type, 
+        qty: qty, // ✅ Added: Ensure the placed quantity is logged immediately
+        orderedPrice: ltp, executedPrice: 0, id: logId, status: "SENT", tag: "API_BOT" 
     });
     pushToDashboard();
 
@@ -1297,7 +1331,9 @@ app.post('/sync-price', async (req, res) => {
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
             const tradeLog = {
-                date: todayStr, time: execTime, type: txnType, orderedPrice: limitPrice,
+                date: todayStr, time: execTime, type: txnType, 
+                qty: parseInt(order.quantity), // ✅ Added: Sync the actual quantity from the exchange
+                orderedPrice: limitPrice,
                 executedPrice: realPrice, id: order.order_id, status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null, tag: preservedTag,
                 analysisData: preservedData 
