@@ -719,12 +719,11 @@ async function verifyOrderStatus(orderId, context) {
 
     console.log(`🔎 Verifying Order ${orderId}...`);
     
-    // Safety counter to prevent infinite loops if API is down
     let retryCount = 0;
     const maxRetries = 20; 
 
     while (retryCount < maxRetries) {
-        // Wait 2s normally between checks
+        // Wait 2s between checks to avoid rate limits
         await new Promise(r => setTimeout(r, 2000));
         retryCount++;
 
@@ -736,11 +735,10 @@ async function verifyOrderStatus(orderId, context) {
             const order = res.data.data.find(o => o.order_id === orderId);
             
             if (!order) {
-                console.log(`⚠️ Order ${orderId} not found yet in history. Retrying (${retryCount}/${maxRetries})...`);
+                console.log(`⚠️ Order ${orderId} not found yet. Retrying (${retryCount}/${maxRetries})...`);
                 continue; 
             }
 
-            // 1. SUCCESS: Order Filled
             // 1. SUCCESS: Order Filled
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
@@ -755,13 +753,18 @@ async function verifyOrderStatus(orderId, context) {
                     botState.history[logIndex].executedPrice = realPrice;
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
-                    // ✅ Fixed: Ensure qty is preserved in logs
+                    // ✅ Preserve Qty in Logs
                     botState.history[logIndex].qty = parseInt(order.filled_quantity) || botState.quantity;
                     await saveTrade(botState.history[logIndex]); 
                 }
 
-                // ✅ EXIT LOGIC: Only trigger for 'EXIT_CHECK' (The closing pair)
+                // ✅ EXIT LOGIC: Standardized to 'EXIT_CHECK'
                 if (context === 'EXIT_CHECK') {
+                    // Record exit time for the 2-minute cooling period
+                    botState.lastExitTime = Date.now(); 
+                    console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
+                    
+                    // Start the 10-minute high-precision monitor
                     console.log(`🎥 Starting 10-Min Analysis for Exit Order: ${orderId}`);
                     botState.activeMonitors[orderId] = {
                         startTime: Date.now(), 
@@ -774,7 +777,7 @@ async function verifyOrderStatus(orderId, context) {
                         data: []
                     };
                     
-                    // ✅ UI FIX: Clear position state BEFORE pushing to dashboard
+                    // Reset State so Dashboard shows "NONE"
                     botState.positionType = null; 
                     botState.slOrderId = null; 
                     botState.maxRunUp = 0;
@@ -783,59 +786,9 @@ async function verifyOrderStatus(orderId, context) {
                 }
 
                 await saveSettings();
-                pushToDashboard(); // ✅ Now pushes "NONE" status correctly
+                pushToDashboard(); // Updates UI to "NONE"
                 return { status: 'FILLED', price: realPrice }; 
             }
-                
-                // Update Log in Memory
-                const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
-                if (logIndex !== -1) {
-                    botState.history[logIndex].id = orderId;
-                    botState.history[logIndex].executedPrice = realPrice;
-                    botState.history[logIndex].time = execTime;
-                    botState.history[logIndex].status = "FILLED";
-                    // 🔥 Save permanent trade record to Firebase
-                    await saveTrade(botState.history[logIndex]); 
-                }
-
-                // EXIT LOGIC: Start high-precision monitoring if this was a trade exit
-                if (context === 'EXIT_CHECK') {
-                    botState.lastExitTime = Date.now(); // ✅ NEW: Start cooling period now
-                    console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
-                    botState.activeMonitors[orderId] = {
-                        startTime: Date.now(), 
-                        lastRecordTime: 0, 
-                        type: botState.positionType,
-                        entryPrice: botState.entryPrice, 
-                        maxRunUp: botState.maxRunUp,
-                        highestAfterExit: realPrice, 
-                        lowestAfterExit: realPrice, 
-                        data: []
-                    };
-                    botState.positionType = null; 
-                    botState.slOrderId = null; 
-                    botState.maxRunUp = 0;
-                }
-
-                await saveSettings();
-                pushToDashboard();
-                return { status: 'FILLED', price: realPrice }; 
-            } 
-
-        } catch (e) {
-            // ✅ This catch block was missing, causing the crash
-            if (e.response && e.response.status === 429) {
-                console.log("⚠️ Upstox Rate Limit (429) hit during verification. Pausing 5 seconds...");
-                await new Promise(r => setTimeout(r, 5000));
-            } else {
-                console.log("Verification Network Error: " + e.message);
-            }
-        }
-    } // Closes the while loop
-    
-    console.log(`🛑 Verification TIMEOUT for ${orderId}. Checking latest state...`);
-    return { status: 'TIMEOUT' };
-} // Closes the function
 
             // 2. FAILURE: Rejected or Cancelled
             if (['rejected', 'cancelled'].includes(order.status)) {
@@ -845,12 +798,10 @@ async function verifyOrderStatus(orderId, context) {
                 if (logIndex !== -1) {
                     botState.history[logIndex].id = orderId;
                     botState.history[logIndex].status = order.status.toUpperCase();
-                    botState.history[logIndex].executedPrice = 0;
                     await saveTrade(botState.history[logIndex]); 
                 }
                 
-                // If entry fails, reset position state so bot can try again
-                // If entry fails, reset all tracking so bot can try again
+                // If entry fails, reset tracking
                 if (context !== 'EXIT_CHECK') { 
                     botState.positionType = null; 
                     botState.quantity = 0;
@@ -864,9 +815,9 @@ async function verifyOrderStatus(orderId, context) {
             }
 
         } catch (e) {
-            // ✅ HANDLE 429 ERROR (Rate Limit) - Crucial 30-line section
+            // ✅ Handles the "Missing catch" error
             if (e.response && e.response.status === 429) {
-                console.log("⚠️ Upstox Rate Limit (429) hit during verification. Pausing 5 seconds...");
+                console.log("⚠️ Upstox Rate Limit (429) hit. Pausing 5 seconds...");
                 await new Promise(r => setTimeout(r, 5000));
             } else {
                 console.log("Verification Network Error: " + e.message);
@@ -874,7 +825,7 @@ async function verifyOrderStatus(orderId, context) {
         }
     }
     
-    console.log(`🛑 Verification TIMEOUT for ${orderId}. Checking latest state...`);
+    console.log(`🛑 Verification TIMEOUT for ${orderId}`);
     return { status: 'TIMEOUT' };
 }
 // --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
