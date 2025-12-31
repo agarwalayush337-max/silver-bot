@@ -820,7 +820,22 @@ async function verifyOrderStatus(orderId, context) {
                 await saveSettings();
                 pushToDashboard();
                 return { status: 'FILLED', price: realPrice }; 
+            } 
+
+        } catch (e) {
+            // ✅ This catch block was missing, causing the crash
+            if (e.response && e.response.status === 429) {
+                console.log("⚠️ Upstox Rate Limit (429) hit during verification. Pausing 5 seconds...");
+                await new Promise(r => setTimeout(r, 5000));
+            } else {
+                console.log("Verification Network Error: " + e.message);
             }
+        }
+    } // Closes the while loop
+    
+    console.log(`🛑 Verification TIMEOUT for ${orderId}. Checking latest state...`);
+    return { status: 'TIMEOUT' };
+} // Closes the function
 
             // 2. FAILURE: Rejected or Cancelled
             if (['rejected', 'cancelled'].includes(order.status)) {
