@@ -467,17 +467,18 @@ async function manageExchangeSL(side, qty, triggerPrice) {
     }
 }
 
-async function modifyExchangeSL(newTrigger) {
+async function modifyExchangeSL(oldStop, newTrigger) {
     if (!botState.slOrderId) return;
     try {
-        console.log(`🔄 Trailing SL: ${botState.currentStop} ➡️ ${Math.round(newTrigger)}`); // ✅ ADD THIS LOG
+        // ✅ Fix: Use the passed 'oldStop' parameter to show correct transition
+        console.log(`🔄 Trailing SL: ${Math.round(oldStop)} ➡️ ${Math.round(newTrigger)}`); 
         await axios.put("https://api.upstox.com/v2/order/modify", {
             order_id: botState.slOrderId,
             order_type: "SL-M",
             quantity: botState.quantity,
             trigger_price: Math.round(newTrigger),
-            price: 0,           // ✅ FIXED: Added required field
-            validity: "DAY",    // ✅ FIXED: Added required field
+            price: 0,
+            validity: "DAY",
             disclosed_quantity: 0
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }});
     } catch (e) { 
@@ -556,9 +557,10 @@ async function initWebSocket() {
                                     }
 
                                     if (didChange) {
+                                        const oldStop = botState.currentStop; // Capture old value first
                                         botState.currentStop = newStop;
                                         pushToDashboard(); 
-                                        modifyExchangeSL(newStop);
+                                        modifyExchangeSL(oldStop, newStop); // Pass both values
                                     }
                                     
                                     // ✅ FIXED: Added proper braces to wrap the console.log and function call
@@ -566,6 +568,9 @@ async function initWebSocket() {
                                         (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
                                         
                                         console.log("🛑 Stop Loss Hit. Verifying Exit Pair...");
+                                        // ✅ Fix: Set position to NONE immediately and push to UI
+                                        botState.positionType = 'NONE'; 
+                                        pushToDashboard(); 
                                         verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
                                     }
                                 }
@@ -581,7 +586,8 @@ async function initWebSocket() {
 
                                     if (now - session.startTime > 600000) {
                                         console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
-                                        const logIndex = botState.history.findIndex(h => h.id === oid);
+                                        // ✅ Fix: Search history by looking for the ID in ANY field to be safer
+                                        const logIndex = botState.history.findIndex(h => h.id == oid || (h.analysisData && h.analysisData.orderId == oid));
                                         
                                         // ✅ SAFETY FIX: Only save if log exists and analysis data is valid
                                         if (logIndex !== -1 && session.data && session.data.length > 0) {
