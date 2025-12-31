@@ -469,6 +469,7 @@ async function manageExchangeSL(side, qty, triggerPrice) {
 async function modifyExchangeSL(newTrigger) {
     if (!botState.slOrderId) return;
     try {
+        console.log(`🔄 Trailing SL: ${botState.currentStop} ➡️ ${Math.round(newTrigger)}`); // ✅ ADD THIS LOG
         await axios.put("https://api.upstox.com/v2/order/modify", {
             order_id: botState.slOrderId,
             order_type: "SL-M",
@@ -538,7 +539,11 @@ async function initWebSocket() {
                                     if (currentProfit >= (600 * tradeQty)) {
                                         const costSL = botState.entryPrice;
                                         const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
-                                        if (newStop !== betterSL) { newStop = betterSL; didChange = true; }
+                                        if (newStop !== betterSL) { 
+                                            console.log(`🛡️ Profit > ${600 * tradeQty} | Moving SL to Cost: ₹${betterSL}`); // ✅ ADD THIS LOG
+                                            newStop = betterSL; 
+                                            didChange = true; 
+                                        }
                                     }
 
                                     if (botState.positionType === 'LONG') {
@@ -556,8 +561,9 @@ async function initWebSocket() {
                                     }
                                     
                                     if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
-                                        (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
-                                         verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+                                        console.log("🛑 Stop Loss Hit. Verifying Exit Pair...");
+                                        // Pass 'EXIT_PAIR' context to tell the function this completes a trade
+                                        verifyOrderStatus(botState.slOrderId, 'EXIT_PAIR'); 
                                     }
                                 }
 
@@ -573,7 +579,9 @@ async function initWebSocket() {
                                     if (now - session.startTime > 600000) {
                                         console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
                                         const logIndex = botState.history.findIndex(h => h.id === oid);
-                                        if (logIndex !== -1) {
+                                        
+                                        // ✅ SAFETY FIX: Only save if log exists and analysis data is valid
+                                        if (logIndex !== -1 && session.data && session.data.length > 0) {
                                             botState.history[logIndex].analysisData = {
                                                 maxRunUp: session.maxRunUp,
                                                 startTime: session.startTime, 
@@ -582,7 +590,11 @@ async function initWebSocket() {
                                                 lowAfter: session.lowestAfterExit
                                             };
                                             await saveTrade(botState.history[logIndex]);
+                                        } else {
+                                            // Prevents Firestore "Undefined" crash
+                                            console.warn(`⚠️ Skipping Firestore save for ${oid}: Log not found or data empty.`);
                                         }
+                                        
                                         delete botState.activeMonitors[oid]; 
                                     }
                                 }
@@ -726,11 +738,51 @@ async function verifyOrderStatus(orderId, context) {
             }
 
             // 1. SUCCESS: Order Filled
+            // 1. SUCCESS: Order Filled
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
                 
                 console.log(`✅ Order Confirmed: ${order.transaction_type} @ ₹${realPrice}`);
+                
+                // Update Log in Memory
+                const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
+                if (logIndex !== -1) {
+                    botState.history[logIndex].id = orderId;
+                    botState.history[logIndex].executedPrice = realPrice;
+                    botState.history[logIndex].time = execTime;
+                    botState.history[logIndex].status = "FILLED";
+                    // ✅ Fixed: Ensure qty is preserved in logs
+                    botState.history[logIndex].qty = parseInt(order.filled_quantity) || botState.quantity;
+                    await saveTrade(botState.history[logIndex]); 
+                }
+
+                // ✅ EXIT LOGIC: Only trigger for 'EXIT_CHECK' (The closing pair)
+                if (context === 'EXIT_CHECK') {
+                    console.log(`🎥 Starting 10-Min Analysis for Exit Order: ${orderId}`);
+                    botState.activeMonitors[orderId] = {
+                        startTime: Date.now(), 
+                        lastRecordTime: 0, 
+                        type: botState.positionType,
+                        entryPrice: botState.entryPrice, 
+                        maxRunUp: botState.maxRunUp,
+                        highestAfterExit: realPrice, 
+                        lowestAfterExit: realPrice, 
+                        data: []
+                    };
+                    
+                    // ✅ UI FIX: Clear position state BEFORE pushing to dashboard
+                    botState.positionType = null; 
+                    botState.slOrderId = null; 
+                    botState.maxRunUp = 0;
+                    botState.quantity = 0;
+                    botState.entryPrice = 0;
+                }
+
+                await saveSettings();
+                pushToDashboard(); // ✅ Now pushes "NONE" status correctly
+                return { status: 'FILLED', price: realPrice }; 
+            }
                 
                 // Update Log in Memory
                 const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
@@ -778,7 +830,13 @@ async function verifyOrderStatus(orderId, context) {
                 }
                 
                 // If entry fails, reset position state so bot can try again
-                if (context !== 'EXIT_CHECK') { botState.positionType = null; }
+                // If entry fails, reset all tracking so bot can try again
+                if (context !== 'EXIT_CHECK') { 
+                    botState.positionType = null; 
+                    botState.quantity = 0;
+                    botState.entryPrice = 0;
+                    botState.slOrderId = null;
+                }
                 
                 await saveSettings();
                 pushToDashboard();
