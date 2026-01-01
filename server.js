@@ -766,6 +766,7 @@ async function verifyOrderStatus(orderId, context) {
             }
 
             // 1️⃣ SUCCESS: Order is officially filled
+            // 1. SUCCESS: Order Filled
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
@@ -780,27 +781,37 @@ async function verifyOrderStatus(orderId, context) {
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
                     botState.history[logIndex].qty = parseInt(order.filled_quantity) || botState.quantity;
+
+                    // ✅ NEW: CALCULATE PNL LIVE
+                    // We only calculate PnL if this was an EXIT order
+                    if (context === 'EXIT_CHECK') {
+                        let tradePnL = 0;
+                        const tradeQty = botState.history[logIndex].qty;
+                        
+                        // If we were LONG, we just SOLD (Profit = Exit - Entry)
+                        if (order.transaction_type === 'SELL') {
+                            tradePnL = (realPrice - botState.entryPrice) * tradeQty;
+                        } 
+                        // If we were SHORT, we just BOUGHT (Profit = Entry - Exit)
+                        else {
+                            tradePnL = (botState.entryPrice - realPrice) * tradeQty;
+                        }
+                        
+                        botState.history[logIndex].pnl = tradePnL;
+                        console.log(`💰 Live PnL Calculated: ₹${tradePnL.toFixed(0)}`);
+                    }
+
                     await saveTrade(botState.history[logIndex]); 
                 }
 
                 // EXIT LOGIC: Standardized to 'EXIT_CHECK'
                 if (context === 'EXIT_CHECK') {
-                    botState.lastExitTime = Date.now(); // Start 2-Min Cooling
+                    botState.lastExitTime = Date.now(); 
                     console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
                     
-                    console.log(`🎥 Starting 10-Min Analysis for Exit Order: ${orderId}`);
-                    botState.activeMonitors[orderId] = {
-                        startTime: Date.now(), 
-                        lastRecordTime: 0, 
-                        type: botState.positionType === 'EXITING' ? (order.transaction_type === 'BUY' ? 'SHORT' : 'LONG') : botState.positionType,
-                        entryPrice: botState.entryPrice, 
-                        maxRunUp: botState.maxRunUp,
-                        highestAfterExit: realPrice, 
-                        lowestAfterExit: realPrice, 
-                        data: []
-                    };
+                    // ... (keep the rest of your monitor logic here) ...
                     
-                    // Clear state for Dashboard "NONE"
+                    // Reset State AFTER PnL is calculated
                     botState.positionType = null; 
                     botState.slOrderId = null; 
                     botState.maxRunUp = 0;
@@ -809,7 +820,7 @@ async function verifyOrderStatus(orderId, context) {
                 }
 
                 await saveSettings();
-                pushToDashboard();
+                pushToDashboard(); 
                 return { status: 'FILLED', price: realPrice }; 
             }
 
