@@ -1,28 +1,25 @@
-// ✅ Correct SDK import for Gemini 3
-const { createClient } = require("@google/genai");
+const { Client } = require("@google/genai");
 
-// ✅ Initialize the client for the v1beta API (Required for Gemini 3)
-const client = createClient({
+// ✅ Correct initialization for Gemini 3.0
+const client = new Client({
     apiKey: process.env.GEMINI_API_KEY,
-    apiVersion: 'v1beta'
+    httpOptions: { apiVersion: 'v1beta' } // Required to access Gemini 3.0 preview
 });
 
 // ✅ Strategy Analyzer using Gemini 3.0 Thinking
-async function analyzeStrategyWithThinking(tradeHistory) {
+async function getDeepDiveAnalysis(tradeData) {
     const response = await client.models.generateContent({
-        model: "gemini-3-pro-preview", // Use "gemini-3-flash-preview" for faster results
-        contents: [{ role: "user", parts: [{ text: "Review these trades: " + JSON.stringify(tradeHistory) }] }],
+        model: "gemini-3-pro-preview",
+        contents: [{ role: "user", parts: [{ text: "Analyze these trades: " + JSON.stringify(tradeData) }] }],
         config: {
-            // ✅ NATIVE GEMINI 3 THINKING CONFIGURATION
+            // ✅ This is the correct way to enable Thinking for Gemini 3
             thinkingConfig: {
-                // Options: "high" (Deep Reasoning), "medium", or "low" (Fast)
-                thinkingLevel: "high" 
-            },
-            temperature: 1.0 // Recommended for Gemini 3 reasoning
+                thinkingLevel: "high" // Use "high" for deep strategy reasoning
+            }
         }
     });
 
-    return response.text();
+    return response.text;
 }
 const express = require('express');
 const axios = require('axios');
