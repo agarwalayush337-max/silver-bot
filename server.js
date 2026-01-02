@@ -1596,7 +1596,7 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
                     <span style="color:#fbbf24;">⚡ ACTION:</span> ${aiBriefing.suggestion}.
                 </div>
                 <br>
-                <button onclick="alert('AI Deep-Dive analyzing historical logs...')" style="width:100%; padding:12px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">Run Overall Optimization</button>
+                <a href="/ai-overall-optimization" style="display:block; text-align:center; width:100%; padding:12px; background:#6366f1; color:white; text-decoration:none; border-radius:8px; font-weight:bold;">Run Overall Optimization</a>
             </div>
         </body>
     `);
