@@ -1,19 +1,29 @@
-// Keep your current require line
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+// ✅ Correct SDK import for Gemini 3
+const { createClient } = require("@google/genai");
 
-// Update initialization to v1beta for Gemini 3 support
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY, { apiVersion: "v1beta" });
-
-const model = genAI.getGenerativeModel({
-    model: "gemini-3-pro-preview", 
-    generationConfig: {
-        // ✅ Add thinkingConfig here within the stable library
-        thinkingConfig: {
-            includeThoughts: true, 
-            thinkingLevel: "high" 
-        }
-    }
+// ✅ Initialize the client for the v1beta API (Required for Gemini 3)
+const client = createClient({
+    apiKey: process.env.GEMINI_API_KEY,
+    apiVersion: 'v1beta'
 });
+
+// ✅ Strategy Analyzer using Gemini 3.0 Thinking
+async function analyzeStrategyWithThinking(tradeHistory) {
+    const response = await client.models.generateContent({
+        model: "gemini-3-pro-preview", // Use "gemini-3-flash-preview" for faster results
+        contents: [{ role: "user", parts: [{ text: "Review these trades: " + JSON.stringify(tradeHistory) }] }],
+        config: {
+            // ✅ NATIVE GEMINI 3 THINKING CONFIGURATION
+            thinkingConfig: {
+                // Options: "high" (Deep Reasoning), "medium", or "low" (Fast)
+                thinkingLevel: "high" 
+            },
+            temperature: 1.0 // Recommended for Gemini 3 reasoning
+        }
+    });
+
+    return response.text();
+}
 const express = require('express');
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
