@@ -1646,8 +1646,7 @@ app.get('/ai-overall-optimization', async (req, res) => {
         });
 
         // ✅ The new SDK uses .text() as a function
-        const aiResponse = result.text().replace(/\n/g, '<br>');
-
+        const aiResponse = result.text.replace(/\n/g, '<br>'); // ✅ Works (it's a string)
         res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
                 <div style="max-width:800px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5;">
