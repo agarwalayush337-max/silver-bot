@@ -1,13 +1,19 @@
+// Keep your current require line
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// ✅ Configured for Gemini 3.0 Flash with "Thinking" enabled
-const model = genAI.getGenerativeModel({ 
-    model: "gemini-3-flash-preview", 
-    // Gemini 3.0 Flash supports high-level reasoning automatically
-    // 'thinkingConfig' is currently specific to the 2.0/Thinking models, 
-    // but 3.0 has improved logic natively.
-}, { apiVersion: 'v1beta' }); // 👈 THIS IS THE FIX
+// Update initialization to v1beta for Gemini 3 support
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY, { apiVersion: "v1beta" });
+
+const model = genAI.getGenerativeModel({
+    model: "gemini-3-pro-preview", 
+    generationConfig: {
+        // ✅ Add thinkingConfig here within the stable library
+        thinkingConfig: {
+            includeThoughts: true, 
+            thinkingLevel: "high" 
+        }
+    }
+});
 const express = require('express');
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
