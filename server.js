@@ -23,6 +23,7 @@ async function runStrategicAnalysis(tradeHistory) {
     return response.text;
 }
 const express = require('express');
+const app = express();
 app.use(require('express').json());
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
@@ -38,7 +39,7 @@ if (serviceAccount && !admin.apps.length) {
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 }
 const db = serviceAccount ? admin.firestore() : null;
-const app = express();
+
 
 
 const puppeteer = require('puppeteer');
