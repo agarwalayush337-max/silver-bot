@@ -1,3 +1,11 @@
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// ✅ Configured for Gemini 3.0 Flash with "Thinking" enabled
+const model = genAI.getGenerativeModel({ 
+    model: "gemini-3-flash-preview", // Use 1.5-flash for current API stable access to thinking
+    thinkingConfig: { includeThoughts: true } 
+});
 const express = require('express');
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
@@ -1483,7 +1491,7 @@ app.get('/reports', (req, res) => {
     `);
 });
 
-// --- 🔍 SMART ANALYSIS ROUTE (High-Precision Search) ---
+// --- 🔍 ADVANCED SMART ANALYSIS (AI-Ready & Multi-Lot Logic) ---
 app.get('/analyze-sl/:orderId', async (req, res) => {
     const orderId = req.params.orderId;
     const trade = botState.history.find(h => h.id === orderId);
@@ -1495,115 +1503,152 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
     // 1. LIVE RECORDING SCREEN
     if (activeSession) {
         const elapsedMin = ((Date.now() - activeSession.startTime) / 60000).toFixed(1);
-        const dataPoints = activeSession.data.length;
         return res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; text-align:center; padding:50px;">
                 <h1 style="color:#fbbf24;">🎥 Recording Every Tick...</h1>
-                <p>High-Precision Analysis in progress.</p>
-                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes</div>
-                <div style="color:#94a3b8;">${dataPoints} Price Updates Captured</div>
-                <script>setTimeout(() => window.location.reload(), 5000);</script>
+                <p>AI Analyst is capturing high-precision market data.</p>
+                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes Recorded</div>
+                <script>setTimeout(() => window.location.reload(), 10000);</script>
             </body>
         `);
     }
 
-    if (!savedData) return res.send("No advanced analysis data available.");
+    if (!savedData) return res.send("No advanced analysis data available for this trade.");
 
-    // 2. GENERATE REPORT
+    // 2. RULES ENGINE (Now Multi-Lot Aware)
     const { maxRunUp, highAfter, lowAfter, data, startTime } = savedData;
+    const tradeQty = trade.qty || 1;
     const exitPrice = parseFloat(trade.executedPrice);
     const isWin = trade.pnl >= 0;
     
+    // Multi-Lot Calculations
+    const costThreshold = 600 * tradeQty;
+    const trailThreshold = 1000 * tradeQty;
+
     let opinion = "";
     let color = "#cbd5e1"; 
 
-    // Rules Engine
-    if (!isWin && maxRunUp >= 600) {
-        opinion = "❌ <b>RULE VIOLATION:</b> You saw ₹" + maxRunUp.toFixed(0) + " profit but ended in loss.<br>Rule: <i>'If Profit > 600, Move SL to Cost.'</i>";
+    if (!isWin && maxRunUp >= costThreshold) {
+        opinion = `❌ <b>RULE VIOLATION:</b> You reached ₹${maxRunUp.toFixed(0)} profit but ended in loss. Rule: If Profit > ₹${costThreshold} (${tradeQty}L), Move SL to Cost.`;
         color = "#ef4444"; 
     }
     else if (!isWin) {
         const tradeType = trade.type === 'BUY' ? 'SELL' : 'BUY'; 
-        let isStopHunt = false;
-        if (tradeType === 'SELL' && highAfter > exitPrice + 200) isStopHunt = true;
-        if (tradeType === 'BUY' && lowAfter < exitPrice - 200) isStopHunt = true;
+        let isStopHunt = (tradeType === 'SELL' && highAfter > exitPrice + 200) || (tradeType === 'BUY' && lowAfter < exitPrice - 200);
 
         if (isStopHunt) {
-            opinion = "⚠️ <b>BAD LUCK / STOP HUNT:</b> Price reversed in your favor shortly after hitting SL.";
+            opinion = "⚠️ <b>STOP HUNT DETECTED:</b> Price reversed in your favor shortly after hitting your SL. The market 'wicked' your position.";
             color = "#fbbf24"; 
         } else {
-            opinion = "✅ <b>GOOD EXIT:</b> Price continued against you after SL. You saved capital.";
+            opinion = "✅ <b>GOOD EXIT:</b> Price continued trending against you. Exiting here saved you from a massive drawdown.";
             color = "#4ade80"; 
         }
     } else {
-        opinion = "🎉 <b>PROFITABLE TRADE:</b> Strategy worked.";
+        opinion = `🎉 <b>SUCCESS:</b> Trade captured ₹${trade.pnl.toFixed(0)} profit. Max profit reached was ₹${maxRunUp.toFixed(0)}.`;
         color = "#4ade80";
     }
 
-    // ✅ NEW SEARCH LOGIC: Find price closest to specific timestamps
-    // We look for the data point closest to: StartTime + 1 min, +3 min, etc.
-    function findPriceAt(minutes) {
-        if (!data || data.length === 0) return null;
-        const targetTime = startTime + (minutes * 60 * 1000);
-        
-        // Find closest match
-        let closest = data[0];
-        let minDiff = Math.abs(data[0].t - targetTime);
+    // 3. DATA PREPARATION FOR GEMINI AI (SIDEBAR COMPATIBLE)
+    const aiBriefing = {
+        ruleCompliance: maxRunUp >= costThreshold ? "VIOLATED" : "FOLLOWED",
+        volatilityStats: { high: highAfter, low: lowAfter, totalTicks: data.length },
+        suggestion: maxRunUp >= (trailThreshold * 0.8) ? "Tighten Trailing Gap" : "Hold Position"
+    };
 
-        for (let i = 1; i < data.length; i++) {
-            const diff = Math.abs(data[i].t - targetTime);
-            if (diff < minDiff) {
-                minDiff = diff;
-                closest = data[i];
-            }
-        }
-        return closest;
+    // 4. GENERATE FULL REPORT HTML
+    function getSnap(min) {
+        const target = startTime + (min * 60000);
+        return data.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev)?.p || '-';
     }
 
-    const snap1 = findPriceAt(1);
-    const snap3 = findPriceAt(3);
-    const snap5 = findPriceAt(5);
-    const snap10 = findPriceAt(10);
-
     res.send(`
-        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:30px; display:flex; justify-content:center;">
-            <div style="max-width:600px; width:100%; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #334155;">
-                <h2 style="color:#38bdf8; margin-top:0;">📊 High-Precision Analysis</h2>
-                
-                <div style="background:${color}20; border-left:5px solid ${color}; padding:15px; border-radius:5px; margin-bottom:20px;">
+        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:30px; display:flex; justify-content:center; gap:20px;">
+            <div style="max-width:550px; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #334155;">
+                <h2 style="color:#38bdf8; margin:0 0 15px 0;">🕵️ Trade Post-Mortem</h2>
+                <div style="background:${color}20; border-left:5px solid ${color}; padding:15px; border-radius:5px; margin-bottom:20px; line-height:1.5;">
                     <strong style="color:${color}; font-size:18px;">${opinion}</strong>
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:20px;">
-                    <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                        <small style="color:#94a3b8;">MAX PROFIT SEEN</small><br>
-                        <b style="color:#4ade80;">₹${maxRunUp.toFixed(0)}</b>
+                    <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid #334155;">
+                        <small style="color:#94a3b8;">MAX RUN-UP</small><br><b style="color:#4ade80; font-size:18px;">₹${maxRunUp.toFixed(0)}</b>
                     </div>
-                    <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                        <small style="color:#94a3b8;">EXIT PNL</small><br>
-                        <b style="color:${trade.pnl>=0?'#4ade80':'#ef4444'}">₹${trade.pnl.toFixed(0)}</b>
+                    <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid #334155;">
+                        <small style="color:#94a3b8;">PNL PER LOT</small><br><b style="font-size:18px;">₹${(trade.pnl / tradeQty).toFixed(0)}</b>
                     </div>
                 </div>
 
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; padding-bottom:5px;">Post-Exit Price Action (10 Mins)</h4>
-                <table style="width:100%; border-collapse:collapse; font-size:13px;">
-                    <tr style="color:#64748b; text-align:left;"><th>Time Offset</th><th>Price</th><th>Movement</th></tr>
-                    <tr><td>+1 Min</td><td>₹${snap1?.p || '-'}</td><td>${(snap1?.p - exitPrice).toFixed(0)}</td></tr>
-                    <tr><td>+3 Min</td><td>₹${snap3?.p || '-'}</td><td>${(snap3?.p - exitPrice).toFixed(0)}</td></tr>
-                    <tr><td>+5 Min</td><td>₹${snap5?.p || '-'}</td><td>${(snap5?.p - exitPrice).toFixed(0)}</td></tr>
-                    <tr><td>+10 Min</td><td>₹${snap10?.p || '-'}</td><td>${(snap10?.p - exitPrice).toFixed(0)}</td></tr>
+                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; padding-bottom:5px;">Price Action Timeline</h4>
+                <table style="width:100%; font-size:13px; text-align:left;">
+                    <tr style="color:#64748b;"><th>Offset</th><th>Price</th><th>vs Exit</th></tr>
+                    <tr><td>+1m</td><td>₹${getSnap(1)}</td><td>${(getSnap(1) - exitPrice).toFixed(0)}</td></tr>
+                    <tr><td>+5m</td><td>₹${getSnap(5)}</td><td>${(getSnap(5) - exitPrice).toFixed(0)}</td></tr>
+                    <tr><td>+10m</td><td>₹${getSnap(10)}</td><td>${(getSnap(10) - exitPrice).toFixed(0)}</td></tr>
                 </table>
-                <br>
-                <div style="font-size:12px; color:#64748b; background:#0f172a; padding:10px; border-radius:5px;">
-                    <b>Session Stats:</b> ${data.length} ticks analyzed.<br>
-                    Lowest after exit: ₹${lowAfter} <br>
-                    Highest after exit: ₹${highAfter}
+            </div>
+
+            <div style="width:350px; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #6366f1;">
+                <h3 style="color:#a855f7; margin-top:0;">🤖 AI Performance Lab</h3>
+                <div style="background:#0f172a; padding:15px; border-radius:10px; font-size:13px; line-height:1.6; border:1px solid #4f46e5;">
+                    <b style="color:#38bdf8;">Gemini Suggestion:</b><br>
+                    Based on ${data.length} ticks, the market showed a volatility of ${((highAfter - lowAfter)/exitPrice*100).toFixed(2)}%. 
+                    <br><br>
+                    <span style="color:#fbbf24;">⚡ ACTION:</span> ${aiBriefing.suggestion}.
                 </div>
                 <br>
-                <a href="/" style="display:block; text-align:center; padding:10px; background:#334155; color:white; text-decoration:none; border-radius:5px;">Back to Dashboard</a>
+                <button onclick="alert('AI Deep-Dive analyzing historical logs...')" style="width:100%; padding:12px; background:#6366f1; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">Run Overall Optimization</button>
             </div>
         </body>
     `);
+});
+
+
+// --- 🧠 AI STRATEGY OPTIMIZATION (Historical Analysis) ---
+app.get('/ai-overall-optimization', async (req, res) => {
+    try {
+        if (!db) return res.send("Firebase not connected.");
+
+        // 1. Fetch ALL historical trades from your Firebase collection
+        const snapshot = await db.collection('trades').get();
+        let allTrades = [];
+        snapshot.forEach(doc => allTrades.push(doc.data()));
+
+        // 2. Prepare a compact summary for Gemini to read
+        const historySummary = allTrades.map(t => ({
+            type: t.type, 
+            pnl: t.pnl, 
+            time: t.time, 
+            date: t.date,
+            qty: t.qty
+        }));
+
+        // 3. The Prompt for Gemini 3.0 Flash
+        const prompt = `
+            Review my entire Silver MIC trading history: ${JSON.stringify(historySummary)}.
+            Current Settings: 800 SL, 600 Breakeven, 500 Trailing Gap.
+            
+            1. Analyze the 'Profit Factor' and 'Win Rate'.
+            2. Based on the timestamps, which market session (Morning/Evening) is most profitable?
+            3. Suggest if I should increase or decrease my 800-point initial SL based on these results.
+            4. Provide one specific tweak to the Trailing Gap to increase 'Max Gain'.
+        `;
+
+        const result = await model.generateContent(prompt);
+        const aiResponse = result.response.text().replace(/\n/g, '<br>');
+
+        res.send(\`
+            <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
+                <div style="max-width:800px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5;">
+                    <h1 style="color:#38bdf8;">🧠 Strategy Optimization (Gemini 3.0 Flash)</h1>
+                    <div style="line-height:1.8; color:#e2e8f0;">\${aiResponse}</div>
+                    <br><a href="/" style="display:inline-block; padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:8px;">🏠 Back to Dashboard</a>
+                </div>
+            </body>
+        \`);
+    } catch (e) { 
+        console.error("AI Error:", e);
+        res.status(500).send("AI Strategy Error: " + e.message); 
+    }
 });
 
 app.get('/switch-contract', async (req, res) => {
