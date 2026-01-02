@@ -1,9 +1,10 @@
-const genai = require("@google/genai");
+// 1. Correct CommonJS require (accessing the .genai property)
+const { genai } = require("@google/genai");
 
-// ✅ Some versions export the class directly on the required object
-const client = new genai.Client({
+// 2. Correct Factory Initialization
+const client = genai.createClient({
     apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: { apiVersion: 'v1beta' }
+    apiVersion: 'v1beta' // 👈 Vital for Gemini 3
 });
 
 // ✅ Strategy Analyzer using Gemini 3.0 Thinking
@@ -1621,50 +1622,46 @@ app.get('/analyze-sl/:orderId', async (req, res) => {
 // --- 🧠 AI STRATEGY OPTIMIZATION (Historical Analysis) ---
 app.get('/ai-overall-optimization', async (req, res) => {
     try {
-        if (!db) return res.send("Firebase not connected.");
-
-        // 1. Fetch ALL historical trades from your Firebase collection
+        console.log("🧠 Gemini 3.0 Flash: Starting Global Strategy Analysis...");
+        
+        // Fetch your Firebase logs
         const snapshot = await db.collection('trades').get();
-        let allTrades = [];
-        snapshot.forEach(doc => allTrades.push(doc.data()));
+        let tradeLogs = [];
+        snapshot.forEach(doc => tradeLogs.push(doc.data()));
 
-        // 2. Prepare a compact summary for Gemini to read
-        const historySummary = allTrades.map(t => ({
-            type: t.type, 
-            pnl: t.pnl, 
-            time: t.time, 
-            date: t.date,
-            qty: t.qty
-        }));
+        // ✅ Correct SDK call with Thinking Capability
+        const result = await client.models.generateContent({
+            model: "gemini-3-pro-preview", 
+            contents: [{ 
+                role: "user", 
+                parts: [{ text: `Analyze my Silver trading strategy performance: ${JSON.stringify(tradeLogs)}` }] 
+            }],
+            config: {
+                thinkingConfig: {
+                    includeThoughts: true, 
+                    thinkingLevel: "high" // 🧠 Max reasoning for your stop-loss logic
+                },
+                temperature: 1.0 
+            }
+        });
 
-        // 3. The Prompt for Gemini 3.0 Flash
-        const prompt = `
-            Review my entire Silver MIC trading history: ${JSON.stringify(historySummary)}.
-            Current Settings: 800 SL, 600 Breakeven, 500 Trailing Gap.
-            
-            1. Analyze the 'Profit Factor' and 'Win Rate'.
-            2. Based on the timestamps, which market session (Morning/Evening) is most profitable?
-            3. Suggest if I should increase or decrease my 800-point initial SL based on these results.
-            4. Provide one specific tweak to the Trailing Gap to increase 'Max Gain'.
-        `;
-
-        const result = await model.generateContent(prompt);
-        const aiResponse = result.response.text().replace(/\n/g, '<br>');
+        // ✅ The new SDK uses .text() as a function
+        const aiResponse = result.text().replace(/\n/g, '<br>');
 
         res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
                 <div style="max-width:800px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5;">
                     <h1 style="color:#38bdf8;">🧠 Strategy Optimization (Gemini 3.0 Flash)</h1>
-                    <div style="line-height:1.8; color:#e2e8f0;">\${aiResponse}</div>
+                    <div style="line-height:1.8; color:#e2e8f0;">${aiResponse}</div>
                     <br><a href="/" style="display:inline-block; padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:8px;">🏠 Back to Dashboard</a>
                 </div>
             </body>
         `);
-    } catch (e) { 
+    } catch (e) {
         console.error("AI Error:", e);
-        res.status(500).send("AI Strategy Error: " + e.message); 
+        res.status(500).send("AI Strategy Error: " + e.message);
     }
-});
+});;
 
 app.get('/switch-contract', async (req, res) => {
     const newId = req.query.id;
