@@ -1,9 +1,9 @@
-const { Client } = require("@google/genai");
+const genai = require("@google/genai");
 
-// ✅ Correct initialization for Gemini 3.0
-const client = new Client({
+// ✅ Some versions export the class directly on the required object
+const client = new genai.Client({
     apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: { apiVersion: 'v1beta' } // Required to access Gemini 3.0 preview
+    httpOptions: { apiVersion: 'v1beta' }
 });
 
 // ✅ Strategy Analyzer using Gemini 3.0 Thinking
