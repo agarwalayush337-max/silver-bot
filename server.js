@@ -1533,122 +1533,163 @@ const analyzeBtn = (t.status === 'FILLED')
     `);
 });
 
+// ✅ REPLACES THE ENTIRE /analyze-sl ROUTE
 app.get('/analyze-sl', async (req, res) => {
     try {
-        const tradeId = req.query.id; // Ensure your dashboard links pass ?id=DOCUMENT_ID
+        const tradeId = req.query.id;
         if (!tradeId) return res.send("Error: No Trade ID provided.");
 
-        // 1. Fetch Trade Data
         const doc = await db.collection('trades').doc(tradeId).get();
-        if (!doc.exists) return res.send("Trade not found.");
+        if (!doc.exists) return res.send("Trade not found in database.");
         const t = doc.data();
 
-        // 2. Prepare Data for AI
+        // --- 1. SMART DATA RECONSTRUCTION ---
+        const exitPrice = t.executedPrice || t.orderedPrice || 0;
+        const totalPnL = t.pnl || 0;
+        const qty = t.qty || 1;
+        const pnlPerLot = (totalPnL / qty).toFixed(2);
+        
+        // Reverse Engineer Entry Price (Since we only have the Exit Log)
+        // If Type is BUY (Short Cover) -> Entry was Higher (Exit + Profit/Qty)
+        // If Type is SELL (Long Exit) -> Entry was Lower (Exit - Profit/Qty)
+        let entryPrice = 0;
+        let positionType = "";
+        
+        if (t.type === 'BUY') {
+            // We Bought to Exit -> Meaning we were SHORT
+            positionType = "SHORT";
+            entryPrice = exitPrice + (totalPnL / qty); 
+        } else {
+            // We Sold to Exit -> Meaning we were LONG
+            positionType = "LONG";
+            entryPrice = exitPrice - (totalPnL / qty);
+        }
+
+        // Fix Date Format
+        const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : new Date().toLocaleString();
+
+        // --- 2. PREPARE AI CONTEXT ---
         const tradeContext = {
-            Date: new Date(t.timestamp).toLocaleString("en-IN"),
-            Type: t.type,
-            BuyAt: t.buyPrice,
-            SellAt: t.sellPrice,
-            ProfitLoss: t.pnl,
-            Ticks: t.analysisData // The recorded price movement
+            Date: tradeDate,
+            Strategy_Position: positionType, // Explicitly tell AI "This was a SHORT trade"
+            Action: `Exited via ${t.type} Order`,
+            Quantity: `${qty} Lots`,
+            Entry_Price: entryPrice.toFixed(2),
+            Exit_Price: exitPrice,
+            Total_PnL: `₹${totalPnL}`,
+            PnL_Per_Lot: `₹${pnlPerLot}`,
+            // We rename this field so AI understands it's AFTER the trade
+            Post_Exit_Price_Action: t.analysisData ? "Attached below (10 mins after exit)" : "Not Recorded"
         };
 
-        // 3. AI Analysis Request (Dynamic Verdict)
+        const tickDataString = t.analysisData ? JSON.stringify(t.analysisData).slice(0, 1500) : "No Data";
+
+        // --- 3. UPDATED PROMPT ---
         const prompt = `
-            Act as a strict trading coach. Review this Silver MIC trade.
+            Act as a strict trading coach. Review this Silver MIC trade EXIT.
             
-            **MY STRATEGY RULES:**
+            **CRITICAL CONTEXT:**
+            1. I was holding a **${positionType}** position.
+            2. I closed it by **${t.type}ING** ${qty} lots at ${exitPrice}.
+            3. My **Per Lot Profit** was ${pnlPerLot}. (Use THIS for rule checks, NOT total PnL).
+            4. The Tick Data provided is **POST-EXIT** (what happened *after* I got out).
+            
+            **MY STRATEGY RULES (PER LOT):**
             ${STRATEGY_RULES}
 
             **TRADE DATA:**
             ${JSON.stringify(tradeContext)}
 
-            **TASK:**
-            1. Analyze the price ticks to see if I missed an opportunity to trail my SL.
-            2. Give a "VERDICT": strictly state if I followed the rules or failed.
-            3. Do NOT mention "AI Model" or "Simulation". Speak directly to me.
+            **POST-EXIT TICKS (10 MINS):**
+            ${tickDataString}
+
+            **YOUR TASK:**
+            1. **Rule Check**: Did I follow the "Move SL to Cost if Profit > 600" rule based on my *Per Lot* profit of ${pnlPerLot}?
+            2. **Exit Analysis**: Look at the POST-EXIT ticks. Did the price reverse against me (Good Exit) or continue in my favor (Bad Exit)?
+            3. **Verdict**: PASS or FAIL.
+            
+            Do NOT show JSON. Speak naturally. Use bolding for key numbers.
         `;
 
         const result = await client.models.generateContent({
-            model: "gemini-3-pro-preview",
+            model: "gemini-3-flash-preview",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
 
-        const analysisText = result.text.replace(/\n/g, '<br>');
+        const analysisText = result.text ? result.text.replace(/\n/g, '<br>') : "No analysis generated.";
 
-        // 4. Render the HTML Report
+        // --- 4. RENDER HTML HEADER (FIXED) ---
         res.send(`
-            <body style="background:#0f172a; color:white; font-family:sans-serif; padding:20px;">
-                <div style="max-width:800px; margin:auto; background:#1e293b; border-radius:12px; border:1px solid #475569; overflow:hidden;">
+            <body style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:20px;">
+                <div style="max-width:800px; margin:auto; background:#1e293b; border-radius:12px; padding:25px; box-shadow:0 4px 20px rgba(0,0,0,0.4);">
                     
-                    <div style="background:#334155; padding:20px; border-bottom:1px solid #475569;">
-                        <h2 style="margin:0; color:#38bdf8;">📊 Trade Analysis</h2>
-                        <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:15px; margin-top:15px; font-size:0.9em;">
-                            <div><strong>🕒 Time:</strong> ${tradeContext.Date}</div>
-                            <div><strong>🏷️ Type:</strong> <span style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</span></div>
-                            <div><strong>💰 P/L:</strong> <span style="color:${t.pnl>=0?'#4ade80':'#f87171'}">₹${t.pnl}</span></div>
-                            <div><strong>📉 Sell:</strong> ${t.sellPrice}</div>
-                            <div><strong>📈 Buy:</strong> ${t.buyPrice}</div>
+                    <div style="border-bottom:1px solid #334155; padding-bottom:15px; margin-bottom:20px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <h2 style="color:#38bdf8; margin:0;">🚀 Trade Analysis</h2>
+                            <div style="text-align:right;">
+                                <div style="font-size:12px; color:#94a3b8;">${tradeDate}</div>
+                                <div style="font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}; font-size:18px;">
+                                    ${totalPnL>=0?'+':''}₹${totalPnL}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:20px; text-align:center;">
+                            <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                                <div style="font-size:11px; color:#94a3b8;">POSITION</div>
+                                <div style="font-weight:bold; color:#fbbf24;">${positionType} (${qty} Lots)</div>
+                            </div>
+                            <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                                <div style="font-size:11px; color:#94a3b8;">ENTRY (Est)</div>
+                                <div style="font-weight:bold;">${entryPrice.toFixed(0)}</div>
+                            </div>
+                            <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                                <div style="font-size:11px; color:#94a3b8;">EXIT PRICE</div>
+                                <div style="font-weight:bold;">${exitPrice}</div>
+                            </div>
+                            <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                                <div style="font-size:11px; color:#94a3b8;">PER LOT PnL</div>
+                                <div style="font-weight:bold; color:${pnlPerLot>=0?'#4ade80':'#f87171'}">₹${pnlPerLot}</div>
+                            </div>
                         </div>
                     </div>
 
-                    <div style="padding:30px; line-height:1.6; color:#e2e8f0;">
+                    <div style="line-height:1.7; color:#cbd5e1; font-size:15px; margin-bottom:30px;">
                         ${analysisText}
                     </div>
 
-                    <div style="background:#0f172a; padding:20px; border-top:1px solid #475569;">
-                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask about this trade</h3>
-                        <div id="chatHistory" style="margin-bottom:15px;"></div>
-                        
+                    <div style="background:#0f172a; padding:20px; border-radius:8px;">
+                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask the Strategy Coach</h3>
+                        <div id="chatHistory" style="margin-bottom:15px; max-height:200px; overflow-y:auto;"></div>
                         <div style="display:flex; gap:10px;">
-                            <input type="text" id="userQuestion" placeholder="Ex: Why did my SL hit so early?" 
-                                   style="flex:1; padding:12px; border-radius:6px; border:none; background:#334155; color:white;">
-                            <button onclick="askAI('${tradeId}')" 
-                                    style="padding:12px 24px; background:#6366f1; color:white; border:none; border-radius:6px; cursor:pointer;">
-                                Ask
-                            </button>
+                            <input type="text" id="q" placeholder="Why was this a good exit?" style="flex:1; padding:12px; background:#334155; border:none; color:white; border-radius:6px;">
+                            <button onclick="ask()" style="padding:12px 20px; background:#6366f1; border:none; color:white; border-radius:6px; cursor:pointer;">Ask</button>
                         </div>
-                        <p id="loading" style="display:none; color:#fbbf24; font-size:0.9em;">Thinking...</p>
-                    </div>
-
-                    <div style="padding:20px; text-align:center;">
-                        <a href="/" style="color:#94a3b8; text-decoration:none;">← Back to Dashboard</a>
                     </div>
                 </div>
 
                 <script>
-                    async function askAI(id) {
-                        const question = document.getElementById('userQuestion').value;
-                        if(!question) return;
-
-                        document.getElementById('loading').style.display = 'block';
-                        const historyDiv = document.getElementById('chatHistory');
+                    async function ask() {
+                        const q = document.getElementById('q').value;
+                        const h = document.getElementById('chatHistory');
+                        h.innerHTML += '<div style="text-align:right; margin:5px; color:#cbd5e1; background:#334155; display:inline-block; padding:8px; border-radius:8px;">'+q+'</div><div style="clear:both;"></div>';
                         
-                        // Show user question immediately
-                        historyDiv.innerHTML += '<div style="background:#334155; padding:10px; margin:5px 0; border-radius:5px; text-align:right;">' + question + '</div>';
-
-                        // Send to server
                         const res = await fetch('/ask-trade-question', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ tradeId: id, question: question })
+                            method:'POST', headers:{'Content-Type':'application/json'},
+                            body: JSON.stringify({ tradeId: "${tradeId}", question: q })
                         });
-                        
                         const data = await res.json();
-                        
-                        // Show AI Response
-                        historyDiv.innerHTML += '<div style="background:#1e293b; border:1px solid #6366f1; padding:10px; margin:5px 0; border-radius:5px;">🤖 ' + data.answer + '</div>';
-                        document.getElementById('loading').style.display = 'none';
-                        document.getElementById('userQuestion').value = '';
+                        h.innerHTML += '<div style="text-align:left; margin:5px; color:#e2e8f0; border-left:3px solid #6366f1; padding-left:10px;">🤖 '+data.answer+'</div>';
+                        document.getElementById('q').value = "";
                     }
                 </script>
             </body>
         `);
 
-    } catch (e) {
+    } catch (e) { 
         console.error(e);
-        res.send("Analysis Failed: " + e.message);
+        res.send("Error: " + e.message); 
     }
 });
 
@@ -1664,7 +1705,7 @@ app.post('/ask-trade-question', async (req, res) => {
 
         // 2. Send context + Question to Gemini 3.0
         const result = await client.models.generateContent({
-            model: "gemini-3-pro-preview",
+            model: "gemini-3-flash-preview",
             contents: [{ 
                 role: "user", 
                 parts: [{ text: `
