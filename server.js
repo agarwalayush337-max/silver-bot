@@ -38,6 +38,7 @@ if (serviceAccount && !admin.apps.length) {
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 }
 const db = serviceAccount ? admin.firestore() : null;
+const app = express();
 
 
 const puppeteer = require('puppeteer');
@@ -46,7 +47,7 @@ const { EMA, SMA, ATR } = require("technicalindicators");
 // ✅ CORRECT IMPORT for Manual WebSocket
 const UpstoxClient = require('upstox-js-sdk');
 const protobuf = require("protobufjs"); // 🆕 REQUIRED
-const app = express();
+
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
