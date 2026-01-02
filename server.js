@@ -23,6 +23,7 @@ async function runStrategicAnalysis(tradeHistory) {
     return response.text;
 }
 const express = require('express');
+app.use(require('express').json());
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
 const admin = require('firebase-admin');
@@ -82,6 +83,23 @@ function authMiddleware(req, res, next) {
         </html>
     `);
 }
+
+const STRATEGY_RULES = `
+**1. RISK MANAGEMENT RULES:**
+* **Initial Stop Loss:** 800 points fixed.
+* **Move to Cost:** IMMEDIATELY if Profit > ₹600 per lot.
+* **Trailing Stop:** If Profit > ₹1000, maintain a Trailing Gap of 500 points.
+
+**2. ENTRY LOGIC (STRICT):**
+* **BUY Signal:**
+    - Previous Close > Previous EMA50
+    - Current Volume > (Average Volume * 1.5)
+    - Price > Breakout High (bH)
+* **SELL Signal:**
+    - Previous Close < Previous EMA50
+    - Current Volume > (Average Volume * 1.5)
+    - Price < Breakout Low (bL)
+`;
 
 // Apply the lock
 app.use(authMiddleware);
@@ -295,7 +313,9 @@ function generateLogHTML(logs) {
         const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌]</a>` : '';
         
         // ✅ CHANGED: Show Analyze button for ALL filled trades (Wins & Losses)
-        const analyzeBtn = (t.status === 'FILLED') ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px; text-decoration:none;">🔍</a>` : '';
+        const analyzeBtn = (t.status === 'FILLED') 
+            ? `<br><a href="/analyze-sl?id=${t.id}" target="_blank" style="display:inline-block; margin-top:4px; background:#6366f1; color:white; padding:3px 8px; border-radius:4px; font-size:10px; text-decoration:none;">🧠 Analyze</a>` 
+            : '';
         
         // Highlight Logic: Dark gradient for paired trades
         const isPaired = pairedIds.has(t.id);
@@ -1507,115 +1527,169 @@ app.get('/reports', (req, res) => {
     `);
 });
 
-// --- 🔍 ADVANCED SMART ANALYSIS (AI-Ready & Multi-Lot Logic) ---
-app.get('/analyze-sl/:orderId', async (req, res) => {
-    const orderId = req.params.orderId;
-    const trade = botState.history.find(h => h.id === orderId);
-    if (!trade) return res.send("Trade not found.");
+app.get('/analyze-sl', async (req, res) => {
+    try {
+        const tradeId = req.query.id; // Ensure your dashboard links pass ?id=DOCUMENT_ID
+        if (!tradeId) return res.send("Error: No Trade ID provided.");
 
-    const activeSession = botState.activeMonitors[orderId];
-    const savedData = trade.analysisData;
+        // 1. Fetch Trade Data
+        const doc = await db.collection('trades').doc(tradeId).get();
+        if (!doc.exists) return res.send("Trade not found.");
+        const t = doc.data();
 
-    // 1. LIVE RECORDING SCREEN
-    if (activeSession) {
-        const elapsedMin = ((Date.now() - activeSession.startTime) / 60000).toFixed(1);
-        return res.send(`
-            <body style="background:#0f172a; color:white; font-family:sans-serif; text-align:center; padding:50px;">
-                <h1 style="color:#fbbf24;">🎥 Recording Every Tick...</h1>
-                <p>AI Analyst is capturing high-precision market data.</p>
-                <div style="font-size:24px; margin:20px; font-weight:bold;">${elapsedMin} / 10 Minutes Recorded</div>
-                <script>setTimeout(() => window.location.reload(), 10000);</script>
+        // 2. Prepare Data for AI
+        const tradeContext = {
+            Date: new Date(t.timestamp).toLocaleString("en-IN"),
+            Type: t.type,
+            BuyAt: t.buyPrice,
+            SellAt: t.sellPrice,
+            ProfitLoss: t.pnl,
+            Ticks: t.analysisData // The recorded price movement
+        };
+
+        // 3. AI Analysis Request (Dynamic Verdict)
+        const prompt = `
+            Act as a strict trading coach. Review this Silver MIC trade.
+            
+            **MY STRATEGY RULES:**
+            ${STRATEGY_RULES}
+
+            **TRADE DATA:**
+            ${JSON.stringify(tradeContext)}
+
+            **TASK:**
+            1. Analyze the price ticks to see if I missed an opportunity to trail my SL.
+            2. Give a "VERDICT": strictly state if I followed the rules or failed.
+            3. Do NOT mention "AI Model" or "Simulation". Speak directly to me.
+        `;
+
+        const result = await client.models.generateContent({
+            model: "gemini-3-pro-preview",
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            config: { thinkingConfig: { thinkingLevel: "high" } }
+        });
+
+        const analysisText = result.text.replace(/\n/g, '<br>');
+
+        // 4. Render the HTML Report
+        res.send(`
+            <body style="background:#0f172a; color:white; font-family:sans-serif; padding:20px;">
+                <div style="max-width:800px; margin:auto; background:#1e293b; border-radius:12px; border:1px solid #475569; overflow:hidden;">
+                    
+                    <div style="background:#334155; padding:20px; border-bottom:1px solid #475569;">
+                        <h2 style="margin:0; color:#38bdf8;">📊 Trade Analysis</h2>
+                        <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:15px; margin-top:15px; font-size:0.9em;">
+                            <div><strong>🕒 Time:</strong> ${tradeContext.Date}</div>
+                            <div><strong>🏷️ Type:</strong> <span style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</span></div>
+                            <div><strong>💰 P/L:</strong> <span style="color:${t.pnl>=0?'#4ade80':'#f87171'}">₹${t.pnl}</span></div>
+                            <div><strong>📉 Sell:</strong> ${t.sellPrice}</div>
+                            <div><strong>📈 Buy:</strong> ${t.buyPrice}</div>
+                        </div>
+                    </div>
+
+                    <div style="padding:30px; line-height:1.6; color:#e2e8f0;">
+                        ${analysisText}
+                    </div>
+
+                    <div style="background:#0f172a; padding:20px; border-top:1px solid #475569;">
+                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask about this trade</h3>
+                        <div id="chatHistory" style="margin-bottom:15px;"></div>
+                        
+                        <div style="display:flex; gap:10px;">
+                            <input type="text" id="userQuestion" placeholder="Ex: Why did my SL hit so early?" 
+                                   style="flex:1; padding:12px; border-radius:6px; border:none; background:#334155; color:white;">
+                            <button onclick="askAI('${tradeId}')" 
+                                    style="padding:12px 24px; background:#6366f1; color:white; border:none; border-radius:6px; cursor:pointer;">
+                                Ask
+                            </button>
+                        </div>
+                        <p id="loading" style="display:none; color:#fbbf24; font-size:0.9em;">Thinking...</p>
+                    </div>
+
+                    <div style="padding:20px; text-align:center;">
+                        <a href="/" style="color:#94a3b8; text-decoration:none;">← Back to Dashboard</a>
+                    </div>
+                </div>
+
+                <script>
+                    async function askAI(id) {
+                        const question = document.getElementById('userQuestion').value;
+                        if(!question) return;
+
+                        document.getElementById('loading').style.display = 'block';
+                        const historyDiv = document.getElementById('chatHistory');
+                        
+                        // Show user question immediately
+                        historyDiv.innerHTML += '<div style="background:#334155; padding:10px; margin:5px 0; border-radius:5px; text-align:right;">' + question + '</div>';
+
+                        // Send to server
+                        const res = await fetch('/ask-trade-question', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ tradeId: id, question: question })
+                        });
+                        
+                        const data = await res.json();
+                        
+                        // Show AI Response
+                        historyDiv.innerHTML += '<div style="background:#1e293b; border:1px solid #6366f1; padding:10px; margin:5px 0; border-radius:5px;">🤖 ' + data.answer + '</div>';
+                        document.getElementById('loading').style.display = 'none';
+                        document.getElementById('userQuestion').value = '';
+                    }
+                </script>
             </body>
         `);
+
+    } catch (e) {
+        console.error(e);
+        res.send("Analysis Failed: " + e.message);
     }
+});
 
-    if (!savedData) return res.send("No advanced analysis data available for this trade.");
+app.post('/ask-trade-question', async (req, res) => {
+    try {
+        console.log("💬 Chat Request Received");
+        const { tradeId, question } = req.body;
+        
+        // 1. Fetch the trade again so AI knows the context
+        const doc = await db.collection('trades').doc(tradeId).get();
+        if (!doc.exists) return res.json({ answer: "Error: Trade not found." });
+        const t = doc.data();
 
-    // 2. RULES ENGINE (Now Multi-Lot Aware)
-    const { maxRunUp, highAfter, lowAfter, data, startTime } = savedData;
-    const tradeQty = trade.qty || 1;
-    const exitPrice = parseFloat(trade.executedPrice);
-    const isWin = trade.pnl >= 0;
-    
-    // Multi-Lot Calculations
-    const costThreshold = 600 * tradeQty;
-    const trailThreshold = 1000 * tradeQty;
+        // 2. Send context + Question to Gemini 3.0
+        const result = await client.models.generateContent({
+            model: "gemini-3-pro-preview",
+            contents: [{ 
+                role: "user", 
+                parts: [{ text: `
+                    SYSTEM: You are a strict trading coach.
+                    RULES: ${STRATEGY_RULES}
+                    
+                    CONTEXT: User is asking about a specific trade.
+                    Trade Data: Type=${t.type}, P/L=${t.pnl}, Buy=${t.buyPrice}, Sell=${t.sellPrice}, Time=${t.timestamp}.
+                    
+                    USER QUESTION: "${question}"
+                    
+                    ANSWER: Keep it brief, specific to this trade, and based on the rules.
+                ` }] 
+            }]
+        });
 
-    let opinion = "";
-    let color = "#cbd5e1"; 
+        // 3. Send AI answer back to the chat box
+        res.json({ answer: result.text });
 
-    if (!isWin && maxRunUp >= costThreshold) {
-        opinion = `❌ <b>RULE VIOLATION:</b> You reached ₹${maxRunUp.toFixed(0)} profit but ended in loss. Rule: If Profit > ₹${costThreshold} (${tradeQty}L), Move SL to Cost.`;
-        color = "#ef4444"; 
+    } catch (e) {
+        console.error("Chat Error:", e);
+        res.status(500).json({ answer: "Server Error: " + e.message });
     }
-    else if (!isWin) {
-        const tradeType = trade.type === 'BUY' ? 'SELL' : 'BUY'; 
-        let isStopHunt = (tradeType === 'SELL' && highAfter > exitPrice + 200) || (tradeType === 'BUY' && lowAfter < exitPrice - 200);
+});
 
-        if (isStopHunt) {
-            opinion = "⚠️ <b>STOP HUNT DETECTED:</b> Price reversed in your favor shortly after hitting your SL. The market 'wicked' your position.";
-            color = "#fbbf24"; 
-        } else {
-            opinion = "✅ <b>GOOD EXIT:</b> Price continued trending against you. Exiting here saved you from a massive drawdown.";
-            color = "#4ade80"; 
-        }
-    } else {
-        opinion = `🎉 <b>SUCCESS:</b> Trade captured ₹${trade.pnl.toFixed(0)} profit. Max profit reached was ₹${maxRunUp.toFixed(0)}.`;
-        color = "#4ade80";
-    }
+// 👆👆👆 END OF STEP 3 👆👆👆
 
-    // 3. DATA PREPARATION FOR GEMINI AI (SIDEBAR COMPATIBLE)
-    const aiBriefing = {
-        ruleCompliance: maxRunUp >= costThreshold ? "VIOLATED" : "FOLLOWED",
-        volatilityStats: { high: highAfter, low: lowAfter, totalTicks: data.length },
-        suggestion: maxRunUp >= (trailThreshold * 0.8) ? "Tighten Trailing Gap" : "Hold Position"
-    };
 
-    // 4. GENERATE FULL REPORT HTML
-    function getSnap(min) {
-        const target = startTime + (min * 60000);
-        return data.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev)?.p || '-';
-    }
-
-    res.send(`
-        <body style="background:#0f172a; color:white; font-family:sans-serif; padding:30px; display:flex; justify-content:center; gap:20px;">
-            <div style="max-width:550px; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #334155;">
-                <h2 style="color:#38bdf8; margin:0 0 15px 0;">🕵️ Trade Post-Mortem</h2>
-                <div style="background:${color}20; border-left:5px solid ${color}; padding:15px; border-radius:5px; margin-bottom:20px; line-height:1.5;">
-                    <strong style="color:${color}; font-size:18px;">${opinion}</strong>
-                </div>
-
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:20px;">
-                    <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid #334155;">
-                        <small style="color:#94a3b8;">MAX RUN-UP</small><br><b style="color:#4ade80; font-size:18px;">₹${maxRunUp.toFixed(0)}</b>
-                    </div>
-                    <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid #334155;">
-                        <small style="color:#94a3b8;">PNL PER LOT</small><br><b style="font-size:18px;">₹${(trade.pnl / tradeQty).toFixed(0)}</b>
-                    </div>
-                </div>
-
-                <h4 style="color:#94a3b8; border-bottom:1px solid #334155; padding-bottom:5px;">Price Action Timeline</h4>
-                <table style="width:100%; font-size:13px; text-align:left;">
-                    <tr style="color:#64748b;"><th>Offset</th><th>Price</th><th>vs Exit</th></tr>
-                    <tr><td>+1m</td><td>₹${getSnap(1)}</td><td>${(getSnap(1) - exitPrice).toFixed(0)}</td></tr>
-                    <tr><td>+5m</td><td>₹${getSnap(5)}</td><td>${(getSnap(5) - exitPrice).toFixed(0)}</td></tr>
-                    <tr><td>+10m</td><td>₹${getSnap(10)}</td><td>${(getSnap(10) - exitPrice).toFixed(0)}</td></tr>
-                </table>
-            </div>
-
-            <div style="width:350px; background:#1e293b; padding:25px; border-radius:15px; border:1px solid #6366f1;">
-                <h3 style="color:#a855f7; margin-top:0;">🤖 AI Performance Lab</h3>
-                <div style="background:#0f172a; padding:15px; border-radius:10px; font-size:13px; line-height:1.6; border:1px solid #4f46e5;">
-                    <b style="color:#38bdf8;">Gemini Suggestion:</b><br>
-                    Based on ${data.length} ticks, the market showed a volatility of ${((highAfter - lowAfter)/exitPrice*100).toFixed(2)}%. 
-                    <br><br>
-                    <span style="color:#fbbf24;">⚡ ACTION:</span> ${aiBriefing.suggestion}.
-                </div>
-                <br>
-                <a href="/ai-overall-optimization" style="display:block; text-align:center; width:100%; padding:12px; background:#6366f1; color:white; text-decoration:none; border-radius:8px; font-weight:bold;">Run Overall Optimization</a>
-            </div>
-        </body>
-    `);
+// ... [Bottom of file] ...
+app.listen(port, () => {
+    console.log(`Server running...`);
 });
 
 
