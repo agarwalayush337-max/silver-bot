@@ -1452,6 +1452,10 @@ app.post('/sync-price', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+app.listen(port, () => {
+    console.log(`Server running...`);
+});
+
 
 // ✅ NEW ROUTE: One-time PnL Reset
 app.post('/reset-pnl', async (req, res) => {
@@ -1691,9 +1695,6 @@ app.post('/ask-trade-question', async (req, res) => {
 
 
 // ... [Bottom of file] ...
-app.listen(port, () => {
-    console.log(`Server running...`);
-});
 
 
 // --- 🧠 AI STRATEGY OPTIMIZATION (Historical Analysis) ---
