@@ -1451,11 +1451,11 @@ app.post('/sync-price', async (req, res) => {
     res.redirect('/');
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(port, () => {
-    console.log(`Server running...`);
+// ✅ CORRECT: Define PORT first, then use it
+const PORT = process.env.PORT || 10000; // Define the port!
+app.listen(PORT, '0.0.0.0', () => {     // Use the variable
+    console.log(`🚀 Server running on port ${PORT}`);
 });
-
 
 // ✅ NEW ROUTE: One-time PnL Reset
 app.post('/reset-pnl', async (req, res) => {
