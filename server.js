@@ -1533,8 +1533,7 @@ const analyzeBtn = (t.status === 'FILLED')
     `);
 });
 
-// ✅ REPLACES THE ENTIRE /analyze-sl ROUTE
-// ✅ REPLACES THE ENTIRE /analyze-sl ROUTE
+// ✅ REPLACES THE ENTIRE /analyze-sl ROUTE (Advanced Quant Version)
 app.get('/analyze-sl', async (req, res) => {
     try {
         const tradeId = req.query.id;
@@ -1544,95 +1543,100 @@ app.get('/analyze-sl', async (req, res) => {
         if (!doc.exists) return res.send("Trade not found in database.");
         const t = doc.data();
 
-        // --- 1. SMART DATA RECONSTRUCTION ---
+        // --- 1. DATA RECONSTRUCTION ---
         const exitPrice = t.executedPrice || t.orderedPrice || 0;
         const totalPnL = t.pnl || 0;
         const qty = t.qty || 1;
         const pnlPerLot = (totalPnL / qty).toFixed(2);
+        const maxRunUp = t.analysisData?.maxRunUp || t.maxRunUp || 0; // Capture Max Profit seen
         
         // Reverse Engineer Entry Price
         let entryPrice = 0;
         let positionType = "";
         
-        if (t.type === 'BUY') { // We Bought to Exit -> We were SHORT
+        if (t.type === 'BUY') { // Exited via BUY -> Was SHORT
             positionType = "SHORT";
             entryPrice = exitPrice + (totalPnL / qty); 
-        } else { // We Sold to Exit -> We were LONG
+        } else { // Exited via SELL -> Was LONG
             positionType = "LONG";
             entryPrice = exitPrice - (totalPnL / qty);
         }
 
         const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : new Date().toLocaleString();
 
-        // --- 2. PREPARE AI CONTEXT ---
+        // --- 2. PREPARE TICK DATA FOR AI ---
+        // We send the 'analysisData' (Post-Exit) AND reconstruct 'During-Trade' context if possible
         const tickData = t.analysisData ? t.analysisData.data : [];
-        // Calculate High/Low of the Post-Exit Data for the AI
-        let postExitHigh = exitPrice; 
-        let postExitLow = exitPrice;
-        if (tickData.length > 0) {
-            const prices = tickData.map(d => d.p);
-            postExitHigh = Math.max(...prices);
-            postExitLow = Math.min(...prices);
-        }
+        const tickDataStr = JSON.stringify(tickData.slice(0, 100)); // Limit to first 100 ticks to save tokens
 
         const tradeContext = {
             Date: tradeDate,
             Position: positionType, 
-            Quantity: `${qty} Lots`,
             Entry: entryPrice.toFixed(2),
             Exit: exitPrice,
             PnL_Per_Lot: `₹${pnlPerLot}`,
-            My_Rules: "Init SL: 800pts | Trail Gap: 500pts (if >1000 profit)",
-            Post_Exit_Movement: tickData.length > 0 ? `Price ranged from ${postExitLow} to ${postExitHigh} in next 10 mins` : "No Data"
+            Max_RunUp_Seen: `₹${maxRunUp} (Peak Profit during trade)`,
+            My_Current_Rules: {
+                Initial_SL: "800 Points",
+                Trailing_Gap: "500 Points",
+                Move_To_Cost_Trigger: "600 Points Profit"
+            }
         };
 
-        // --- 3. THE "WHAT-IF" SIMULATION PROMPT ---
+        // --- 3. THE "QUANT OPTIMIZER" PROMPT ---
         const prompt = `
-            Act as a highly analytical Trading Coach.
-            
-            **SCENARIO:**
-            User took a **${positionType}** trade on Silver MIC.
-            They exited at **${exitPrice}** with a PnL of **${pnlPerLot}/lot**.
-            
-            **THE DATA (10 Mins After Exit):**
-            * The price moved between **Low: ${postExitLow}** and **High: ${postExitHigh}**.
-            * Full Tick Data (Sample): ${JSON.stringify(tickData.slice(0, 30))}... (trend continued similarly).
+            Act as a Quantitative Strategist. Review this Silver MIC trade and mathematically calculate the OPTIMAL parameters.
 
-            **YOUR TASK (The "What If" Analysis):**
-            
-            1. **The Verdict:** Did the user follow the "Move SL to Cost" rule (Profit > 600)? 
-               (Current PnL: ${pnlPerLot}).
-            
-            2. **"What If" Simulation (CRITICAL):**
-               * **If Trailing Gap was 800 (instead of 500):** Look at the post-exit volatility. Would a wider gap have kept them in the trade?
-               * **If Initial SL was 1000 (instead of 800):** If this was a loss, would a 1000pt stop have survived the dip?
-               * **Opportunity Cost:** If they stayed in for these 10 minutes, what would be the max potential profit? (Compare Entry ${entryPrice.toFixed(0)} vs Best Price in Range).
+            **TRADE CONTEXT:**
+            * Position: ${positionType}
+            * Entry: ${entryPrice.toFixed(2)} | Exit: ${exitPrice}
+            * Result: ${pnlPerLot}/lot
+            * **Max Profit Reached (RunUp): ₹${maxRunUp}**
 
-            3. **Conclusion:** Was this a "Good Exit" (Saved Money) or a "Premature Exit" (Left Money on Table)?
+            **POST-EXIT PRICE ACTION (Ticks):**
+            ${tickDataStr}
+
+            **YOUR MISSION (Reverse Engineer the Perfect Strategy):**
+            
+            1. **Optimal Initial SL:** Look at the price drawdown. Did the user get stopped out prematurely? 
+               *Calculated Advice:* "Based on the volatility, the Initial SL should have been **X Points** (e.g., 920) to survive the noise."
+
+            2. **Optimal Trailing Gap:** Analyze the retracements (pullbacks) in the tick data. 
+               *Calculated Advice:* "The market dipped 650 points before rallying. Your 500 point gap was too tight. The **Best Trailing Gap** for this specific trade was **X Points** (e.g., 700)."
+
+            3. **Optimal 'Move-to-Cost' Trigger:** Look at the Max RunUp (₹${maxRunUp}). 
+               *Calculated Advice:* "You missed the move-to-cost rule because profit only hit ${maxRunUp}. You should lower your trigger to **X Points** (e.g., 450) to lock in safety earlier."
+
+            4. **Opportunity Cost:** If the user had used these "Optimal Parameters", what would the result be?
+               * "You could have turned this ₹${pnlPerLot} loss into a **₹X Profit**."
 
             **OUTPUT FORMAT:**
-            Use HTML tags. 
-            <h3>Verdict</h3> ... 
-            <h3>What If Analysis</h3> <ul>...</ul>
-            <h3>Post-Mortem Conclusion</h3> ...
+            <h2>🛡️ Optimized Strategy Parameters</h2>
+            <ul>
+                <li><b>Best Initial SL:</b> [Value] (Reason)</li>
+                <li><b>Best Trailing Gap:</b> [Value] (Reason)</li>
+                <li><b>Best Safety Trigger:</b> [Value] (Reason)</li>
+            </ul>
+            <h3>💰 Opportunity Analysis</h3>
+            [Explain the potential outcome with these new settings]
         `;
 
         const result = await client.models.generateContent({
-            model: "gemini-3-flash-preview",
+            model: "gemini-3-pro-preview",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
 
         const analysisText = result.text ? result.text.replace(/\n/g, '<br>') : "No analysis generated.";
 
-        // --- 4. RENDER HTML HEADER (Identical to before) ---
+        // --- 4. RENDER HTML ---
         res.send(`
             <body style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:20px;">
                 <div style="max-width:800px; margin:auto; background:#1e293b; border-radius:12px; padding:25px; box-shadow:0 4px 20px rgba(0,0,0,0.4);">
                     
                     <div style="border-bottom:1px solid #334155; padding-bottom:15px; margin-bottom:20px;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <h2 style="color:#38bdf8; margin:0;">🚀 Trade & "What-If" Analysis</h2>
+                            <h2 style="color:#38bdf8; margin:0;">🧪 Quant "What-If" Analysis</h2>
                             <div style="text-align:right;">
                                 <div style="font-size:12px; color:#94a3b8;">${tradeDate}</div>
                                 <div style="font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}; font-size:18px;">
@@ -1641,22 +1645,18 @@ app.get('/analyze-sl', async (req, res) => {
                             </div>
                         </div>
 
-                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-top:20px; text-align:center;">
+                        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-top:20px; text-align:center;">
                             <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                                <div style="font-size:11px; color:#94a3b8;">POSITION</div>
-                                <div style="font-weight:bold; color:#fbbf24;">${positionType} (${qty} Lots)</div>
+                                <div style="font-size:11px; color:#94a3b8;">MAX RUN-UP</div>
+                                <div style="font-weight:bold; color:#fbbf24;">₹${maxRunUp}</div>
                             </div>
                             <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                                <div style="font-size:11px; color:#94a3b8;">ENTRY (Est)</div>
+                                <div style="font-size:11px; color:#94a3b8;">ENTRY</div>
                                 <div style="font-weight:bold;">${entryPrice.toFixed(0)}</div>
                             </div>
                             <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                                <div style="font-size:11px; color:#94a3b8;">EXIT PRICE</div>
+                                <div style="font-size:11px; color:#94a3b8;">EXIT</div>
                                 <div style="font-weight:bold;">${exitPrice}</div>
-                            </div>
-                            <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                                <div style="font-size:11px; color:#94a3b8;">PER LOT PnL</div>
-                                <div style="font-weight:bold; color:${pnlPerLot>=0?'#4ade80':'#f87171'}">₹${pnlPerLot}</div>
                             </div>
                         </div>
                     </div>
@@ -1666,10 +1666,10 @@ app.get('/analyze-sl', async (req, res) => {
                     </div>
 
                     <div style="background:#0f172a; padding:20px; border-radius:8px;">
-                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask the Strategy Coach</h3>
+                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask the Quant Coach</h3>
                         <div id="chatHistory" style="margin-bottom:15px; max-height:200px; overflow-y:auto;"></div>
                         <div style="display:flex; gap:10px;">
-                            <input type="text" id="q" placeholder="Ex: Would a 1000pt trailing stop have worked?" style="flex:1; padding:12px; background:#334155; border:none; color:white; border-radius:6px;">
+                            <input type="text" id="q" placeholder="Ex: Show me the math for the Best Trailing Gap" style="flex:1; padding:12px; background:#334155; border:none; color:white; border-radius:6px;">
                             <button onclick="ask()" style="padding:12px 20px; background:#6366f1; border:none; color:white; border-radius:6px; cursor:pointer;">Ask</button>
                         </div>
                     </div>
@@ -1698,6 +1698,7 @@ app.get('/analyze-sl', async (req, res) => {
         res.send("Error: " + e.message); 
     }
 });
+
 
 app.post('/ask-trade-question', async (req, res) => {
     try {
