@@ -1534,6 +1534,7 @@ const analyzeBtn = (t.status === 'FILLED')
 });
 
 // ✅ REPLACES THE ENTIRE /analyze-sl ROUTE
+// ✅ REPLACES THE ENTIRE /analyze-sl ROUTE
 app.get('/analyze-sl', async (req, res) => {
     try {
         const tradeId = req.query.id;
@@ -1549,66 +1550,71 @@ app.get('/analyze-sl', async (req, res) => {
         const qty = t.qty || 1;
         const pnlPerLot = (totalPnL / qty).toFixed(2);
         
-        // Reverse Engineer Entry Price (Since we only have the Exit Log)
-        // If Type is BUY (Short Cover) -> Entry was Higher (Exit + Profit/Qty)
-        // If Type is SELL (Long Exit) -> Entry was Lower (Exit - Profit/Qty)
+        // Reverse Engineer Entry Price
         let entryPrice = 0;
         let positionType = "";
         
-        if (t.type === 'BUY') {
-            // We Bought to Exit -> Meaning we were SHORT
+        if (t.type === 'BUY') { // We Bought to Exit -> We were SHORT
             positionType = "SHORT";
             entryPrice = exitPrice + (totalPnL / qty); 
-        } else {
-            // We Sold to Exit -> Meaning we were LONG
+        } else { // We Sold to Exit -> We were LONG
             positionType = "LONG";
             entryPrice = exitPrice - (totalPnL / qty);
         }
 
-        // Fix Date Format
         const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : new Date().toLocaleString();
 
         // --- 2. PREPARE AI CONTEXT ---
+        const tickData = t.analysisData ? t.analysisData.data : [];
+        // Calculate High/Low of the Post-Exit Data for the AI
+        let postExitHigh = exitPrice; 
+        let postExitLow = exitPrice;
+        if (tickData.length > 0) {
+            const prices = tickData.map(d => d.p);
+            postExitHigh = Math.max(...prices);
+            postExitLow = Math.min(...prices);
+        }
+
         const tradeContext = {
             Date: tradeDate,
-            Strategy_Position: positionType, // Explicitly tell AI "This was a SHORT trade"
-            Action: `Exited via ${t.type} Order`,
+            Position: positionType, 
             Quantity: `${qty} Lots`,
-            Entry_Price: entryPrice.toFixed(2),
-            Exit_Price: exitPrice,
-            Total_PnL: `₹${totalPnL}`,
+            Entry: entryPrice.toFixed(2),
+            Exit: exitPrice,
             PnL_Per_Lot: `₹${pnlPerLot}`,
-            // We rename this field so AI understands it's AFTER the trade
-            Post_Exit_Price_Action: t.analysisData ? "Attached below (10 mins after exit)" : "Not Recorded"
+            My_Rules: "Init SL: 800pts | Trail Gap: 500pts (if >1000 profit)",
+            Post_Exit_Movement: tickData.length > 0 ? `Price ranged from ${postExitLow} to ${postExitHigh} in next 10 mins` : "No Data"
         };
 
-        const tickDataString = t.analysisData ? JSON.stringify(t.analysisData).slice(0, 1500) : "No Data";
-
-        // --- 3. UPDATED PROMPT ---
+        // --- 3. THE "WHAT-IF" SIMULATION PROMPT ---
         const prompt = `
-            Act as a strict trading coach. Review this Silver MIC trade EXIT.
+            Act as a highly analytical Trading Coach.
             
-            **CRITICAL CONTEXT:**
-            1. I was holding a **${positionType}** position.
-            2. I closed it by **${t.type}ING** ${qty} lots at ${exitPrice}.
-            3. My **Per Lot Profit** was ${pnlPerLot}. (Use THIS for rule checks, NOT total PnL).
-            4. The Tick Data provided is **POST-EXIT** (what happened *after* I got out).
+            **SCENARIO:**
+            User took a **${positionType}** trade on Silver MIC.
+            They exited at **${exitPrice}** with a PnL of **${pnlPerLot}/lot**.
             
-            **MY STRATEGY RULES (PER LOT):**
-            ${STRATEGY_RULES}
+            **THE DATA (10 Mins After Exit):**
+            * The price moved between **Low: ${postExitLow}** and **High: ${postExitHigh}**.
+            * Full Tick Data (Sample): ${JSON.stringify(tickData.slice(0, 30))}... (trend continued similarly).
 
-            **TRADE DATA:**
-            ${JSON.stringify(tradeContext)}
-
-            **POST-EXIT TICKS (10 MINS):**
-            ${tickDataString}
-
-            **YOUR TASK:**
-            1. **Rule Check**: Did I follow the "Move SL to Cost if Profit > 600" rule based on my *Per Lot* profit of ${pnlPerLot}?
-            2. **Exit Analysis**: Look at the POST-EXIT ticks. Did the price reverse against me (Good Exit) or continue in my favor (Bad Exit)?
-            3. **Verdict**: PASS or FAIL.
+            **YOUR TASK (The "What If" Analysis):**
             
-            Do NOT show JSON. Speak naturally. Use bolding for key numbers.
+            1. **The Verdict:** Did the user follow the "Move SL to Cost" rule (Profit > 600)? 
+               (Current PnL: ${pnlPerLot}).
+            
+            2. **"What If" Simulation (CRITICAL):**
+               * **If Trailing Gap was 800 (instead of 500):** Look at the post-exit volatility. Would a wider gap have kept them in the trade?
+               * **If Initial SL was 1000 (instead of 800):** If this was a loss, would a 1000pt stop have survived the dip?
+               * **Opportunity Cost:** If they stayed in for these 10 minutes, what would be the max potential profit? (Compare Entry ${entryPrice.toFixed(0)} vs Best Price in Range).
+
+            3. **Conclusion:** Was this a "Good Exit" (Saved Money) or a "Premature Exit" (Left Money on Table)?
+
+            **OUTPUT FORMAT:**
+            Use HTML tags. 
+            <h3>Verdict</h3> ... 
+            <h3>What If Analysis</h3> <ul>...</ul>
+            <h3>Post-Mortem Conclusion</h3> ...
         `;
 
         const result = await client.models.generateContent({
@@ -1619,14 +1625,14 @@ app.get('/analyze-sl', async (req, res) => {
 
         const analysisText = result.text ? result.text.replace(/\n/g, '<br>') : "No analysis generated.";
 
-        // --- 4. RENDER HTML HEADER (FIXED) ---
+        // --- 4. RENDER HTML HEADER (Identical to before) ---
         res.send(`
             <body style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:20px;">
                 <div style="max-width:800px; margin:auto; background:#1e293b; border-radius:12px; padding:25px; box-shadow:0 4px 20px rgba(0,0,0,0.4);">
                     
                     <div style="border-bottom:1px solid #334155; padding-bottom:15px; margin-bottom:20px;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <h2 style="color:#38bdf8; margin:0;">🚀 Trade Analysis</h2>
+                            <h2 style="color:#38bdf8; margin:0;">🚀 Trade & "What-If" Analysis</h2>
                             <div style="text-align:right;">
                                 <div style="font-size:12px; color:#94a3b8;">${tradeDate}</div>
                                 <div style="font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}; font-size:18px;">
@@ -1663,7 +1669,7 @@ app.get('/analyze-sl', async (req, res) => {
                         <h3 style="color:#94a3b8; margin-top:0;">💬 Ask the Strategy Coach</h3>
                         <div id="chatHistory" style="margin-bottom:15px; max-height:200px; overflow-y:auto;"></div>
                         <div style="display:flex; gap:10px;">
-                            <input type="text" id="q" placeholder="Why was this a good exit?" style="flex:1; padding:12px; background:#334155; border:none; color:white; border-radius:6px;">
+                            <input type="text" id="q" placeholder="Ex: Would a 1000pt trailing stop have worked?" style="flex:1; padding:12px; background:#334155; border:none; color:white; border-radius:6px;">
                             <button onclick="ask()" style="padding:12px 20px; background:#6366f1; border:none; color:white; border-radius:6px; cursor:pointer;">Ask</button>
                         </div>
                     </div>
