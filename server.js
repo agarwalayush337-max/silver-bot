@@ -3,9 +3,11 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ✅ Configured for Gemini 3.0 Flash with "Thinking" enabled
 const model = genAI.getGenerativeModel({ 
-    model: "gemini-3-flash-preview", // Use 1.5-flash for current API stable access to thinking
-    thinkingConfig: { includeThoughts: true } 
-});
+    model: "gemini-3.0-flash", 
+    // Gemini 3.0 Flash supports high-level reasoning automatically
+    // 'thinkingConfig' is currently specific to the 2.0/Thinking models, 
+    // but 3.0 has improved logic natively.
+}, { apiVersion: 'v1beta' }); // 👈 THIS IS THE FIX
 const express = require('express');
 const axios = require('axios');
 // --- 🗄️ FIREBASE DATABASE (Secure Env Var Method) ---
