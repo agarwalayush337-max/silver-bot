@@ -805,13 +805,22 @@ async function verifyOrderStatus(orderId, context) {
                 }
 
                 // EXIT LOGIC: Standardized to 'EXIT_CHECK'
+                // EXIT LOGIC: Standardized to 'EXIT_CHECK'
                 if (context === 'EXIT_CHECK') {
                     botState.lastExitTime = Date.now(); 
                     console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
                     
-                    // ... (keep the rest of your monitor logic here) ...
+                    // ✅ FIX: START HIGH-PRECISION MONITORING
+                    console.log(`🎥 Starting 10-Minute Post-Trade Analysis for ${orderId}...`);
+                    botState.activeMonitors[orderId] = {
+                        startTime: Date.now(),
+                        maxRunUp: botState.maxRunUp, // Store the peak profit seen during the trade
+                        highestAfterExit: realPrice,
+                        lowestAfterExit: realPrice,
+                        data: [] // Ticks will be pushed here by WebSocket
+                    };
                     
-                    // Reset State AFTER PnL is calculated
+                    // Reset State AFTER initializing monitor
                     botState.positionType = null; 
                     botState.slOrderId = null; 
                     botState.maxRunUp = 0;
@@ -1070,34 +1079,39 @@ setInterval(async () => {
             // 4. Detailed Indicator Log
             const shortName = botState.contractName.replace("SILVER MIC ", ""); // Turns "SILVER MIC APRIL" into "APRIL"
             console.log(`📊 [${shortName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
-            // 5. Execute Signal Logic
-            // 5. Execute Signal Logic
+            // 5. Signal Detection Logic (Modified for Cooling Period Reporting)
             if (isMarketOpen() && !botState.positionType) {
                  
-                 // ✅ NEW: 2-Minute Cooling Period Check
-                 const msSinceExit = Date.now() - botState.lastExitTime;
-                 if (msSinceExit < 120000) {
-                     const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
-                     console.log(`⏳ Cooling Period Active: Waiting ${waitSec}s more...`);
-                     return; // Skip signal detection
-                 }
-                
-                 const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
-                 const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
+                // ✅ Check for signals FIRST
+                const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
+                const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
 
-                 if (isBuySignal) {
-                     if (botState.isTradingEnabled) {
-                         await placeOrder("BUY", botState.maxTradeQty, lastKnownLtp);
-                     } else {
-                         console.log(`⚠️ SIGNAL DETECTED: BUY @ ${lastKnownLtp} (Paused)`);
-                     }
+                // ✅ Check Cooling Period status
+                const msSinceExit = Date.now() - botState.lastExitTime;
+                const inCoolingPeriod = msSinceExit < 120000;
+                const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
+
+                if (isBuySignal) {
+                    if (inCoolingPeriod) {
+                        console.log(`⚠️ [COOLING] Signal Detected: BUY @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
+                    } else if (botState.isTradingEnabled) {
+                        await placeOrder("BUY", botState.maxTradeQty, lastKnownLtp);
+                    } else {
+                        console.log(`⚠️ SIGNAL DETECTED: BUY @ ${lastKnownLtp} (Bot Paused)`);
+                    }
                 } 
                 else if (isSellSignal) {
-                    if (botState.isTradingEnabled) {
+                    if (inCoolingPeriod) {
+                        console.log(`⚠️ [COOLING] Signal Detected: SELL @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
+                    } else if (botState.isTradingEnabled) {
                         await placeOrder("SELL", botState.maxTradeQty, lastKnownLtp);
                     } else {
-                         console.log(`⚠️ SIGNAL DETECTED: SELL @ ${lastKnownLtp} (Paused)`);
+                        console.log(`⚠️ SIGNAL DETECTED: SELL @ ${lastKnownLtp} (Bot Paused)`);
                     }
+                }
+                // Log cooling status if no signal but cooling is active
+                else if (inCoolingPeriod) {
+                    console.log(`⏳ Cooling Period Active: Waiting ${waitSec}s more...`);
                 }
             } 
         }
