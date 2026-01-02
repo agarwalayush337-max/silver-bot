@@ -1,25 +1,25 @@
-// 1. Correct CommonJS require (accessing the .genai property)
-const { genai } = require("@google/genai");
+// ✅ Correct CommonJS import for Gemini 3
+const { GoogleGenAI } = require("@google/genai");
 
-// 2. Correct Factory Initialization
-const client = genai.createClient({
+// ✅ Initialize using the 'new' keyword and the correct class name
+const client = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY,
-    apiVersion: 'v1beta' // 👈 Vital for Gemini 3
 });
 
-// ✅ Strategy Analyzer using Gemini 3.0 Thinking
-async function getDeepDiveAnalysis(tradeData) {
+async function runStrategicAnalysis(tradeHistory) {
     const response = await client.models.generateContent({
         model: "gemini-3-pro-preview",
-        contents: [{ role: "user", parts: [{ text: "Analyze these trades: " + JSON.stringify(tradeData) }] }],
+        contents: [{ role: "user", parts: [{ text: "Evaluate strategy: " + JSON.stringify(tradeHistory) }] }],
         config: {
-            // ✅ This is the correct way to enable Thinking for Gemini 3
+            // ✅ NATIVE GEMINI 3 THINKING
             thinkingConfig: {
-                thinkingLevel: "high" // Use "high" for deep strategy reasoning
-            }
+                thinkingLevel: "high" 
+            },
+            temperature: 1.0 
         }
     });
 
+    // In this SDK version, .text is a property of the response
     return response.text;
 }
 const express = require('express');
