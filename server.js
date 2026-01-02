@@ -1636,7 +1636,7 @@ app.get('/ai-overall-optimization', async (req, res) => {
         const result = await model.generateContent(prompt);
         const aiResponse = result.response.text().replace(/\n/g, '<br>');
 
-        res.send(\`
+        res.send(`
             <body style="background:#0f172a; color:white; font-family:sans-serif; padding:40px;">
                 <div style="max-width:800px; margin:auto; background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5;">
                     <h1 style="color:#38bdf8;">🧠 Strategy Optimization (Gemini 3.0 Flash)</h1>
@@ -1644,7 +1644,7 @@ app.get('/ai-overall-optimization', async (req, res) => {
                     <br><a href="/" style="display:inline-block; padding:10px 20px; background:#6366f1; color:white; text-decoration:none; border-radius:8px;">🏠 Back to Dashboard</a>
                 </div>
             </body>
-        \`);
+        `);
     } catch (e) { 
         console.error("AI Error:", e);
         res.status(500).send("AI Strategy Error: " + e.message); 
