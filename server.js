@@ -1488,8 +1488,10 @@ app.get('/reports', (req, res) => {
         const dayLogs = grouped[selectedDate].trades;
         const dayRows = dayLogs.map(t => {
             // ✅ CHANGED: Show Analyze button for ALL filled trades
-            const analyzeBtn = (t.status === 'FILLED') ? `<a href="/analyze-sl/${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` : '';
-            
+            // ✅ FIXED REPORTS LINK
+const analyzeBtn = (t.status === 'FILLED') 
+    ? `<a href="/analyze-sl?id=${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` 
+    : '';
             return `<div style="padding:10px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; font-size:12px;">
                 <span>${t.time}</span>
                 <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b>
