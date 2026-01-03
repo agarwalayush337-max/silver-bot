@@ -44,7 +44,8 @@ const db = serviceAccount ? admin.firestore() : null;
 
 const puppeteer = require('puppeteer');
 const OTPAuth = require('otpauth');
-const { EMA, SMA, ATR } = require("technicalindicators");
+const { EMA, SMA, ATR, RSI } = require("technicalindicators");
+const { Parser } = require('json2csv'); // 🆕 For Excel Download
 // ✅ CORRECT IMPORT for Manual WebSocket
 const UpstoxClient = require('upstox-js-sdk');
 const protobuf = require("protobufjs"); // 🆕 REQUIRED
@@ -323,12 +324,22 @@ function generateLogHTML(logs) {
         const isPaired = pairedIds.has(t.id);
         const bgStyle = isPaired ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' : 'border-bottom:1px solid #334155;';
 
+        // --- REPLACE INSIDE generateLogHTML function ---
+
+        const metrics = t.metrics || {}; 
+        // Show RSI and Volume Multiple in the log
+        const extraInfo = metrics.rsi ? `RSI:${metrics.rsi} V:${metrics.volMult}x` : '';
+
         return `<div style="display:grid; grid-template-columns: 1.2fr 0.6fr 0.5fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
             <span style="color:#94a3b8;">${t.time}</span> 
             <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
             <span style="text-align:center; color:#cbd5e1;">${t.qty || botState.maxTradeQty}L</span> <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
             <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
-            <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} ${analyzeBtn} ${deleteBtn}</span>
+            <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
+                ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} 
+                <br><span style="font-size:9px; color:#64748b;">${extraInfo}</span>
+                ${analyzeBtn} ${deleteBtn}
+            </span>
             <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${t.id || '-'}</span>
         </div>`;
     }).join('');
@@ -569,31 +580,54 @@ async function initWebSocket() {
                             if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
                                 lastKnownLtp = newPrice;
                         
+                
                                 // 1️⃣ LIVE TRADE TRACKING
                                 if (botState.positionType) {
-                                    const tradeQty = botState.quantity || 1; // Use current trade quantity
+                                    const tradeQty = botState.quantity || 1;
                                     let currentProfit = 0;
                                     if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * tradeQty;
                                     if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * tradeQty;
                                     
                                     if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
                                 
+                                    // ✅ RULE 1: DYNAMIC TRAILING
+                                    // Use Live ATR (limit min to 500)
+                                    const liveATR = Math.max(globalATR, 500) || 1000;
+                                    
                                     let newStop = botState.currentStop;
                                     let didChange = false;
-                                    let trailingGap = globalATR * 1.5; 
-                                
-                                
-                                    if (currentProfit >= (1000 * tradeQty)) trailingGap = 500;
-                                    if (currentProfit >= (600 * tradeQty)) {
-                                        const costSL = botState.entryPrice;
-                                        const betterSL = botState.positionType === 'LONG' ? Math.max(botState.currentStop, costSL) : Math.min(botState.currentStop, costSL);
-                                        if (newStop !== betterSL) { 
-                                            console.log(`🛡️ Profit > ${600 * tradeQty} | Moving SL to Cost: ₹${betterSL}`); // ✅ ADD THIS LOG
-                                            newStop = betterSL; 
-                                            didChange = true; 
+
+                                    // STAGE A: Move to Cost if Profit > 1 ATR
+                                    if (currentProfit >= liveATR) {
+                                        const costSL = botState.entryPrice; 
+                                        const isBetter = botState.positionType === 'LONG' ? (costSL > botState.currentStop) : (costSL < botState.currentStop);
+                                        
+                                        if (isBetter) {
+                                            newStop = costSL;
+                                            didChange = true;
+                                            console.log(`🛡️ Profit > 1 ATR (${liveATR.toFixed(0)}) | Moving SL to Cost`);
                                         }
                                     }
 
+                                    // STAGE B: Trail Aggressively if Profit > 1.5 ATR
+                                    if (currentProfit >= (1.5 * liveATR)) {
+                                        
+                                        // Normal Trail Gap = 1 ATR
+                                        let dynamicGap = liveATR; 
+                                        
+                                        // Tighten if Profit > 4 ATR (Super Trend)
+                                        if (currentProfit >= (4 * liveATR)) dynamicGap = liveATR * 0.5;
+
+                                        if (botState.positionType === 'LONG') {
+                                            const trailingLevel = newPrice - dynamicGap;
+                                            if (trailingLevel > newStop) { newStop = trailingLevel; didChange = true; }
+                                        } else {
+                                            const trailingLevel = newPrice + dynamicGap;
+                                            if (trailingLevel < newStop) { newStop = trailingLevel; didChange = true; }
+                                        }
+                                    }
+
+                                    
                                     if (botState.positionType === 'LONG') {
                                         const trailingLevel = newPrice - trailingGap;
                                         if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
@@ -1074,6 +1108,7 @@ setInterval(() => {
 // TRADING LOOP (Runs every 30s)
 // --- TRADING ENGINE (Watcher & Entry) ---
 // --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
+// --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
 setInterval(async () => {
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
@@ -1107,55 +1142,89 @@ setInterval(async () => {
             const l = candles.map(c => c[3]);
             const v = candles.map(c => c[5]);
 
-            // 3. Indicator Calculations
+            // 1. CALCULATE INDICATORS
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
             const vAvg = SMA.calculate({period: 20, values: v});
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
-            
+            const rsiArray = RSI.calculate({period: 14, values: cl}); // 🆕 RSI
+
             const curE50 = e50[e50.length-1];
             const curE200 = e200[e200.length-1];
             const curV = v[v.length-1];
             const curAvgV = vAvg[vAvg.length-1];
-            globalATR = atr[atr.length-1]; 
+            const curRSI = rsiArray[rsiArray.length - 1]; 
             
+            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
+            const rawATR = atr[atr.length-1];
+            globalATR = rawATR ? Math.max(rawATR, 500) : 1000; 
+
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
+            const volMult = curV / curAvgV; 
 
-            // 4. Detailed Indicator Log
-            const shortName = botState.contractName.replace("SILVER MIC ", ""); // Turns "SILVER MIC APRIL" into "APRIL"
-            console.log(`📊 [${shortName}] LTP: ${lastKnownLtp} | E50: ${curE50.toFixed(0)} | E200: ${curE200.toFixed(0)} | Vol: ${curV} | Avg Vol: ${curAvgV.toFixed(0)}`);
-            // 5. Signal Detection Logic (Modified for Cooling Period Reporting)
+            // 2. DETAILED LOG
+            const shortName = botState.contractName.replace("SILVER MIC ", ""); 
+            console.log(`📊 [${shortName}] LTP:${lastKnownLtp} E50:${curE50.toFixed(0)} E200:${curE200.toFixed(0)} Vol:${curV} AvgV:${curAvgV.toFixed(0)} ATR:${globalATR.toFixed(0)} RSI:${curRSI.toFixed(1)}`);
+
+            // 3. SIGNAL LOGIC
             if (isMarketOpen() && !botState.positionType) {
-                 
-                // ✅ Check for signals FIRST
-                const isBuySignal = (cl[cl.length-2] > e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp > bH);
-                const isSellSignal = (cl[cl.length-2] < e50[e50.length-2] && curV > (curAvgV * 1.5) && lastKnownLtp < bL);
+                
+                // ✅ RULE: Volume Guardrails (1.4x to 3.5x)
+                const isVolValid = (volMult > 1.4 && volMult <= 3.5); 
 
-                // ✅ Check Cooling Period status
+                const isBuySignal = (
+                    cl[cl.length-2] > e50[e50.length-2] && 
+                    isVolValid && 
+                    lastKnownLtp > bH 
+                );
+
+                const isSellSignal = (
+                    cl[cl.length-2] < e50[e50.length-2] && 
+                    isVolValid && 
+                    lastKnownLtp < bL 
+                );
+
+                // Check Cooling Period
                 const msSinceExit = Date.now() - botState.lastExitTime;
                 const inCoolingPeriod = msSinceExit < 120000;
                 const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
 
-                if (isBuySignal) {
+                if (isBuySignal || isSellSignal) {
+                    const signalType = isBuySignal ? "BUY" : "SELL";
+
                     if (inCoolingPeriod) {
-                        console.log(`⚠️ [COOLING] Signal Detected: BUY @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
+                        // ✅ EXACT LOG FORMAT: SIGNAL BLOCKED
+                        console.log(`⚠️ [COOLING] Signal Detected: ${signalType} @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
                     } else if (botState.isTradingEnabled) {
-                        await placeOrder("BUY", botState.maxTradeQty, lastKnownLtp);
+                        
+                        // ✅ DYNAMIC STOP LOSS (1.5 * ATR)
+                        const price = lastKnownLtp;
+                        
+                        // PLACE ORDER
+                        const success = await placeOrder(signalType, botState.maxTradeQty, price);
+
+                        // LOG METRICS FOR EXCEL
+                        if(success) {
+                             const logIndex = botState.history.findIndex(h => h.id === "PENDING" || h.status === "SENT");
+                             if(logIndex !== -1) {
+                                 botState.history[logIndex].metrics = {
+                                     rsi: curRSI.toFixed(2),
+                                     atr: globalATR.toFixed(0),
+                                     e50: curE50.toFixed(0),
+                                     e200: curE200.toFixed(0),
+                                     vol: curV,
+                                     avgVol: curAvgV.toFixed(0),
+                                     volMult: volMult.toFixed(2)
+                                 };
+                             }
+                        }
+
                     } else {
-                        console.log(`⚠️ SIGNAL DETECTED: BUY @ ${lastKnownLtp} (Bot Paused)`);
-                    }
-                } 
-                else if (isSellSignal) {
-                    if (inCoolingPeriod) {
-                        console.log(`⚠️ [COOLING] Signal Detected: SELL @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
-                    } else if (botState.isTradingEnabled) {
-                        await placeOrder("SELL", botState.maxTradeQty, lastKnownLtp);
-                    } else {
-                        console.log(`⚠️ SIGNAL DETECTED: SELL @ ${lastKnownLtp} (Bot Paused)`);
+                        console.log(`⚠️ Signal (Paused): ${signalType} @ ${lastKnownLtp} | RSI: ${curRSI.toFixed(1)}`);
                     }
                 }
-                // Log cooling status if no signal but cooling is active
+                // ✅ OPTIONAL: Log generic cooling status only if cooling is active (Correctly Placed Here)
                 else if (inCoolingPeriod) {
                     console.log(`⏳ Cooling Period Active: Waiting ${waitSec}s more...`);
                 }
@@ -1319,6 +1388,11 @@ app.get('/', (req, res) => {
                         <small id="hist-btn-pnl" style="color:${historyPnL>=0?'#4ade80':'#f87171'}">Total: ₹${historyPnL.toFixed(2)}</small>
                     </a>
                 </div>
+                <a href="/download-excel" style="display:block; width:100%; margin-bottom:15px; padding:10px; background:#22c55e; color:white; text-align:center; border-radius:8px; text-decoration:none;">
+                    📥 DOWNLOAD EXCEL DATA
+                </a>
+                <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:15px; border:1px solid #334155;">
+                    <form action="/update-qty" method="POST" style="display:flex; justify-content:space-between; align-items:center;">
 
                 <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:15px; border:1px solid #334155;">
                     <form action="/update-qty" method="POST" style="display:flex; justify-content:space-between; align-items:center;">
@@ -1907,6 +1981,46 @@ app.post('/update-qty', async (req, res) => {
         console.log(`🔢 Next Trade Qty set to: ${newQty}`);
     }
     res.redirect('/');
+});
+
+
+// ✅ RULE 5: EXCEL DOWNLOAD ROUTE
+app.get('/download-excel', (req, res) => {
+    try {
+        const trades = botState.history.filter(t => t.status === 'FILLED' && !t.type.includes('SYSTEM'));
+        
+        // Map data to YOUR exact Sheet format
+        const excelData = trades.map(t => {
+            const m = t.metrics || {};
+            return {
+                "DATE": t.date,
+                "TYPE": t.type,
+                "QUANTITY": t.qty,
+                "ENTRY PRICE": t.orderedPrice, 
+                "ENTRY TIME": t.time,
+                "EXIT PRICE": t.executedPrice,
+                "EXIT TIME": t.lastExitTime ? new Date(t.lastExitTime).toLocaleTimeString() : '-', 
+                "PnL": t.pnl || 0,
+                "E50": m.e50 || '-',
+                "E200": m.e200 || '-',
+                "VOLUME": m.vol || '-',
+                "AVG VOLUME": m.avgVol || '-',
+                "VOLUME MULTIPLE": m.volMult || '-',
+                "RSI": m.rsi || '-'
+            };
+        });
+
+        const json2csvParser = new Parser();
+        const csv = json2csvParser.parse(excelData);
+
+        res.header('Content-Type', 'text/csv');
+        res.attachment(`Silver_Trades_${formatDate(getIST())}.csv`);
+        res.send(csv);
+
+    } catch (e) {
+        console.error("Excel Gen Error:", e);
+        res.status(500).send("Error generating Excel: " + e.message);
+    }
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
