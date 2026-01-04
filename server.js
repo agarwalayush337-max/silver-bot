@@ -385,14 +385,32 @@ async function loadState() {
         const doc = await db.collection('bot').doc('main').get();
         if (doc.exists) {
             const data = doc.data();
+            
+            // Restoration Logic
             botState.positionType = data.positionType;
             botState.entryPrice = data.entryPrice || 0;
             botState.currentStop = data.currentStop;
             botState.slOrderId = data.slOrderId;
             botState.isTradingEnabled = data.isTradingEnabled ?? true;
             botState.maxRunUp = data.maxRunUp || 0;
-            botState.quantity = data.quantity || 0;
+            botState.maxDrawdown = data.maxDrawdown || 0; // ✅ Load MAE Memory
+            
+            // ✅ CRITICAL FIX: LOAD SAVED QUANTITY PREFERENCE
+            // If data.maxTradeQty exists, use it. If not, default to 1.
+            botState.maxTradeQty = data.maxTradeQty || 1; 
+            
+            // Restore current position quantity (if any)
+            botState.quantity = data.quantity || 0; 
+            
             botState.hiddenLogIds = data.hiddenLogIds || [];
+            
+            // Restore Post-Exit Watcher (The 10-min recording)
+            if (data.postExitWatch) {
+                botState.postExitWatch = data.postExitWatch;
+                console.log(`🎥 Resuming Post-Trade Watch for ID: ${botState.postExitWatch.id}`);
+            }
+            
+            console.log(`⚙️ Settings Loaded. Trading Qty: ${botState.maxTradeQty} | Position: ${botState.positionType || 'NONE'}`);
         }
 
         // 2. Load Trades
@@ -411,22 +429,16 @@ async function loadState() {
                 botState.history.push(trade);
             } else {
                 // Found a duplicate! (The ghost copy)
-                // We don't save it to memory.
-                // Optionally: We could delete it from DB here, but filtering memory is safer for now.
                 console.log(`🧹 Filtered out duplicate trade: ${trade.id}`);
             }
         }
         
         console.log(`✅ Loaded ${botState.history.length} unique trades.`);
 
-        // 4. MIGRATION CHECK (Only runs if Firebase was totally empty)
-        if (rawHistory.length === 0) {
-           // ... (Your existing migration logic from Redis goes here if you want to keep it, otherwise remove it) ...
-        }
-
     } catch (e) { console.error("❌ Firebase Load Error:", e.message); }
 }
 loadState();
+
 async function saveState() { await saveSettings(); } // Backward compatibility wrapper
 // --- TIME HELPERS ---
 function getIST() { return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"})); }
@@ -579,6 +591,37 @@ async function initWebSocket() {
                             
                             if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
                                 lastKnownLtp = newPrice;
+
+                                // --- INSIDE currentWs.onmessage (After getting newPrice) ---
+                    
+                                // 0️⃣ TICK RECORDER (For AI Analysis)
+                                const tickTime = getIST(); // Get IST Time object
+                                const tickLog = { t: tickTime.toLocaleTimeString(), p: newPrice }; // Compact format: t=Time, p=Price
+                    
+                                // A) Record if currently IN A TRADE
+                                if (botState.positionType) {
+                                    if (!botState.currentTradeTicks) botState.currentTradeTicks = [];
+                                    botState.currentTradeTicks.push(tickLog);
+                                }
+                    
+                                // B) Record if in POST-EXIT WATCH (The 10 mins after trade)
+                                if (botState.postExitWatch) {
+                                    if (Date.now() < botState.postExitWatch.until) {
+                                        // Find the completed trade in history
+                                        const pastTrade = botState.history.find(t => t.id === botState.postExitWatch.id);
+                                        if (pastTrade) {
+                                            if (!pastTrade.tickData) pastTrade.tickData = [];
+                                            pastTrade.tickData.push(tickLog);
+                                        }
+                                    } else {
+                                        // Time expired (10 mins done)
+                                        console.log(`⏹️ Post-Trade Recording Finished for ${botState.postExitWatch.id}`);
+                                        botState.postExitWatch = null; 
+                                        saveSettings(); // Save final data to Firebase
+                                    }
+                                }
+                    
+                                // ... (Continue with existing 1️⃣ LIVE TRADE TRACKING logic) ...
                         
                 
                                 // 1️⃣ LIVE TRADE TRACKING
@@ -971,19 +1014,21 @@ async function verifyOrderStatus(orderId, context) {
 async function placeOrder(type, qty, ltp) {
     if (!ACCESS_TOKEN || !isApiAvailable() || !botState.isTradingEnabled) return false;
 
-    // 1. Calculate Initial 0.3% Buffer (Rounded to Whole Number for MCX)
+    // 1. Calculate Initial 0.3% Buffer
     const bufferAmount = ltp * 0.003;
     let limitPrice = type === "BUY" ? Math.round(ltp + bufferAmount) : Math.round(ltp - bufferAmount);
 
     console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit: ₹${limitPrice}`);
 
-    const logId = "PENDING";
-    botState.history.unshift({ 
+    // Create Initial Log
+    const logId = "ORD-" + Date.now(); // Unique ID for tracking
+    const logEntry = { 
         date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
         type: type, 
-        qty: qty, // ✅ Added: Ensure the placed quantity is logged immediately
+        qty: qty, 
         orderedPrice: ltp, executedPrice: 0, id: logId, status: "SENT", tag: "API_BOT" 
-    });
+    };
+    botState.history.unshift(logEntry);
     pushToDashboard();
 
     try {
@@ -1002,7 +1047,7 @@ async function placeOrder(type, qty, ltp) {
             tag: "API_BOT"
         }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
-        // ✅ THE V3 FIX: Capture ID from the plural "order_ids" array
+        // Capture ID
         let orderId = res.data?.data?.order_ids?.[0] || res.data?.data?.order_id || res.data?.order_id;
 
         if (!orderId) {
@@ -1010,21 +1055,82 @@ async function placeOrder(type, qty, ltp) {
             throw new Error("No Order ID found in Upstox response.");
         }
 
-        // 3. START ROBUST VERIFICATION
+        // 3. ROBUST VERIFICATION
+        // passing 'ENTRY' helps verifyOrderStatus logic if distinct, otherwise generic
         const result = await verifyOrderStatus(orderId, 'ENTRY');
 
         if (result.status === 'FILLED') {
-            botState.positionType = type === "BUY" ? 'LONG' : 'SHORT';
-            botState.entryPrice = result.price; 
-            botState.quantity = qty;
-            botState.maxRunUp = 0; 
-
-            const slPrice = type === "BUY" ? Math.round(result.price - 800) : Math.round(result.price + 800);
-            botState.currentStop = slPrice;
             
-            await saveSettings();
-            await manageExchangeSL(type, qty, slPrice); 
-            return true;
+            // ✅ DETECT IF THIS IS AN ENTRY OR EXIT
+            // It is an Entry if we have NO position, OR if we are adding to same side (unlikely in this bot)
+            // It is an Exit if we have a position and this order is Opposite
+            const isExit = botState.positionType && (botState.positionType === 'LONG' && type === 'SELL') || (botState.positionType === 'SHORT' && type === 'BUY');
+
+            if (!isExit) {
+                //Handler: === NEW ENTRY ===
+                botState.positionType = type === "BUY" ? 'LONG' : 'SHORT';
+                botState.entryPrice = result.price; 
+                botState.quantity = qty;
+                
+                // ✅ RESET AI METRICS FOR NEW TRADE
+                botState.maxRunUp = 0; 
+                botState.maxDrawdown = 0; 
+                botState.currentTradeTicks = []; // Start Fresh Recording
+
+                // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
+                const liveATR = Math.max(globalATR, 500) || 1000;
+                const slPoints = Math.round(liveATR * 1.5);
+                const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
+                
+                botState.currentStop = slPrice;
+                
+                // Update Log with Execution Price
+                const histIdx = botState.history.findIndex(h => h.id === logId);
+                if(histIdx !== -1) botState.history[histIdx].executedPrice = result.price;
+
+                await saveSettings();
+                await manageExchangeSL(type, qty, slPrice); 
+                return true;
+
+            } else {
+                //Handler: === EXIT / SQUARE OFF ===
+                
+                // Calculate PnL
+                let pnl = 0;
+                if(botState.positionType === 'LONG') pnl = (result.price - botState.entryPrice) * qty;
+                if(botState.positionType === 'SHORT') pnl = (botState.entryPrice - result.price) * qty;
+
+                // Update the log we just pushed at the top with Final Data
+                const histIdx = botState.history.findIndex(h => h.id === logId);
+                if(histIdx !== -1) {
+                    botState.history[histIdx].executedPrice = result.price;
+                    botState.history[histIdx].pnl = pnl;
+                    
+                    // ✅ SAVE AI DATA (TICKS + METRICS)
+                    botState.history[histIdx].tickData = [...(botState.currentTradeTicks || [])];
+                    botState.history[histIdx].metrics = {
+                        mae: botState.maxDrawdown || 0,
+                        mfe: botState.maxRunUp || 0
+                        // Note: RSI/ATR metrics are added by the Interval loop separately
+                    };
+                }
+
+                // ✅ START 10-MINUTE POST-TRADE WATCHER
+                botState.postExitWatch = {
+                    id: logId, // Link to this specific trade log
+                    until: Date.now() + (10 * 60 * 1000) // 10 Minutes from now
+                };
+                console.log(`🎥 AI Camera Rolling: Recording 10 mins post-trade (ID: ${logId})`);
+
+                // CLEANUP STATE
+                botState.positionType = null;
+                botState.currentTradeTicks = [];
+                botState.maxRunUp = 0;
+                botState.maxDrawdown = 0;
+                
+                await saveSettings();
+                return true;
+            }
         }
         return false;
 
@@ -1032,7 +1138,6 @@ async function placeOrder(type, qty, ltp) {
         const errorDetail = e.response?.data?.errors?.[0]?.message || e.message;
 
         // 🛡️ CIRCUIT BREACH AUTO-RECOVERY
-        // Scans the error message for "High Price Range:XXXXX.XX" to set the max possible bid
         const highMatch = errorDetail.match(/High Price Range:(\d+\.?\d*)/);
         const lowMatch = errorDetail.match(/Low Price Range:(\d+\.?\d*)/);
 
@@ -1041,7 +1146,7 @@ async function placeOrder(type, qty, ltp) {
             
             console.error(`⚠️ Circuit Breach! Auto-adjusting to Limit: ₹${circuitLimitPrice}`);
             
-            // SECOND ATTEMPT: Place order at exact circuit limit provided by RMS
+            // SECOND ATTEMPT
             try {
                 const res2 = await axios.post("https://api.upstox.com/v3/order/place", {
                     quantity: qty, product: "I", validity: "DAY", price: circuitLimitPrice,
@@ -1057,7 +1162,10 @@ async function placeOrder(type, qty, ltp) {
         }
 
         console.error(`❌ [FAILURE] Order Rejected: ${errorDetail}`);
-        botState.positionType = null;
+        // Only reset position if we were trying to enter and failed. 
+        // If exiting and failed, we are still in position!
+        if (!botState.positionType) botState.positionType = null; 
+        
         pushToDashboard();
         await saveSettings();
         return false;
@@ -2073,13 +2181,19 @@ app.get('/switch-contract', async (req, res) => {
 });
 
 app.post('/update-qty', async (req, res) => {
-    const newQty = parseInt(req.body.qty);
-    if (newQty > 0 && newQty <= 10) {
-        botState.maxTradeQty = newQty;
-        if (db) await saveSettings();
-        console.log(`🔢 Next Trade Qty set to: ${newQty}`);
+    try {
+        const newQty = parseInt(req.body.quantity || req.body.qty); // Handle 'quantity' or 'qty' name
+        
+        if (newQty && newQty > 0) {
+            botState.maxTradeQty = newQty; // Update Memory
+            await saveSettings(); // 💾 CRITICAL: Save to Firebase/File
+            console.log(`✅ Trade Quantity Updated to: ${botState.maxTradeQty} Lots`);
+        }
+        res.redirect('/'); // Go back to dashboard
+    } catch (e) {
+        console.error("Update Qty Error:", e);
+        res.status(500).send("Error updating quantity");
     }
-    res.redirect('/');
 });
 
 
