@@ -1388,11 +1388,6 @@ app.get('/', (req, res) => {
                         <small id="hist-btn-pnl" style="color:${historyPnL>=0?'#4ade80':'#f87171'}">Total: ₹${historyPnL.toFixed(2)}</small>
                     </a>
                 </div>
-                <a href="/download-excel" style="display:block; width:100%; margin-bottom:15px; padding:10px; background:#22c55e; color:white; text-align:center; border-radius:8px; text-decoration:none;">
-                    📥 DOWNLOAD EXCEL DATA
-                </a>
-                <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:15px; border:1px solid #334155;">
-                    <form action="/update-qty" method="POST" style="display:flex; justify-content:space-between; align-items:center;">
 
                 <div style="background:#0f172a; padding:15px; border-radius:10px; margin-bottom:15px; border:1px solid #334155;">
                     <form action="/update-qty" method="POST" style="display:flex; justify-content:space-between; align-items:center;">
@@ -1536,76 +1531,90 @@ app.post('/reset-pnl', async (req, res) => {
     res.redirect('/');
 });
 
-// --- 📊 REPORTS ROUTE ---
+// ✅ REPORTS PAGE (With Date-wise Excel Download)
 app.get('/reports', (req, res) => {
-    // 1. Group Data by Date
+    // 1. Group History by Date
     const grouped = {};
-    botState.history.forEach(log => {
-        if (!log.date || log.type.includes('SYSTEM')) return;
-        if (!grouped[log.date]) grouped[log.date] = { date: log.date, trades: [], pnl: 0, wins: 0, losses: 0 };
-        
-        grouped[log.date].trades.push(log);
-        if (log.pnl) {
-            grouped[log.date].pnl += log.pnl;
-            if (log.pnl > 0) grouped[log.date].wins++;
-            else grouped[log.date].losses++;
-        }
+    const trades = botState.history.filter(h => h.status === 'FILLED' && !h.type.includes('SYSTEM'));
+
+    trades.forEach(t => {
+        if (!grouped[t.date]) grouped[t.date] = [];
+        grouped[t.date].push(t);
     });
 
-    const reportRows = Object.values(grouped).sort((a,b) => new Date(b.date) - new Date(a.date));
-
-    // 2. Check if a specific date is selected
-    const selectedDate = req.query.date;
-    let detailView = "";
+    // 2. Start HTML Generation
+    let html = `<html><head><title>Trade Reports</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 1000px; margin: auto; }
+        .date-card { background: #1e293b; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #334155; }
+        .header-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 10px; margin-bottom: 10px; }
+        .pnl-tag { font-weight: bold; padding: 4px 8px; border-radius: 4px; background: #0f172a; border: 1px solid #334155; }
+        .download-btn { background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 13px; font-weight: bold; display: flex; align-items: center; gap: 5px; }
+        .download-btn:hover { background: #16a34a; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; color: #94a3b8; padding: 8px; border-bottom: 1px solid #334155; }
+        td { padding: 8px; border-bottom: 1px solid #334155; color: #e2e8f0; }
+        .buy { color: #4ade80; } .sell { color: #f87171; }
+        .metrics { font-size: 11px; color: #64748b; }
+    </style>
+    </head><body>
     
-    if (selectedDate && grouped[selectedDate]) {
-        const dayLogs = grouped[selectedDate].trades;
-        const dayRows = dayLogs.map(t => {
-            // ✅ CHANGED: Show Analyze button for ALL filled trades
-            // ✅ FIXED REPORTS LINK
-const analyzeBtn = (t.status === 'FILLED') 
-    ? `<a href="/analyze-sl?id=${t.id}" target="_blank" style="color:#f472b6; font-size:10px;">🔍 ANALYZE</a>` 
-    : '';
-            return `<div style="padding:10px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; font-size:12px;">
-                <span>${t.time}</span>
-                <b style="color:${t.type=='BUY'?'#4ade80':'#f87171'}">${t.type}</b>
-                <span>₹${t.executedPrice}</span>
-                <span style="color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">₹${(t.pnl||0).toFixed(0)} ${analyzeBtn}</span>
-            </div>`;
-        }).join('');
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h2>📜 Historical Trade Reports</h2>
+        <a href="/" style="text-decoration:none; color:#38bdf8; border:1px solid #38bdf8; padding:5px 10px; border-radius:4px;">🏠 Dashboard</a>
+    </div>`;
 
-        detailView = `
-            <div style="margin-top:20px; background:#0f172a; padding:15px; border-radius:10px;">
-                <h3 style="color:#fbbf24; margin-top:0;">📅 Details for ${selectedDate}</h3>
-                ${dayRows}
-            </div>
-        `;
+    // 3. Sort Dates (Newest First)
+    const sortedDates = Object.keys(grouped).sort((a,b) => new Date(b) - new Date(a));
+
+    if(sortedDates.length === 0) {
+        html += `<div style="text-align:center; color:#64748b; margin-top:50px;">No trades found yet.</div>`;
     }
 
-    // 3. Render Report Page
-    const reportHTML = reportRows.map(r => `
-        <a href="/reports?date=${r.date}" style="text-decoration:none; color:white;">
-            <div style="display:flex; justify-content:space-between; padding:15px; background:#0f172a; margin-bottom:10px; border-radius:8px; border-left:5px solid ${r.pnl>=0?'#4ade80':'#f87171'};">
-                <div><b>${r.date}</b><br><small style="color:#94a3b8;">${r.wins}W / ${r.losses}L</small></div>
-                <div style="text-align:right;"><b style="font-size:16px; color:${r.pnl>=0?'#4ade80':'#f87171'}">₹${r.pnl.toFixed(2)}</b></div>
-            </div>
-        </a>
-    `).join('');
+    sortedDates.forEach(date => {
+        const dayTrades = grouped[date];
+        // Calculate Day PnL (Sum of all PnL entries)
+        const dayPnL = dayTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+        const pnlColor = dayPnL >= 0 ? '#4ade80' : '#f87171';
+        
+        // --- HEADER WITH DOWNLOAD BUTTON ---
+        html += `<div class="date-card">
+            <div class="header-row">
+                <div style="display:flex; align-items:center; gap:15px;">
+                    <h3 style="margin:0;">📅 ${date}</h3>
+                    <span class="pnl-tag" style="color:${pnlColor}">Day PnL: ₹${dayPnL.toFixed(0)}</span>
+                </div>
+                <a href="/download-day-excel?date=${date}" class="download-btn">
+                    📥 Download Excel
+                </a>
+            </div>`;
 
-    res.send(`
-        <!DOCTYPE html><html style="background:#1e293b; color:white; font-family:sans-serif;">
-        <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-        <body style="padding:20px; max-width:600px; margin:auto;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-                <h2 style="color:#38bdf8; margin:0;">📊 Historical Reports</h2>
-                <a href="/" style="padding:8px 15px; background:#64748b; color:white; text-decoration:none; border-radius:5px;">🏠 Home</a>
-            </div>
+        // --- TABLE ---
+        html += `<table>
+            <tr><th>Time</th><th>Type</th><th>Qty</th><th>Price</th><th>PnL</th><th>Metrics (RSI/Vol)</th></tr>`;
             
-            <div id="calendar-view">${reportHTML}</div>
-            ${detailView}
-        </body></html>
-    `);
+        dayTrades.forEach(t => {
+            const m = t.metrics || {};
+            const metricStr = m.rsi ? `RSI:${m.rsi} | Vol:${m.volMult}x` : '-';
+            const rowColor = (t.pnl && t.pnl !== 0) ? (t.pnl > 0 ? 'rgba(74, 222, 128, 0.1)' : 'rgba(248, 113, 113, 0.1)') : 'transparent';
+
+            html += `<tr style="background:${rowColor}">
+                <td>${t.time}</td>
+                <td class="${t.type === 'BUY' ? 'buy' : 'sell'}"><b>${t.type}</b></td>
+                <td>${t.qty}</td>
+                <td>${t.executedPrice}</td>
+                <td style="font-weight:bold; color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">${t.pnl !== undefined ? '₹'+t.pnl : '-'}</td>
+                <td class="metrics">${metricStr}</td>
+            </tr>`;
+        });
+        html += `</table></div>`;
+    });
+
+    html += `</body></html>`;
+    res.send(html);
 });
+
+
 
 // ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE
 app.get('/analyze-sl', async (req, res) => {
@@ -1829,6 +1838,95 @@ app.get('/analyze-sl', async (req, res) => {
         res.send("Error: " + e.message); 
     }
 });
+
+
+// ✅ EXCEL DOWNLOADER (PAIRS ENTRY + EXIT)
+app.get('/download-day-excel', (req, res) => {
+    try {
+        const targetDate = req.query.date;
+        
+        // 1. Filter for EXIT TRADES only (Trades that have a PnL recorded)
+        // We look for 'FILLED' trades that have a PnL property (even if 0, but usually exits have value)
+        // In your system, Entry has PnL: 0 or undefined, Exit has PnL: <Amount>
+        // We iterate NEWEST to OLDEST (Index 0 is newest)
+        const allTrades = botState.history;
+        
+        // Filter: Must be on target date, Must be filled, Must NOT be System message
+        const dayTrades = allTrades.filter(t => t.date === targetDate && t.status === 'FILLED' && !t.type.includes('SYSTEM'));
+        
+        const pairedRows = [];
+        const usedEntryIds = new Set(); // To prevent double counting
+
+        // Loop through trades to find EXITS first
+        for (let i = 0; i < dayTrades.length; i++) {
+            const exitTrade = dayTrades[i];
+
+            // Condition: It's an EXIT if it has a PnL value (positive or negative) 
+            // OR if it's the second part of a pair (logic: if we find a matching entry later)
+            // Simpler approach: In your logs, Exit always has PnL. Entry usually doesn't (or it's 0).
+            // Let's assume any trade with PnL !== 0 is an Exit. 
+            // If PnL is 0, it might be a breakeven exit OR an entry. 
+            // We'll check the TYPE to be sure.
+            
+            // We look for an ENTRY that happened BEFORE this Exit (which means AFTER in the array index)
+            const entryTrade = dayTrades.slice(i + 1).find((t, index) => {
+                // Entry Logic:
+                // 1. Opposite Type (If Exit is SELL, Entry is BUY)
+                // 2. Same Quantity
+                // 3. Has not been paired yet
+                const isOpposite = t.type !== exitTrade.type;
+                const isSameQty = t.qty === exitTrade.qty;
+                const isNotUsed = !usedEntryIds.has(t.id || index); // Use ID or Index
+                
+                return isOpposite && isSameQty && isNotUsed;
+            });
+
+            if (entryTrade) {
+                // WE FOUND A PAIR!
+                usedEntryIds.add(entryTrade.id); // Mark entry as used
+                
+                // Determine Direction (LONG or SHORT) based on ENTRY
+                const direction = entryTrade.type === 'BUY' ? 'LONG' : 'SHORT';
+                
+                // Metrics should come from ENTRY (Decision point)
+                const m = entryTrade.metrics || {};
+
+                pairedRows.push({
+                    "DATE": exitTrade.date,
+                    "TYPE": direction,
+                    "QUANTITY": exitTrade.qty,
+                    "ENTRY PRICE": entryTrade.executedPrice,
+                    "ENTRY TIME": entryTrade.time,
+                    "EXIT PRICE": exitTrade.executedPrice,
+                    "EXIT TIME": exitTrade.time,
+                    "PnL": exitTrade.pnl,
+                    "E50": m.e50 || '-',
+                    "E200": m.e200 || '-',
+                    "VOLUME": m.vol || '-',
+                    "AVG VOLUME": m.avgVol || '-',
+                    "VOLUME MULTIPLE": m.volMult || '-',
+                    "RSI": m.rsi || '-'
+                });
+            }
+        }
+
+        if (pairedRows.length === 0) {
+            return res.send("No completed paired trades found for this date.");
+        }
+
+        const json2csvParser = new Parser();
+        const csv = json2csvParser.parse(pairedRows);
+
+        res.header('Content-Type', 'text/csv');
+        res.attachment(`Silver_Analysis_${targetDate}.csv`);
+        res.send(csv);
+
+    } catch (e) {
+        console.error("Excel Gen Error:", e);
+        res.status(500).send("Error generating Excel: " + e.message);
+    }
+});
+
 
 app.post('/ask-trade-question', async (req, res) => {
     try {
