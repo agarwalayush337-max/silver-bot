@@ -1840,59 +1840,50 @@ app.get('/analyze-sl', async (req, res) => {
 });
 
 
-// ✅ EXCEL DOWNLOADER (PAIRS ENTRY + EXIT)
+// ✅ EXCEL DOWNLOADER (FIXED: Strict Pairing + Chronological Order)
 app.get('/download-day-excel', (req, res) => {
     try {
         const targetDate = req.query.date;
-        
-        // 1. Filter for EXIT TRADES only (Trades that have a PnL recorded)
-        // We look for 'FILLED' trades that have a PnL property (even if 0, but usually exits have value)
-        // In your system, Entry has PnL: 0 or undefined, Exit has PnL: <Amount>
-        // We iterate NEWEST to OLDEST (Index 0 is newest)
         const allTrades = botState.history;
         
-        // Filter: Must be on target date, Must be filled, Must NOT be System message
-        const dayTrades = allTrades.filter(t => t.date === targetDate && t.status === 'FILLED' && !t.type.includes('SYSTEM'));
-        
+        // 1. Filter for EXIT TRADES ONLY (Must have PnL)
+        // We assume any trade with a valid PnL (even 0) is an Exit.
+        // We filter out any trade where pnl is undefined or null.
+        const exitTrades = allTrades.filter(t => 
+            t.date === targetDate && 
+            t.status === 'FILLED' && 
+            t.pnl !== undefined && 
+            t.pnl !== null
+        );
+
         const pairedRows = [];
-        const usedEntryIds = new Set(); // To prevent double counting
+        const usedEntryIds = new Set(); 
 
-        // Loop through trades to find EXITS first
-        for (let i = 0; i < dayTrades.length; i++) {
-            const exitTrade = dayTrades[i];
-
-            // Condition: It's an EXIT if it has a PnL value (positive or negative) 
-            // OR if it's the second part of a pair (logic: if we find a matching entry later)
-            // Simpler approach: In your logs, Exit always has PnL. Entry usually doesn't (or it's 0).
-            // Let's assume any trade with PnL !== 0 is an Exit. 
-            // If PnL is 0, it might be a breakeven exit OR an entry. 
-            // We'll check the TYPE to be sure.
+        // 2. Iterate through Exits to find their Entry
+        exitTrades.forEach(exitTrade => {
             
-            // We look for an ENTRY that happened BEFORE this Exit (which means AFTER in the array index)
-            const entryTrade = dayTrades.slice(i + 1).find((t, index) => {
-                // Entry Logic:
-                // 1. Opposite Type (If Exit is SELL, Entry is BUY)
-                // 2. Same Quantity
-                // 3. Has not been paired yet
-                const isOpposite = t.type !== exitTrade.type;
-                const isSameQty = t.qty === exitTrade.qty;
-                const isNotUsed = !usedEntryIds.has(t.id || index); // Use ID or Index
-                
-                return isOpposite && isSameQty && isNotUsed;
-            });
+            // Find the matching Entry in the MAIN history (not just dayTrades)
+            // The Entry must be OLDER than the Exit (Index > Exit Index in 'allTrades')
+            const exitIndex = allTrades.indexOf(exitTrade);
+            
+            // Search backwards in time (indices larger than exitIndex)
+            const entryTrade = allTrades.slice(exitIndex + 1).find(t => 
+                t.status === 'FILLED' &&
+                t.qty === exitTrade.qty &&
+                t.type !== exitTrade.type && // Opposite type
+                !t.pnl && // Entries usually don't have PnL
+                !usedEntryIds.has(t.id) // Ensure we haven't paired it already
+            );
 
             if (entryTrade) {
-                // WE FOUND A PAIR!
-                usedEntryIds.add(entryTrade.id); // Mark entry as used
+                usedEntryIds.add(entryTrade.id);
                 
-                // Determine Direction (LONG or SHORT) based on ENTRY
+                // Determine Direction (LONG/SHORT)
                 const direction = entryTrade.type === 'BUY' ? 'LONG' : 'SHORT';
-                
-                // Metrics should come from ENTRY (Decision point)
-                const m = entryTrade.metrics || {};
+                const m = entryTrade.metrics || {}; 
 
                 pairedRows.push({
-                    "DATE": exitTrade.date,
+                    "DATE": entryTrade.date, // Use Entry Date (matches your sheet)
                     "TYPE": direction,
                     "QUANTITY": exitTrade.qty,
                     "ENTRY PRICE": entryTrade.executedPrice,
@@ -1908,17 +1899,27 @@ app.get('/download-day-excel', (req, res) => {
                     "RSI": m.rsi || '-'
                 });
             }
-        }
+        });
+
+        // 3. SORT CHRONOLOGICALLY (Oldest Entry First)
+        // Your sheet starts at 9:00 AM.
+        pairedRows.sort((a, b) => {
+            // Convert time strings "HH:MM:SS" to comparison
+            // Helper to parse time assuming same date
+            const tA = new Date(`1970/01/01 ${a["ENTRY TIME"]}`).getTime();
+            const tB = new Date(`1970/01/01 ${b["ENTRY TIME"]}`).getTime();
+            return tA - tB;
+        });
 
         if (pairedRows.length === 0) {
-            return res.send("No completed paired trades found for this date.");
+            return res.send(`No complete trades found for ${targetDate}. (Make sure trades have PnL)`);
         }
 
         const json2csvParser = new Parser();
         const csv = json2csvParser.parse(pairedRows);
 
         res.header('Content-Type', 'text/csv');
-        res.attachment(`Silver_Analysis_${targetDate}.csv`);
+        res.attachment(`Silver_Report_${targetDate}.csv`);
         res.send(csv);
 
     } catch (e) {
