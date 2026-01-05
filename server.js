@@ -1765,9 +1765,10 @@ app.get('/reports', (req, res) => {
 
 
 // ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE
-app.get('/analyze-sl', async (req, res) => {
+// ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE (Fixed for /analyze-sl/:id)
+app.get('/analyze-sl/:id', async (req, res) => {
     try {
-        const tradeId = req.query.id;
+        const tradeId = req.params.id; // ✅ Now grabs ID from the URL path
         if (!tradeId) return res.send("Error: No Trade ID provided.");
 
         const doc = await db.collection('trades').doc(tradeId).get();
@@ -1861,7 +1862,7 @@ app.get('/analyze-sl', async (req, res) => {
         `;
 
         const result = await client.models.generateContent({
-            model: "gemini-3-flash-preview",
+            model: "gemini-2.0-flash-exp", // ✅ Updated Model Name
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
