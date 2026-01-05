@@ -628,6 +628,8 @@ async function initWebSocket() {
                                 if (botState.positionType) {
                                     const tradeQty = botState.quantity || 1;
                                     let currentProfit = 0;
+                                    
+                                    // Calculate Total Profit (e.g., 500 pts * 4 lots = 2000 profit)
                                     if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * tradeQty;
                                     if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * tradeQty;
                                     
@@ -640,53 +642,51 @@ async function initWebSocket() {
                                     let newStop = botState.currentStop;
                                     let didChange = false;
 
-                                    // STAGE A: Move to Cost if Profit > 1 ATR
-                                    if (currentProfit >= liveATR) {
+                                    // ✅ FIX 1: Define Default Trailing Gap (1.5x ATR)
+                                    let trailingGap = liveATR * 1.5; 
+
+                                    // STAGE A: Move to Cost if Profit > 1 ATR (Per Lot)
+                                    // Logic: If Total Profit > (ATR * Qty)
+                                    if (currentProfit >= (liveATR * tradeQty)) {
                                         const costSL = botState.entryPrice; 
                                         const isBetter = botState.positionType === 'LONG' ? (costSL > botState.currentStop) : (costSL < botState.currentStop);
                                         
                                         if (isBetter) {
                                             newStop = costSL;
                                             didChange = true;
-                                            console.log(`🛡️ Profit > 1 ATR (${liveATR.toFixed(0)}) | Moving SL to Cost`);
+                                            // ✅ LOG: Shows Profit vs Target
+                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 1 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost`);
                                         }
                                     }
 
-                                    // STAGE B: Trail Aggressively if Profit > 1.5 ATR
-                                    if (currentProfit >= (1.5 * liveATR)) {
-                                        
+                                    // STAGE B: Tighten Gap if Profit > 1.5 ATR (Per Lot)
+                                    if (currentProfit >= (1.5 * liveATR * tradeQty)) {
                                         // Normal Trail Gap = 1 ATR
-                                        let dynamicGap = liveATR; 
+                                        trailingGap = liveATR; 
                                         
-                                        // Tighten if Profit > 4 ATR (Super Trend)
-                                        if (currentProfit >= (4 * liveATR)) dynamicGap = liveATR * 0.5;
-
-                                        if (botState.positionType === 'LONG') {
-                                            const trailingLevel = newPrice - dynamicGap;
-                                            if (trailingLevel > newStop) { newStop = trailingLevel; didChange = true; }
-                                        } else {
-                                            const trailingLevel = newPrice + dynamicGap;
-                                            if (trailingLevel < newStop) { newStop = trailingLevel; didChange = true; }
+                                        // Super Trend: Tighten if Profit > 4 ATR (Per Lot)
+                                        if (currentProfit >= (4 * liveATR * tradeQty)) {
+                                            trailingGap = liveATR * 0.5;
                                         }
                                     }
 
-                                    
+                                    // Apply Calculated Gap
                                     if (botState.positionType === 'LONG') {
-                                        const trailingLevel = newPrice - trailingGap;
+                                        const trailingLevel = newPrice - trailingGap; // ✅ trailingGap is now safe to use
                                         if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
                                     } else {
-                                        const trailingLevel = newPrice + trailingGap;
+                                        const trailingLevel = newPrice + trailingGap; // ✅ trailingGap is now safe to use
                                         if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
                                     }
 
                                     if (didChange) {
-                                        const oldStop = botState.currentStop; // Capture old value first
+                                        const oldStop = botState.currentStop; 
                                         botState.currentStop = newStop;
                                         pushToDashboard(); 
-                                        modifyExchangeSL(oldStop, newStop); // Pass both values
+                                        modifyExchangeSL(oldStop, newStop); 
                                     }
                                     
-                                    // ✅ FIXED: Added proper braces to wrap the console.log and function call
+                                    // Stop Loss Hit Logic
                                     if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
                                         (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
                                         
@@ -695,14 +695,13 @@ async function initWebSocket() {
                                             
                                             const exitOrderId = botState.slOrderId;
                                             const exitType = botState.positionType === 'LONG' ? 'SELL' : 'BUY';
-                                            const currentTradeQty = botState.quantity; // ✅ Capture current quantity
+                                            const currentTradeQty = botState.quantity; 
 
-                                            // ✅ Placeholder with Dynamic Quantity
                                             botState.history.unshift({ 
                                                 date: formatDate(getIST()), 
                                                 time: getIST().toLocaleTimeString(), 
                                                 type: exitType, 
-                                                qty: currentTradeQty, // ✅ Added this line
+                                                qty: currentTradeQty, 
                                                 orderedPrice: botState.currentStop, 
                                                 executedPrice: 0, 
                                                 id: exitOrderId, 
