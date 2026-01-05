@@ -377,6 +377,7 @@ async function saveSettings() {
             isTradingEnabled: botState.isTradingEnabled,
             maxRunUp: botState.maxRunUp,
             quantity: botState.quantity,
+            maxTradeQty: botState.maxTradeQty,
             totalPnL: botState.totalPnL,
             hiddenLogIds: botState.hiddenLogIds || [],
             updatedAt: new Date().toISOString()
@@ -1764,47 +1765,54 @@ app.get('/reports', (req, res) => {
 
 
 
-// ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE
-// ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE (Fixed for /analyze-sl/:id)
+// ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE (Fixed: Exit Price, MAE/MFE, In-Trade Data)
 app.get('/analyze-sl/:id', async (req, res) => {
     try {
-        const tradeId = req.params.id; // ✅ Now grabs ID from the URL path
+        const tradeId = req.params.id;
         if (!tradeId) return res.send("Error: No Trade ID provided.");
 
         const doc = await db.collection('trades').doc(tradeId).get();
         if (!doc.exists) return res.send("Trade not found in database.");
         const t = doc.data();
 
-        // --- 1. DATA RECONSTRUCTION & CONTEXT ---
+        // --- 1. DATA RECONSTRUCTION ---
         const exitPrice = t.executedPrice || t.orderedPrice || 0;
         const totalPnL = t.pnl || 0;
-        const qty = t.qty || 1; // Default to 1 if missing
+        const qty = t.qty || 1;
         const pnlPerLot = (totalPnL / qty).toFixed(2);
-        const maxRunUp = t.analysisData?.maxRunUp || t.maxRunUp || 0;
+        
+        // ✅ FIX 1: Retrieve MAE (Drawdown) and MFE (RunUp) correctly
+        const maxRunUp = t.metrics?.mfe || t.analysisData?.maxRunUp || t.maxRunUp || 0;
+        const maxDrawdown = t.metrics?.mae || t.analysisData?.maxDrawdown || t.maxDrawdown || 0;
 
-        // Determine Position Type (Reverse Logic: Selling to Exit = LONG)
+        // Determine Position
         let positionType = "UNKNOWN";
         let entryPrice = 0;
-
         if (t.type === 'BUY') { 
-            positionType = "SHORT"; // We Bought to Cover
+            positionType = "SHORT"; 
             entryPrice = exitPrice + (totalPnL / qty); 
         } else if (t.type === 'SELL') { 
-            positionType = "LONG"; // We Sold to Exit
+            positionType = "LONG"; 
             entryPrice = exitPrice - (totalPnL / qty);
         }
 
         const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : new Date().toLocaleString();
 
-        // --- 2. POST-EXIT SNAPSHOTS (For HTML Table & AI) ---
-        const tickData = t.analysisData ? t.analysisData.data : [];
+        // --- 2. PREPARE DATA FOR AI ---
+        // A) Post-Exit Data (What happened AFTER)
+        const postExitData = t.analysisData ? t.analysisData.data : [];
         const startTime = t.analysisData ? t.analysisData.startTime : Date.now();
+        
+        // B) In-Trade Data (What happened DURING - ✅ NEW)
+        // We sample it (take every 5th tick) to keep the prompt size manageable for AI
+        const inTradeRaw = t.tickData || [];
+        const inTradeSample = inTradeRaw.filter((_, i) => i % 5 === 0);
 
-        // Helper to find price at X minutes after exit
+        // Helper for Snapshots
         function getPriceAt(min) {
-            if (!tickData.length) return null;
+            if (!postExitData.length) return null;
             const target = startTime + (min * 60 * 1000);
-            return tickData.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev);
+            return postExitData.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev);
         }
 
         const snap1 = getPriceAt(1);
@@ -1812,57 +1820,49 @@ app.get('/analyze-sl/:id', async (req, res) => {
         const snap5 = getPriceAt(5);
         const snap10 = getPriceAt(10);
         
-        // Calculate Post-Exit Range
-        const postExitPrices = tickData.map(d => d.p);
-        const postHigh = postExitPrices.length ? Math.max(...postExitPrices) : exitPrice;
-        const postLow = postExitPrices.length ? Math.min(...postExitPrices) : exitPrice;
-
         // --- 3. THE "OPTIMIZER" PROMPT ---
         const prompt = `
             Act as a Quantitative Strategy Consultant. 
-            Goal: Tell me the BEST POSSIBLE parameters I *should* have used for this specific trade to maximize profit.
+            Goal: Tell me the BEST POSSIBLE parameters I *should* have used for this specific trade.
 
             **1. TRADE REALITY:**
             * Position: ${positionType} (${qty} Lots)
             * Entry: ${entryPrice.toFixed(2)} | Exit: ${exitPrice}
             * **Actual Result:** ₹${pnlPerLot}/lot (Total: ₹${totalPnL})
-            * **Max Profit Seen (RunUp):** ₹${maxRunUp}
+            
+            **2. PERFORMANCE METRICS:**
+            * **Max Profit (MFE):** ₹${maxRunUp} (Did I leave money on the table?)
+            * **Max Loss (MAE):** ₹${maxDrawdown} (How much heat did I take?)
 
-            **2. MY CURRENT RULES (That I used):**
-            * Initial SL: 800 Points
-            * Trailing Logic: If Profit > 1000, Trail Gap = 500 Points.
-            * Move to Cost: If Profit > 600.
-
-            **3. POST-EXIT PRICE DATA (What happened next):**
+            **3. IN-TRADE PRICE ACTION (During the trade):**
+            * The price path I survived: ${JSON.stringify(inTradeSample.map(d=>d.p))}
+            
+            **4. POST-EXIT PRICE DATA (After I got out):**
             * 1 Min Later: ${snap1?.p || 'N/A'}
             * 5 Mins Later: ${snap5?.p || 'N/A'}
             * 10 Mins Later: ${snap10?.p || 'N/A'}
-            * Range: Low ${postLow} - High ${postHigh}
-            * Volatility Sample: ${JSON.stringify(tickData.slice(0, 50))}
+            * Trend continued or reversed?
 
             **YOUR TASK (Optimize My Strategy):**
-            Don't just review. CALCULATE the perfect settings for this trade.
-
-            1. **Best Initial SL:** Look at the drawdown. Was 800 too small? What SL would have survived the noise?
-            2. **Best Trailing Gap:** Look at the retracements. Was 500 too tight? Calculate the gap that would have ridden the trend longest.
-            3. **Best 'Move-to-Cost':** Profit peaked at ${maxRunUp}. Should the trigger be lower (e.g., 400) to lock safety earlier?
-            4. **SIMULATION:** If I used YOUR "Best" settings above, what would the **Total Profit** be?
-
+            1. **Best Initial SL:** Look at the MAE (${maxDrawdown}). Was my SL safe or lucky?
+            2. **Best Trailing Logic:** Look at the In-Trade path. Did a small pullback scare me out early?
+            3. **Best 'Move-to-Cost':** Profit peaked at ${maxRunUp}. Should I have locked it earlier?
+            
             **OUTPUT FORMAT (Strict HTML):**
             <h3>🚀 Optimal Strategy Parameters</h3>
             <ul>
-                <li><b>Best Initial SL:</b> [Value] (Reason)</li>
-                <li><b>Best Trailing Gap:</b> [Value] (Reason)</li>
-                <li><b>Best Safety Trigger:</b> [Value] (Reason)</li>
+                <li><b>Best Initial SL:</b> [Value] (Reason based on MAE)</li>
+                <li><b>Best Trailing Gap:</b> [Value] (Reason based on volatility)</li>
+                <li><b>Best Target/Lock:</b> [Value] (Reason based on MFE)</li>
             </ul>
-            <h3>💰 Profit Simulation</h3>
-            <p>If you used these settings, result would be: <b>₹[Amount]</b> instead of ₹${totalPnL}.</p>
+            <h3>💰 Simulation</h3>
+            <p>Potential Outcome: <b>₹[Amount]</b> (vs Actual ₹${totalPnL})</p>
             <h3>📉 Technical Insight</h3>
-            [Brief comment on why the market behaved this way]
+            [Brief comment on price action]
         `;
 
         const result = await client.models.generateContent({
-            model: "gemini-3-flash-preview", // ✅ Updated Model Name
+            model: "gemini-3-flash-preview",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
@@ -1888,22 +1888,29 @@ app.get('/analyze-sl/:id', async (req, res) => {
                             </div>
                         </div>
 
-                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:15px; text-align:center;">
-                            <div style="background:#0f172a; padding:12px; border-radius:10px;">
-                                <div style="font-size:11px; color:#94a3b8;">POSITION</div>
-                                <div style="font-weight:bold; color:#fbbf24; font-size:15px;">${positionType}</div>
+                        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:15px; text-align:center; margin-bottom:10px;">
+                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                                <div style="font-size:10px; color:#94a3b8;">POSITION</div>
+                                <div style="font-weight:bold; color:#fbbf24; font-size:14px;">${positionType} (${qty} Lots)</div>
                             </div>
-                            <div style="background:#0f172a; padding:12px; border-radius:10px;">
-                                <div style="font-size:11px; color:#94a3b8;">QUANTITY</div>
-                                <div style="font-weight:bold; font-size:15px;">${qty} Lots</div>
+                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                                <div style="font-size:10px; color:#94a3b8;">ENTRY PRICE</div>
+                                <div style="font-weight:bold; font-size:14px;">${entryPrice.toFixed(0)}</div>
                             </div>
-                            <div style="background:#0f172a; padding:12px; border-radius:10px;">
-                                <div style="font-size:11px; color:#94a3b8;">ENTRY PRICE</div>
-                                <div style="font-weight:bold; font-size:15px;">${entryPrice.toFixed(0)}</div>
+                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                                <div style="font-size:10px; color:#94a3b8;">EXIT PRICE</div>
+                                <div style="font-weight:bold; font-size:14px;">${exitPrice}</div>
                             </div>
-                            <div style="background:#0f172a; padding:12px; border-radius:10px;">
-                                <div style="font-size:11px; color:#94a3b8;">MAX RUN-UP</div>
-                                <div style="font-weight:bold; color:#fbbf24; font-size:15px;">₹${maxRunUp}</div>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:15px; text-align:center;">
+                            <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
+                                <div style="font-size:10px; color:#94a3b8;">MAX RUN-UP (MFE)</div>
+                                <div style="font-weight:bold; color:#4ade80; font-size:14px;">+₹${maxRunUp}</div>
+                            </div>
+                            <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
+                                <div style="font-size:10px; color:#94a3b8;">MAX DRAWDOWN (MAE)</div>
+                                <div style="font-weight:bold; color:#f87171; font-size:14px;">-₹${maxDrawdown}</div>
                             </div>
                         </div>
                     </div>
@@ -1914,40 +1921,43 @@ app.get('/analyze-sl/:id', async (req, res) => {
 
                     <div style="background:#1e293b; padding:20px; border-radius:15px; border:1px solid #334155; margin-bottom:25px;">
                         <h3 style="margin-top:0; color:#cbd5e1; font-size:16px; border-bottom:1px solid #475569; padding-bottom:10px;">⏱️ Post-Exit Price Snapshots</h3>
+                        
+                        ${postExitData.length > 0 ? `
                         <table style="width:100%; border-collapse:collapse; color:#cbd5e1; font-size:14px;">
                             <tr style="text-align:left; color:#94a3b8;">
                                 <th style="padding:10px;">Time Offset</th>
                                 <th>Price</th>
                                 <th>Diff from Exit</th>
-                                <th>Status</th>
                             </tr>
                             <tr style="border-bottom:1px solid #334155;">
                                 <td style="padding:10px;">+1 Min</td>
                                 <td>${snap1?.p || '-'}</td>
-                                <td>${snap1 ? (snap1.p - exitPrice).toFixed(0) : '-'}</td>
                                 <td style="color:${snap1 && ((positionType=='LONG' && snap1.p > exitPrice) || (positionType=='SHORT' && snap1.p < exitPrice)) ? '#4ade80' : '#f87171'}">
-                                    ${snap1 ? 'Recorded' : 'No Data'}
+                                    ${snap1 ? (snap1.p - exitPrice).toFixed(0) : '-'}
                                 </td>
                             </tr>
                             <tr style="border-bottom:1px solid #334155;">
                                 <td style="padding:10px;">+3 Mins</td>
                                 <td>${snap3?.p || '-'}</td>
                                 <td>${snap3 ? (snap3.p - exitPrice).toFixed(0) : '-'}</td>
-                                <td>-</td>
                             </tr>
                             <tr style="border-bottom:1px solid #334155;">
                                 <td style="padding:10px;">+5 Mins</td>
                                 <td>${snap5?.p || '-'}</td>
                                 <td>${snap5 ? (snap5.p - exitPrice).toFixed(0) : '-'}</td>
-                                <td>-</td>
                             </tr>
                             <tr>
                                 <td style="padding:10px;">+10 Mins</td>
                                 <td>${snap10?.p || '-'}</td>
                                 <td>${snap10 ? (snap10.p - exitPrice).toFixed(0) : '-'}</td>
-                                <td>-</td>
                             </tr>
                         </table>
+                        ` : `
+                        <div style="text-align:center; padding:20px; color:#facc15;">
+                            ⚠️ <b>No Post-Exit Data Yet.</b><br>
+                            <span style="font-size:12px; color:#94a3b8;">Recorder runs for 10 mins after exit. If you just exited, refresh in a few minutes.</span>
+                        </div>
+                        `}
                     </div>
 
                     <div style="background:#0f172a; padding:20px; border-radius:15px; border:1px solid #334155;">
