@@ -1862,7 +1862,7 @@ app.get('/analyze-sl/:id', async (req, res) => {
         `;
 
         const result = await client.models.generateContent({
-            model: "gemini-2.0-flash-exp", // ✅ Updated Model Name
+            model: "gemini-3-flash-preview", // ✅ Updated Model Name
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
