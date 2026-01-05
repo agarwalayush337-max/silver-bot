@@ -308,39 +308,58 @@ function getPairedLogs(logs) {
 }
 
 // ✅ HELPER: Generate Consistent Log HTML (Grid Layout Fix)
+// ✅ HELPER: Generate Log HTML (Complete Block)
 function generateLogHTML(logs) {
-    const pairedIds = getPairedLogs(logs);
+    // Helper to group Entry/Exit pairs visually
+    const pairedIds = getPairedLogs(logs); 
 
     return logs.map(t => {
+        // 1. Manual Delete Button (Only for manual trades)
         const isManual = t.tag !== 'API_BOT' && t.status === 'FILLED';
-        const deleteBtn = isManual ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌]</a>` : '';
-        
-        // ✅ CHANGED: Show Analyze button for ALL filled trades (Wins & Losses)
-        const analyzeBtn = (t.status === 'FILLED') 
-            ? `<br><a href="/analyze-sl?id=${t.id}" target="_blank" style="display:inline-block; margin-top:4px; background:#6366f1; color:white; padding:3px 8px; border-radius:4px; font-size:10px; text-decoration:none;">🧠 Analyze</a>` 
+        const deleteBtn = isManual 
+            ? `<a href="/delete-log/${t.id}" style="color:#ef4444; font-size:10px; margin-left:5px; text-decoration:none;">[❌]</a>` 
             : '';
         
-        // Highlight Logic: Dark gradient for paired trades
-        const isPaired = pairedIds.has(t.id);
-        const bgStyle = isPaired ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' : 'border-bottom:1px solid #334155;';
-
-        // --- REPLACE INSIDE generateLogHTML function ---
-
+        // 2. Analyze Button Logic (Only show if PnL exists - meaning it's a closed trade)
+        // We use 't.pnl !== undefined' to prevent it from showing on Entry orders
+        const hasPnL = t.pnl !== undefined && t.pnl !== null;
+        const analyzeBtn = (t.status === 'FILLED' && hasPnL) 
+            ? `<br><a href="/analyze-sl/${t.id}" target="_blank" style="display:inline-block; margin-top:4px; background:#6366f1; color:white; padding:3px 8px; border-radius:4px; font-size:10px; text-decoration:none;">🧠 Analyze</a>` 
+            : '';
+        
+        // 3. Metrics Info (RSI / Vol)
         const metrics = t.metrics || {}; 
-        // Show RSI and Volume Multiple in the log
         const extraInfo = metrics.rsi ? `RSI:${metrics.rsi} V:${metrics.volMult}x` : '';
 
+        // 4. Background Styling (Highlight paired trades)
+        const isPaired = pairedIds.has(t.id);
+        const bgStyle = isPaired 
+            ? 'background:linear-gradient(90deg, #1e293b 0%, #334155 100%); border-left: 3px solid #6366f1;' 
+            : 'border-bottom:1px solid #334155;';
+
+        // 5. Return HTML Row
         return `<div style="display:grid; grid-template-columns: 1.2fr 0.6fr 0.5fr 1fr 1fr 1fr 1.5fr; gap:5px; padding:10px; font-size:11px; align-items:center; ${bgStyle} margin-bottom:2px; border-radius:4px;">
             <span style="color:#94a3b8;">${t.time}</span> 
-            <b style="text-align:center; color:${t.type=='BUY'?'#4ade80':t.type=='SELL'?'#f87171':'#fbbf24'}">${t.type}</b> 
-            <span style="text-align:center; color:#cbd5e1;">${t.qty || botState.maxTradeQty}L</span> <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
+            
+            <b style="text-align:center; color:${t.type === 'BUY' ? '#4ade80' : t.type === 'SELL' ? '#f87171' : '#fbbf24'}">
+                ${t.type}
+            </b> 
+            
+            <span style="text-align:center; color:#cbd5e1;">${t.qty}L</span> 
+            
+            <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
+            
             <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
+            
             <span style="text-align:right; font-weight:bold; color:${(t.pnl || 0) >= 0 ? '#4ade80' : '#f87171'};">
-                ${t.pnl ? '₹'+t.pnl.toFixed(0) : ''} 
+                ${hasPnL ? '₹' + t.pnl.toFixed(0) : ''} 
                 <br><span style="font-size:9px; color:#64748b;">${extraInfo}</span>
                 ${analyzeBtn} ${deleteBtn}
             </span>
-            <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">${t.id || '-'}</span>
+            
+            <span style="text-align:right; color:#64748b; font-family:monospace; overflow:hidden; text-overflow:ellipsis;">
+                ${t.id || '-'}
+            </span>
         </div>`;
     }).join('');
 }
@@ -861,21 +880,22 @@ async function fetchLatestOrderId() {
 }
 
 // --- 🔎 FULL ROBUST VERIFICATION (Blocking Mode) ---
-// --- 🔎 INTELLIGENT VERIFICATION (Handles Slippage & Gaps) ---
-async function verifyOrderStatus(orderId, context) {
+// --- 🔎 INTELLIGENT VERIFICATION (Full Logic: ID Swap, PnL, Slippage, Rate Limits) ---
+async function verifyOrderStatus(orderId, context, tempLogId = null) {
     if (!orderId) return { status: 'FAILED' };
 
-    console.log(`🔎 Verifying Order ${orderId}...`);
+    console.log(`🔎 Verifying Order ${orderId} (Context: ${context})...`);
     
     let retryCount = 0;
     const maxRetries = 15; // Checks for ~30 seconds total
 
     while (retryCount < maxRetries) {
-        // Wait 2s between checks to avoid rate limits
+        // Wait 2s between checks (Avoid Rate Limits)
         await new Promise(r => setTimeout(r, 2000));
         retryCount++;
 
         try {
+            // 1. Fetch Latest Order Data from Upstox
             const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { 
                 headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
             });
@@ -883,125 +903,143 @@ async function verifyOrderStatus(orderId, context) {
             const order = res.data.data.find(o => o.order_id === orderId);
             
             if (!order) {
-                console.log(`⚠️ Order ${orderId} not found in exchange history. Retrying...`);
+                console.log(`... Order ${orderId} not found yet (Attempt ${retryCount})`);
                 continue; 
             }
 
-            // 1️⃣ SUCCESS: Order is officially filled
-            // 1. SUCCESS: Order Filled
+            // ============================================
+            // ✅ CASE 1: ORDER FILLED (COMPLETE)
+            // ============================================
             if (order.status === 'complete') {
                 const realPrice = parseFloat(order.average_price);
                 const execTime = new Date(order.order_timestamp).toLocaleTimeString();
                 
                 console.log(`✅ Order Confirmed: ${order.transaction_type} @ ₹${realPrice}`);
                 
-                // Update Log in Memory
-                const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
+                // --- A. UPDATE THE DASHBOARD LOG ---
+                // Find by Real ID OR Temp ID (Passed from placeOrder)
+                const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === tempLogId);
+                
                 if (logIndex !== -1) {
-                    botState.history[logIndex].id = orderId;
+                    // Update Core Data
+                    botState.history[logIndex].id = orderId; // 🔄 Swap Temp ID for Real ID
                     botState.history[logIndex].executedPrice = realPrice;
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
-                    botState.history[logIndex].qty = parseInt(order.filled_quantity) || botState.quantity;
+                    
+                    // Capture Filled Quantity
+                    const filledQty = parseInt(order.filled_quantity);
+                    if (filledQty) botState.history[logIndex].qty = filledQty;
 
-                    // ✅ NEW: CALCULATE PNL LIVE
-                    // We only calculate PnL if this was an EXIT order
+                    // --- B. HANDLE EXIT LOGIC (STOP LOSS / TARGET HIT) ---
                     if (context === 'EXIT_CHECK') {
+                        console.log("📝 Calculating Final PnL for Exit...");
+                        
                         let tradePnL = 0;
-                        const tradeQty = botState.history[logIndex].qty;
-                        
-                        // If we were LONG, we just SOLD (Profit = Exit - Entry)
-                        if (order.transaction_type === 'SELL') {
-                            tradePnL = (realPrice - botState.entryPrice) * tradeQty;
-                        } 
-                        // If we were SHORT, we just BOUGHT (Profit = Entry - Exit)
-                        else {
-                            tradePnL = (botState.entryPrice - realPrice) * tradeQty;
-                        }
-                        
-                        botState.history[logIndex].pnl = tradePnL;
-                        console.log(`💰 Live PnL Calculated: ₹${tradePnL.toFixed(0)}`);
-                    }
+                        const qty = botState.history[logIndex].qty;
+                        const entryPrice = botState.entryPrice;
 
+                        // Calculate PnL based on direction
+                        if (order.transaction_type === 'SELL') tradePnL = (realPrice - entryPrice) * qty;
+                        else tradePnL = (entryPrice - realPrice) * qty;
+
+                        // Save PnL
+                        botState.history[logIndex].pnl = tradePnL;
+                        botState.totalPnL += tradePnL;
+                        console.log(`💰 Final PnL: ₹${tradePnL.toFixed(0)}`);
+
+                        // 💾 Save AI Data
+                        botState.history[logIndex].tickData = [...(botState.currentTradeTicks || [])];
+                        botState.history[logIndex].metrics = {
+                            ...(botState.history[logIndex].metrics || {}),
+                            mae: botState.maxDrawdown || 0,
+                            mfe: botState.maxRunUp || 0
+                        };
+
+                        // 🎥 Start 10-Minute Post-Trade Watcher
+                        botState.postExitWatch = { 
+                            id: orderId, 
+                            until: Date.now() + (10 * 60 * 1000) 
+                        };
+                        console.log(`🎥 Post-Trade Watcher Started for ID: ${orderId}`);
+
+                        // 🧹 RESET GLOBAL BOT STATE
+                        botState.positionType = null;
+                        botState.entryPrice = 0;
+                        botState.quantity = 0;
+                        botState.currentTradeTicks = [];
+                        botState.maxRunUp = 0;
+                        botState.maxDrawdown = 0;
+                    }
+                    
+                    // Save this specific trade to Firestore
                     await saveTrade(botState.history[logIndex]); 
                 }
-
-                // EXIT LOGIC: Standardized to 'EXIT_CHECK'
-                // EXIT LOGIC: Standardized to 'EXIT_CHECK'
-                if (context === 'EXIT_CHECK') {
-                    botState.lastExitTime = Date.now(); 
-                    console.log(`❄️ Cooling period started at: ${new Date().toLocaleTimeString()}`);
-                    
-                    // ✅ FIX: START HIGH-PRECISION MONITORING
-                    console.log(`🎥 Starting 10-Minute Post-Trade Analysis for ${orderId}...`);
-                    botState.activeMonitors[orderId] = {
-                        startTime: Date.now(),
-                        maxRunUp: botState.maxRunUp, // Store the peak profit seen during the trade
-                        highestAfterExit: realPrice,
-                        lowestAfterExit: realPrice,
-                        data: [] // Ticks will be pushed here by WebSocket
-                    };
-                    
-                    // Reset State AFTER initializing monitor
-                    botState.positionType = null; 
-                    botState.slOrderId = null; 
-                    botState.maxRunUp = 0;
-                    botState.quantity = 0;
-                    botState.entryPrice = 0;
-                }
-
+                
                 await saveSettings();
                 pushToDashboard(); 
                 return { status: 'FILLED', price: realPrice }; 
             }
 
-            // 2️⃣ SLIPPAGE HANDLING: Order is still open/pending after several checks
+            // ============================================
+            // ✅ CASE 2: SLIPPAGE / STUCK ORDER
+            // ============================================
             if (order.status === 'trigger pending' || order.status === 'open') {
                 if (retryCount >= 6) { // If still open after ~12 seconds
                     console.log(`⚠️ SLIPPAGE DETECTED: Order ${orderId} is still ${order.status}. Price likely gapped.`);
                     
-                    // ✅ REVERT STATE: Tell the bot it's still in the trade
-                    // If the SL order was a 'BUY', it means our position is 'SHORT'
-                    botState.positionType = (order.transaction_type === 'BUY') ? 'SHORT' : 'LONG';
-                    
-                    console.log(`🔄 State Reverted to ${botState.positionType}. WebSocket will resume monitoring.`);
+                    // Revert State so bot knows we are still in the trade
+                    // If SL (Sell) is open, we are still LONG.
+                    if (context === 'EXIT_CHECK') {
+                         botState.positionType = (order.transaction_type === 'BUY') ? 'SHORT' : 'LONG';
+                         console.log(`🔄 State Reverted to ${botState.positionType}. Monitoring continues.`);
+                    }
+
                     pushToDashboard();
                     return { status: 'SLIPPAGE' }; 
                 }
             }
-
-            // 3️⃣ FAILURE: Rejected or Cancelled
+            
+            // ============================================
+            // ✅ CASE 3: FAILED / CANCELLED
+            // ============================================
             if (['rejected', 'cancelled'].includes(order.status)) {
-                console.log(`❌ Order Failed: ${order.status_message}`);
+                console.error(`❌ Order ${order.status.toUpperCase()}: ${order.status_message}`);
                 
-                const logIndex = botState.history.findIndex(h => h.id === orderId || h.id === "PENDING");
+                const logIndex = botState.history.findIndex(h => h.id === tempLogId || h.id === orderId);
                 if (logIndex !== -1) {
                     botState.history[logIndex].id = orderId;
                     botState.history[logIndex].status = order.status.toUpperCase();
-                    await saveTrade(botState.history[logIndex]); 
+                    await saveTrade(botState.history[logIndex]);
                 }
-                
+
+                // If Entry failed, clear state. If Exit failed, keep state (handled above).
                 if (context !== 'EXIT_CHECK') { 
                     botState.positionType = null; 
                     botState.quantity = 0;
                 }
                 
-                await saveSettings();
                 pushToDashboard();
+                await saveSettings();
                 return { status: 'FAILED' }; 
             }
 
-        } catch (e) {
+        } catch (e) { 
             if (e.response && e.response.status === 429) {
                 console.log("⚠️ Upstox Rate Limit hit. Pausing 5s...");
                 await new Promise(r => setTimeout(r, 5000));
             } else {
-                console.log("Verification Error: " + e.message);
+                console.log(`⚠️ Verification Error (Attempt ${retryCount}): ${e.message}`); 
             }
         }
     }
     
-    // Safety Fallback: Unlock state if we timeout to prevent the bot from staying "EXITING"
+    // ============================================
+    // ✅ CASE 4: TIMEOUT
+    // ============================================
+    console.error(`❌ Verification Timeout for Order ${orderId}`);
+    
+    // Safety Fallback: Unlock state if stuck
     if (botState.positionType === 'EXITING') {
         console.log("🛑 Verification TIMEOUT. Reverting state to allow recovery.");
         botState.positionType = null; 
@@ -1009,8 +1047,8 @@ async function verifyOrderStatus(orderId, context) {
     return { status: 'TIMEOUT' };
 }
 // --- STRICT PLACE ORDER (With Intent Logging & Error Detail) ---
-// --- 🚀 ROBUST V3 PLACE ORDER (Array Handling + Circuit Auto-Correction) ---
-async function placeOrder(type, qty, ltp) {
+// --- 🚀 ROBUST V3 PLACE ORDER (Fixed ID & Metrics) ---
+async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metrics parameter
     if (!ACCESS_TOKEN || !isApiAvailable() || !botState.isTradingEnabled) return false;
 
     // 1. Calculate Initial 0.3% Buffer
@@ -1019,14 +1057,21 @@ async function placeOrder(type, qty, ltp) {
 
     console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit: ₹${limitPrice}`);
 
-    // Create Initial Log
-    const logId = "ORD-" + Date.now(); // Unique ID for tracking
+    // Create Initial Log with a TRACKABLE ID
+    const logId = "ORD-" + Date.now(); 
     const logEntry = { 
-        date: formatDate(getIST()), time: getIST().toLocaleTimeString(), 
+        date: formatDate(getIST()), 
+        time: getIST().toLocaleTimeString(), 
         type: type, 
         qty: qty, 
-        orderedPrice: ltp, executedPrice: 0, id: logId, status: "SENT", tag: "API_BOT" 
+        orderedPrice: ltp, 
+        executedPrice: 0, 
+        id: logId, // ✅ This Temp ID is now crucial
+        status: "SENT", 
+        tag: "API_BOT",
+        metrics: metrics // ✅ 2. Save Metrics (RSI, E50, Vol) to history immediately
     };
+    
     botState.history.unshift(logEntry);
     pushToDashboard();
 
@@ -1055,15 +1100,16 @@ async function placeOrder(type, qty, ltp) {
         }
 
         // 3. ROBUST VERIFICATION
-        // passing 'ENTRY' helps verifyOrderStatus logic if distinct, otherwise generic
-        const result = await verifyOrderStatus(orderId, 'ENTRY');
+        // ✅ 3. Pass 'logId' so verifyOrderStatus updates the existing row instead of creating a new one
+        const result = await verifyOrderStatus(orderId, 'ENTRY', logId); 
 
         if (result.status === 'FILLED') {
             
             // ✅ DETECT IF THIS IS AN ENTRY OR EXIT
-            // It is an Entry if we have NO position, OR if we are adding to same side (unlikely in this bot)
-            // It is an Exit if we have a position and this order is Opposite
-            const isExit = botState.positionType && (botState.positionType === 'LONG' && type === 'SELL') || (botState.positionType === 'SHORT' && type === 'BUY');
+            const isExit = botState.positionType && (
+                (botState.positionType === 'LONG' && type === 'SELL') || 
+                (botState.positionType === 'SHORT' && type === 'BUY')
+            );
 
             if (!isExit) {
                 //Handler: === NEW ENTRY ===
@@ -1083,8 +1129,8 @@ async function placeOrder(type, qty, ltp) {
                 
                 botState.currentStop = slPrice;
                 
-                // Update Log with Execution Price
-                const histIdx = botState.history.findIndex(h => h.id === logId);
+                // Update Log with Execution Price (Find by ID since it might have changed to real OrderID)
+                const histIdx = botState.history.findIndex(h => h.id === orderId || h.id === logId);
                 if(histIdx !== -1) botState.history[histIdx].executedPrice = result.price;
 
                 await saveSettings();
@@ -1100,26 +1146,21 @@ async function placeOrder(type, qty, ltp) {
                 if(botState.positionType === 'SHORT') pnl = (botState.entryPrice - result.price) * qty;
 
                 // Update the log we just pushed at the top with Final Data
-                const histIdx = botState.history.findIndex(h => h.id === logId);
+                const histIdx = botState.history.findIndex(h => h.id === orderId || h.id === logId);
                 if(histIdx !== -1) {
                     botState.history[histIdx].executedPrice = result.price;
                     botState.history[histIdx].pnl = pnl;
                     
                     // ✅ SAVE AI DATA (TICKS + METRICS)
                     botState.history[histIdx].tickData = [...(botState.currentTradeTicks || [])];
-                    botState.history[histIdx].metrics = {
-                        mae: botState.maxDrawdown || 0,
-                        mfe: botState.maxRunUp || 0
-                        // Note: RSI/ATR metrics are added by the Interval loop separately
-                    };
                 }
 
                 // ✅ START 10-MINUTE POST-TRADE WATCHER
                 botState.postExitWatch = {
-                    id: logId, // Link to this specific trade log
+                    id: orderId, // Link to this specific trade log
                     until: Date.now() + (10 * 60 * 1000) // 10 Minutes from now
                 };
-                console.log(`🎥 AI Camera Rolling: Recording 10 mins post-trade (ID: ${logId})`);
+                console.log(`🎥 AI Camera Rolling: Recording 10 mins post-trade (ID: ${orderId})`);
 
                 // CLEANUP STATE
                 botState.positionType = null;
@@ -1154,15 +1195,16 @@ async function placeOrder(type, qty, ltp) {
                 }, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' }});
 
                 let orderId2 = res2.data?.data?.order_ids?.[0] || res2.data?.data?.order_id;
-                return await verifyOrderStatus(orderId2, 'ENTRY');
+                // ✅ 4. Pass logId here too so the retry updates the original log
+                return await verifyOrderStatus(orderId2, 'ENTRY', logId); 
             } catch (err2) {
                 console.error("❌ Final Circuit Retry Failed:", err2.message);
             }
         }
 
         console.error(`❌ [FAILURE] Order Rejected: ${errorDetail}`);
+        
         // Only reset position if we were trying to enter and failed. 
-        // If exiting and failed, we are still in position!
         if (!botState.positionType) botState.positionType = null; 
         
         pushToDashboard();
@@ -1297,41 +1339,40 @@ setInterval(async () => {
                 const inCoolingPeriod = msSinceExit < 120000;
                 const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
 
+                // --- 4. SIGNAL EXECUTION BLOCK ---
                 if (isBuySignal || isSellSignal) {
                     const signalType = isBuySignal ? "BUY" : "SELL";
 
+                    // Check if we are in the "Cooling Period" (2 mins after exit)
                     if (inCoolingPeriod) {
-                        // ✅ EXACT LOG FORMAT: SIGNAL BLOCKED
-                        console.log(`⚠️ [COOLING] Signal Detected: ${signalType} @ ${lastKnownLtp} | Execution blocked for ${waitSec}s`);
-                    } else if (botState.isTradingEnabled) {
+                        console.log(`⚠️ [COOLING] Signal Detected: ${signalType} @ ${lastKnownLtp} | Execution Blocked for ${waitSec}s`);
+                    } 
+                    else if (botState.isTradingEnabled) {
                         
-                        // ✅ DYNAMIC STOP LOSS (1.5 * ATR)
-                        const price = lastKnownLtp;
-                        
-                        // PLACE ORDER
-                        const success = await placeOrder(signalType, botState.maxTradeQty, price);
+                        console.log(`⚡ Signal Triggered: ${signalType} @ ${lastKnownLtp}`);
 
-                        // LOG METRICS FOR EXCEL
-                        if(success) {
-                             const logIndex = botState.history.findIndex(h => h.id === "PENDING" || h.status === "SENT");
-                             if(logIndex !== -1) {
-                                 botState.history[logIndex].metrics = {
-                                     rsi: curRSI.toFixed(2),
-                                     atr: globalATR.toFixed(0),
-                                     e50: curE50.toFixed(0),
-                                     e200: curE200.toFixed(0),
-                                     vol: curV,
-                                     avgVol: curAvgV.toFixed(0),
-                                     volMult: volMult.toFixed(2)
-                                 };
-                             }
-                        }
+                        // ✅ CAPTURE METRICS FOR ANALYSIS/EXCEL
+                        // We capture these NOW so they match exactly why we took the trade
+                        const tradeMetrics = {
+                            rsi: curRSI.toFixed(2),
+                            atr: globalATR.toFixed(0),
+                            e50: curE50.toFixed(0),
+                            e200: curE200.toFixed(0),
+                            vol: curV,
+                            avgVol: curAvgV.toFixed(0),
+                            volMult: volMult.toFixed(2)
+                        };
+
+                        // ✅ PASS METRICS TO PLACE ORDER
+                        // This ensures they get saved to the log immediately
+                        await placeOrder(signalType, botState.maxTradeQty, lastKnownLtp, tradeMetrics);
 
                     } else {
+                        // Log for monitoring even if trading is paused
                         console.log(`⚠️ Signal (Paused): ${signalType} @ ${lastKnownLtp} | RSI: ${curRSI.toFixed(1)}`);
                     }
                 }
-                // ✅ OPTIONAL: Log generic cooling status only if cooling is active (Correctly Placed Here)
+                // Optional: Log cooling status if active
                 else if (inCoolingPeriod) {
                     console.log(`⏳ Cooling Period Active: Waiting ${waitSec}s more...`);
                 }
@@ -2197,34 +2238,45 @@ app.post('/update-qty', async (req, res) => {
 
 
 // ✅ RULE 5: EXCEL DOWNLOAD ROUTE
+// ✅ EXCEL DOWNLOAD ROUTE (Fixed Date & Metrics)
 app.get('/download-excel', (req, res) => {
     try {
-        const trades = botState.history.filter(t => t.status === 'FILLED' && !t.type.includes('SYSTEM'));
+        // 1. Filter & Sort Trades
+        // We only want FILLED trades that are actual buys/sells (not system logs)
+        const trades = botState.history
+            .filter(t => t.status === 'FILLED' && !t.type.includes('SYSTEM'))
+            // Sort Descending (Newest First) -> Combines Date + Time strings safely
+            .sort((a,b) => new Date(b.date + ' ' + b.time) - new Date(a.date + ' ' + a.time));
         
-        // Map data to YOUR exact Sheet format
+        // 2. Map Data to Excel Columns
         const excelData = trades.map(t => {
+            // Safely access metrics (defaults to empty object if missing)
             const m = t.metrics || {};
+            
             return {
-                "DATE": t.date,
+                "DATE": t.date, // ✅ Uses the trade's specific date
                 "TYPE": t.type,
                 "QUANTITY": t.qty,
                 "ENTRY PRICE": t.orderedPrice, 
                 "ENTRY TIME": t.time,
                 "EXIT PRICE": t.executedPrice,
-                "EXIT TIME": t.lastExitTime ? new Date(t.lastExitTime).toLocaleTimeString() : '-', 
                 "PnL": t.pnl || 0,
+                
+                // ✅ METRICS COLUMNS (Now populated correctly)
                 "E50": m.e50 || '-',
                 "E200": m.e200 || '-',
-                "VOLUME": m.vol || '-',
                 "AVG VOLUME": m.avgVol || '-',
                 "VOLUME MULTIPLE": m.volMult || '-',
-                "RSI": m.rsi || '-'
+                "RSI": m.rsi || '-',
+                "ATR": m.atr || '-'
             };
         });
 
+        // 3. Convert JSON to CSV
         const json2csvParser = new Parser();
         const csv = json2csvParser.parse(excelData);
 
+        // 4. Send File Download
         res.header('Content-Type', 'text/csv');
         res.attachment(`Silver_Trades_${formatDate(getIST())}.csv`);
         res.send(csv);
