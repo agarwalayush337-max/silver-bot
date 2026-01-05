@@ -2287,5 +2287,13 @@ app.get('/download-excel', (req, res) => {
         res.status(500).send("Error generating Excel: " + e.message);
     }
 });
+// ✅ AUTO-RECOVERY: If server restarts, wait 20s (to let it settle) then Auto-Login
+setTimeout(() => {
+    // Only try to login if market is OPEN and we are NOT logged in
+    if (isMarketOpen() && !ACCESS_TOKEN) {
+        console.log("♻️ Crash Recovery Detected: Attempting Auto-Login...");
+        performAutoLogin();
+    }
+}, 20000); // 20-second delay to prevent crashing a cold server
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
