@@ -861,6 +861,18 @@ async function performAutoLogin() {
 
         const res = await axios.post('https://api.upstox.com/v2/login/authorization/token', params, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
         ACCESS_TOKEN = res.data.access_token;
+        // ============================================================
+        // 🔑 SHARE TOKEN WITH BOT 2 (SLAVE)
+        // ============================================================
+        if (db) {
+            await db.collection('bot').doc('SHARED_AUTH').set({
+                access_token: ACCESS_TOKEN,
+                date: new Date().toDateString(),
+                updatedAt: new Date().toISOString()
+            }, { merge: true });
+            console.log("🤝 Token shared to Firestore for Bot 2.");
+        }
+        // ============================================================
         
         await initWebSocket();
         
