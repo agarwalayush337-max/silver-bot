@@ -1795,6 +1795,10 @@ app.get('/reports', (req, res) => {
 // ✅ AI ANALYSIS SYSTEM (Loading Screen + API + Caching)
 // ============================================================
 
+// ============================================================
+// ✅ AI ANALYSIS SYSTEM (Loading Screen + API + Rich UI)
+// ============================================================
+
 // 1️⃣ THE LOADING SHELL (Instant Load)
 app.get('/analyze-sl/:id', async (req, res) => {
     const tradeId = req.params.id;
@@ -1957,7 +1961,7 @@ app.post('/api/generate-analysis', async (req, res) => {
     }
 });
 
-// 3️⃣ HELPER FUNCTION TO GENERATE HTML
+// 3️⃣ HELPER FUNCTION TO GENERATE HTML (Now RESTORED with Full UI)
 function renderAnalysisHTML(t, analysisText, tradeId) {
     const totalPnL = t.pnl || 0;
     const exitPrice = t.executedPrice || t.orderedPrice || 0;
@@ -1966,6 +1970,8 @@ function renderAnalysisHTML(t, analysisText, tradeId) {
     const maxRunUp = t.metrics?.mfe || t.analysisData?.maxRunUp || t.maxRunUp || 0;
     const maxDrawdown = t.metrics?.mae || t.analysisData?.maxDrawdown || t.maxDrawdown || 0;
     
+    const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : "Unknown Date";
+
     // Position Calc
     let positionType = "UNKNOWN";
     let entryPrice = 0;
@@ -1988,41 +1994,63 @@ function renderAnalysisHTML(t, analysisText, tradeId) {
     const snap5 = getPriceAt(5);
     const snap10 = getPriceAt(10);
 
+    // ✅ FULL UI RESTORED BELOW
     return `
     <div style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:30px; min-height:100vh;">
         <div style="max-width:900px; margin:auto;">
             
-            <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
-                <h2 style="margin:0; color:#38bdf8;">🚀 Analysis Result</h2>
-                <a href="/analyze-sl/${tradeId}?refresh=true" style="background:#f59e0b; padding:8px 15px; border-radius:5px; text-decoration:none; color:#0f172a; font-weight:bold; font-size:12px;">
-                    🔄 Refresh AI
-                </a>
+            <div style="background:#1e293b; border-radius:15px; padding:20px; border:1px solid #334155; margin-bottom:25px; box-shadow:0 10px 30px rgba(0,0,0,0.3);">
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #475569; padding-bottom:15px; margin-bottom:15px;">
+                    <div>
+                        <h2 style="margin:0; color:#38bdf8;">🚀 Strategy Optimizer</h2>
+                        <div style="color:#94a3b8; font-size:13px;">${tradeDate}</div>
+                    </div>
+                    
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <a href="/analyze-sl/${tradeId}?refresh=true" style="background:#f59e0b; padding:8px 15px; border-radius:5px; text-decoration:none; color:#0f172a; font-weight:bold; font-size:12px;">
+                            🔄 Refresh
+                        </a>
+                        <div style="text-align:right;">
+                            <div style="font-size:12px; color:#cbd5e1;">ACTUAL TOTAL PnL</div>
+                            <div style="font-size:24px; font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}">
+                                ${totalPnL>=0?'+':''}₹${totalPnL}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:15px; text-align:center; margin-bottom:10px;">
+                    <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                        <div style="font-size:10px; color:#94a3b8;">POSITION</div>
+                        <div style="font-weight:bold; color:#fbbf24; font-size:14px;">${positionType} (${qty} Lots)</div>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                        <div style="font-size:10px; color:#94a3b8;">ENTRY PRICE</div>
+                        <div style="font-weight:bold; font-size:14px;">${entryPrice.toFixed(0)}</div>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; border-radius:10px;">
+                        <div style="font-size:10px; color:#94a3b8;">EXIT PRICE</div>
+                        <div style="font-weight:bold; font-size:14px;">${exitPrice}</div>
+                    </div>
+                </div>
+
+                <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:15px; text-align:center;">
+                    <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
+                        <div style="font-size:10px; color:#94a3b8;">MAX RUN-UP (MFE)</div>
+                        <div style="font-weight:bold; color:#4ade80; font-size:14px;">+₹${maxRunUp}</div>
+                    </div>
+                    <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
+                        <div style="font-size:10px; color:#94a3b8;">MAX DRAWDOWN (MAE)</div>
+                        <div style="font-weight:bold; color:#f87171; font-size:14px;">-₹${maxDrawdown}</div>
+                    </div>
+                </div>
             </div>
 
-            <div style="background:#1e293b; padding:20px; border-radius:10px; margin-bottom:20px; display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; text-align:center;">
-                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                    <small style="color:#94a3b8">PnL</small><br>
-                    <b style="color:${totalPnL>=0?'#4ade80':'#f87171'}">₹${totalPnL}</b>
-                 </div>
-                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                    <small style="color:#94a3b8">Drawdown (MAE)</small><br>
-                    <b style="color:#f87171">₹${maxDrawdown}</b>
-                 </div>
-                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                    <small style="color:#94a3b8">RunUp (MFE)</small><br>
-                    <b style="color:#4ade80">₹${maxRunUp}</b>
-                 </div>
-                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
-                    <small style="color:#94a3b8">Exit Price</small><br>
-                    <b>${exitPrice}</b>
-                 </div>
-            </div>
-
-            <div style="background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5; line-height:1.7; color:#e2e8f0;">
+            <div style="background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5; margin-bottom:25px; line-height:1.7; color:#e2e8f0;">
                 ${analysisText}
             </div>
-            
-            <div style="background:#1e293b; padding:20px; border-radius:15px; border:1px solid #334155; margin-top:20px;">
+
+            <div style="background:#1e293b; padding:20px; border-radius:15px; border:1px solid #334155; margin-bottom:25px;">
                 <h3 style="margin-top:0; color:#cbd5e1; font-size:16px; border-bottom:1px solid #475569; padding-bottom:10px;">⏱️ Post-Exit Price Snapshots</h3>
                 ${postExitData.length > 0 ? `
                 <table style="width:100%; border-collapse:collapse; color:#cbd5e1; font-size:14px;">
