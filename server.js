@@ -615,45 +615,62 @@ async function initWebSocket() {
                                 // --- INSIDE currentWs.onmessage (After getting newPrice) ---
                     
                                 // 0️⃣ TICK RECORDER (For AI Analysis)
-                                const tickTime = getIST(); // Get IST Time object
-                                const tickLog = { t: tickTime.toLocaleTimeString(), p: newPrice }; // Compact format: t=Time, p=Price
-                    
+                                const tickTime = getIST(); 
+                                const tickLog = { t: tickTime.toLocaleTimeString(), p: newPrice }; 
+                                
                                 // A) Record if currently IN A TRADE
                                 if (botState.positionType) {
                                     if (!botState.currentTradeTicks) botState.currentTradeTicks = [];
                                     botState.currentTradeTicks.push(tickLog);
                                 }
-                    
+                                
                                 // B) Record if in POST-EXIT WATCH (The 10 mins after trade)
                                 if (botState.postExitWatch) {
                                     if (Date.now() < botState.postExitWatch.until) {
                                         // Find the completed trade in history
                                         const pastTrade = botState.history.find(t => t.id === botState.postExitWatch.id);
                                         if (pastTrade) {
+                                            // Initialize array if missing
                                             if (!pastTrade.tickData) pastTrade.tickData = [];
+                                            // Add tick
                                             pastTrade.tickData.push(tickLog);
+                                            
+                                            // OPTIONAL: Save every 1 min to prevent data loss if crash (modulo check)
+                                            if (pastTrade.tickData.length % 12 === 0) saveTrade(pastTrade);
                                         }
                                     } else {
-                                        // Time expired (10 mins done)
+                                        // ✅ FIX 2: TIME EXPIRED - SAVE DATA PERMANENTLY
                                         console.log(`⏹️ Post-Trade Recording Finished for ${botState.postExitWatch.id}`);
+                                        
+                                        const finishedTrade = botState.history.find(t => t.id === botState.postExitWatch.id);
+                                        if (finishedTrade) {
+                                            await saveTrade(finishedTrade); // <--- CRITICAL FIX: Actually saves to Firestore
+                                            console.log("💾 Post-Trade Data Saved to DB.");
+                                        }
+                                        
                                         botState.postExitWatch = null; 
-                                        saveSettings(); // Save final data to Firebase
+                                        saveSettings(); 
                                     }
                                 }
-                    
-                                // ... (Continue with existing 1️⃣ LIVE TRADE TRACKING logic) ...
-                        
+                                                    
                 
                                 // 1️⃣ LIVE TRADE TRACKING
                                 if (botState.positionType) {
                                     const tradeQty = botState.quantity || 1;
                                     let currentProfit = 0;
                                     
-                                    // Calculate Total Profit (e.g., 500 pts * 4 lots = 2000 profit)
+                                    // Calculate Total Profit
                                     if (botState.positionType === 'LONG') currentProfit = (newPrice - botState.entryPrice) * tradeQty;
                                     if (botState.positionType === 'SHORT') currentProfit = (botState.entryPrice - newPrice) * tradeQty;
                                     
+                                    // Track Max Run Up (MFE)
                                     if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
+                                
+                                    // ✅ FIX 1: TRACK MAX DRAWDOWN (MAE)
+                                    // Initialize if undefined
+                                    if (botState.maxDrawdown === undefined) botState.maxDrawdown = 0;
+                                    // Capture lowest PnL (e.g., -500 is "less than" 0)
+                                    if (currentProfit < botState.maxDrawdown) botState.maxDrawdown = currentProfit;
                                 
                                     // ✅ RULE 1: DYNAMIC TRAILING
                                     // Use Live ATR (limit min to 500)
@@ -668,14 +685,21 @@ async function initWebSocket() {
                                     // STAGE A: Move to Cost if Profit > 1 ATR (Per Lot)
                                     // Logic: If Total Profit > (ATR * Qty)
                                     if (currentProfit >= (liveATR * tradeQty)) {
-                                        const costSL = botState.entryPrice; 
+                                        
+                                        // ✅ FIX: Calculate Cost + 50 (Brokerage Buffer)
+                                        let costSL = botState.entryPrice;
+                                        if (botState.positionType === 'LONG') costSL = botState.entryPrice + 50;
+                                        if (botState.positionType === 'SHORT') costSL = botState.entryPrice - 50;
+
+                                        // Check if this new "Cost + 50" level is better than the current Stop
+                                        // For LONG, Better = Higher | For SHORT, Better = Lower
                                         const isBetter = botState.positionType === 'LONG' ? (costSL > botState.currentStop) : (costSL < botState.currentStop);
                                         
                                         if (isBetter) {
                                             newStop = costSL;
                                             didChange = true;
                                             // ✅ LOG: Shows Profit vs Target
-                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 1 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost`);
+                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 1 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost + 50`);
                                         }
                                     }
 
@@ -1305,17 +1329,22 @@ setInterval(async () => {
             const curAvgV = vAvg[vAvg.length-1];
             const curRSI = rsiArray[rsiArray.length - 1]; 
             
-            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
+           // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
             const rawATR = atr[atr.length-1];
+            
+            // 1. Store the REAL ATR for display/logging
+            const displayATR = rawATR ? rawATR.toFixed(0) : "0";
+
+            // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
             globalATR = rawATR ? Math.max(rawATR, 500) : 1000; 
 
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
             const volMult = curV / curAvgV; 
 
-            // 2. DETAILED LOG
+            // 2. DETAILED LOG (Now shows REAL ATR)
             const shortName = botState.contractName.replace("SILVER MIC ", ""); 
-            console.log(`📊 [${shortName}] LTP:${lastKnownLtp} E50:${curE50.toFixed(0)} E200:${curE200.toFixed(0)} Vol:${curV} AvgV:${curAvgV.toFixed(0)} ATR:${globalATR.toFixed(0)} RSI:${curRSI.toFixed(1)}`);
+            console.log(`📊 [${shortName}] LTP:${lastKnownLtp} E50:${curE50.toFixed(0)} E200:${curE200.toFixed(0)} Vol:${curV} AvgV:${curAvgV.toFixed(0)} ATR:${displayATR} (Used:${globalATR.toFixed(0)}) RSI:${curRSI.toFixed(1)}`);
 
             // 3. SIGNAL LOGIC
             if (isMarketOpen() && !botState.positionType) {
@@ -1680,7 +1709,7 @@ app.post('/reset-pnl', async (req, res) => {
     res.redirect('/');
 });
 
-// ✅ REPORTS PAGE (With Date-wise Excel Download)
+// ✅ REPORTS PAGE (Cleaned UI + Analyze Button)
 app.get('/reports', (req, res) => {
     // 1. Group History by Date
     const grouped = {};
@@ -1691,20 +1720,20 @@ app.get('/reports', (req, res) => {
         grouped[t.date].push(t);
     });
 
-    // 2. Start HTML Generation
+    // 2. Start HTML Construction
     let html = `<html><head><title>Trade Reports</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 1000px; margin: auto; }
         .date-card { background: #1e293b; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #334155; }
         .header-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 10px; margin-bottom: 10px; }
         .pnl-tag { font-weight: bold; padding: 4px 8px; border-radius: 4px; background: #0f172a; border: 1px solid #334155; }
-        .download-btn { background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 13px; font-weight: bold; display: flex; align-items: center; gap: 5px; }
-        .download-btn:hover { background: #16a34a; }
+        .btn { padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; display: inline-block; }
+        .btn-green { background: #22c55e; color: white; }
+        .btn-blue { background: #6366f1; color: white; margin-left:5px;}
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th { text-align: left; color: #94a3b8; padding: 8px; border-bottom: 1px solid #334155; }
         td { padding: 8px; border-bottom: 1px solid #334155; color: #e2e8f0; }
         .buy { color: #4ade80; } .sell { color: #f87171; }
-        .metrics { font-size: 11px; color: #64748b; }
     </style>
     </head><body>
     
@@ -1720,32 +1749,30 @@ app.get('/reports', (req, res) => {
         html += `<div style="text-align:center; color:#64748b; margin-top:50px;">No trades found yet.</div>`;
     }
 
+    // 4. Build Table for Each Date
     sortedDates.forEach(date => {
         const dayTrades = grouped[date];
-        // Calculate Day PnL (Sum of all PnL entries)
         const dayPnL = dayTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
         const pnlColor = dayPnL >= 0 ? '#4ade80' : '#f87171';
         
-        // --- HEADER WITH DOWNLOAD BUTTON ---
         html += `<div class="date-card">
             <div class="header-row">
                 <div style="display:flex; align-items:center; gap:15px;">
                     <h3 style="margin:0;">📅 ${date}</h3>
                     <span class="pnl-tag" style="color:${pnlColor}">Day PnL: ₹${dayPnL.toFixed(0)}</span>
                 </div>
-                <a href="/download-day-excel?date=${date}" class="download-btn">
-                    📥 Download Excel
-                </a>
-            </div>`;
-
-        // --- TABLE ---
-        html += `<table>
-            <tr><th>Time</th><th>Type</th><th>Qty</th><th>Price</th><th>PnL</th><th>Metrics (RSI/Vol)</th></tr>`;
+                <a href="/download-day-excel?date=${date}" class="btn btn-green">📥 Excel</a>
+            </div>
+            <table>
+            <tr><th>Time</th><th>Type</th><th>Qty</th><th>Price</th><th>PnL</th><th>Action</th></tr>`;
             
         dayTrades.forEach(t => {
-            const m = t.metrics || {};
-            const metricStr = m.rsi ? `RSI:${m.rsi} | Vol:${m.volMult}x` : '-';
-            const rowColor = (t.pnl && t.pnl !== 0) ? (t.pnl > 0 ? 'rgba(74, 222, 128, 0.1)' : 'rgba(248, 113, 113, 0.1)') : 'transparent';
+            const rowColor = (t.pnl && t.pnl !== 0) ? (t.pnl > 0 ? 'rgba(74, 222, 128, 0.05)' : 'rgba(248, 113, 113, 0.05)') : 'transparent';
+            
+            // ✅ "Analyze" Button (Only shows if trade is closed/has PnL)
+            const analyzeBtn = (t.pnl !== undefined) 
+                ? `<a href="/analyze-sl/${t.id}" target="_blank" class="btn btn-blue">🧠 Analyze</a>` 
+                : '-';
 
             html += `<tr style="background:${rowColor}">
                 <td>${t.time}</td>
@@ -1753,7 +1780,7 @@ app.get('/reports', (req, res) => {
                 <td>${t.qty}</td>
                 <td>${t.executedPrice}</td>
                 <td style="font-weight:bold; color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">${t.pnl !== undefined ? '₹'+t.pnl : '-'}</td>
-                <td class="metrics">${metricStr}</td>
+                <td>${analyzeBtn}</td>
             </tr>`;
         });
         html += `</table></div>`;
@@ -1764,28 +1791,86 @@ app.get('/reports', (req, res) => {
 });
 
 
+// ============================================================
+// ✅ AI ANALYSIS SYSTEM (Loading Screen + API + Caching)
+// ============================================================
 
-// ✅ ULTIMATE STRATEGY OPTIMIZER ROUTE (Fixed: Exit Price, MAE/MFE, In-Trade Data)
+// 1️⃣ THE LOADING SHELL (Instant Load)
 app.get('/analyze-sl/:id', async (req, res) => {
-    try {
-        const tradeId = req.params.id;
-        if (!tradeId) return res.send("Error: No Trade ID provided.");
+    const tradeId = req.params.id;
+    
+    // Send a page that immediately shows a spinner, then fetches data via AJAX
+    res.send(`
+    <html>
+    <head>
+        <title>AI Analysis</title>
+        <style>
+            body { background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+            .loader { border: 4px solid #334155; border-top: 4px solid #6366f1; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin:auto; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .container { text-align:center; }
+        </style>
+    </head>
+    <body>
+        <div class="container" id="loading">
+            <div class="loader"></div>
+            <h3 style="color:#94a3b8; margin-top:20px;">🤖 Gemini is analyzing trade #${tradeId}...</h3>
+            <p style="color:#64748b; font-size:12px;">This may take 5-10 seconds.</p>
+        </div>
+        <div id="content" style="width:100%; height:100%; display:none;"></div>
 
-        const doc = await db.collection('trades').doc(tradeId).get();
-        if (!doc.exists) return res.send("Trade not found in database.");
+        <script>
+            // Check for refresh flag in URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const forceRefresh = urlParams.get('refresh') === 'true';
+
+            // Call the API
+            fetch('/api/generate-analysis', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tradeId: '${tradeId}', force: forceRefresh })
+            })
+            .then(res => res.text())
+            .then(html => {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('content').style.display = 'block';
+                document.getElementById('content').innerHTML = html;
+            })
+            .catch(err => {
+                document.getElementById('loading').innerHTML = '<h3 style="color:#f87171">❌ Error loading analysis</h3><p>'+err+'</p>';
+            });
+        </script>
+    </body>
+    </html>
+    `);
+});
+
+
+// 2️⃣ THE HEAVY API (Handles Cache, Calculations & Gemini)
+app.post('/api/generate-analysis', async (req, res) => {
+    try {
+        const { tradeId, force } = req.body;
+        const docRef = db.collection('trades').doc(tradeId);
+        const doc = await docRef.get();
+        if (!doc.exists) return res.send("Trade not found.");
+        
         const t = doc.data();
 
-        // --- 1. DATA RECONSTRUCTION ---
+        // --- CHECK CACHE (If analysis exists and we are NOT forcing refresh) ---
+        if (t.aiAnalysis && !force) {
+            console.log(`⚡ Serving Cached Analysis for ${tradeId}`);
+            return res.send(renderAnalysisHTML(t, t.aiAnalysis, tradeId));
+        }
+
+        // --- PREPARE DATA FOR GEMINI (Your Custom Logic) ---
         const exitPrice = t.executedPrice || t.orderedPrice || 0;
         const totalPnL = t.pnl || 0;
         const qty = t.qty || 1;
-        const pnlPerLot = (totalPnL / qty).toFixed(2);
         
-        // ✅ FIX 1: Retrieve MAE (Drawdown) and MFE (RunUp) correctly
+        // ✅ Retrieve MAE/MFE Correctly
         const maxRunUp = t.metrics?.mfe || t.analysisData?.maxRunUp || t.maxRunUp || 0;
         const maxDrawdown = t.metrics?.mae || t.analysisData?.maxDrawdown || t.maxDrawdown || 0;
 
-        // Determine Position
         let positionType = "UNKNOWN";
         let entryPrice = 0;
         if (t.type === 'BUY') { 
@@ -1796,64 +1881,54 @@ app.get('/analyze-sl/:id', async (req, res) => {
             entryPrice = exitPrice - (totalPnL / qty);
         }
 
-        const tradeDate = (t.date && t.time) ? `${t.date} ${t.time}` : new Date().toLocaleString();
-
-        // --- 2. PREPARE DATA FOR AI ---
-        // A) Post-Exit Data (What happened AFTER)
-        const postExitData = t.analysisData ? t.analysisData.data : [];
-        const startTime = t.analysisData ? t.analysisData.startTime : Date.now();
-        
-        // B) In-Trade Data (What happened DURING - ✅ NEW)
-        // We sample it (take every 5th tick) to keep the prompt size manageable for AI
+        // ✅ In-Trade Tick Sampling (For Volatility Context)
         const inTradeRaw = t.tickData || [];
         const inTradeSample = inTradeRaw.filter((_, i) => i % 5 === 0);
 
-        // Helper for Snapshots
+        // ✅ Post-Exit Snapshots Logic
+        const postExitData = t.analysisData ? t.analysisData.data : [];
+        const startTime = t.analysisData ? t.analysisData.startTime : Date.now();
         function getPriceAt(min) {
             if (!postExitData.length) return null;
             const target = startTime + (min * 60 * 1000);
             return postExitData.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev);
         }
-
         const snap1 = getPriceAt(1);
-        const snap3 = getPriceAt(3);
         const snap5 = getPriceAt(5);
         const snap10 = getPriceAt(10);
-        
-        // --- 3. THE "OPTIMIZER" PROMPT ---
+
         const prompt = `
             Act as a Quantitative Strategy Consultant. 
-            Goal: Tell me the BEST POSSIBLE parameters I *should* have used for this specific trade.
+            Goal: Optimize my strategy based on this specific trade.
 
             **1. TRADE REALITY:**
             * Position: ${positionType} (${qty} Lots)
             * Entry: ${entryPrice.toFixed(2)} | Exit: ${exitPrice}
-            * **Actual Result:** ₹${pnlPerLot}/lot (Total: ₹${totalPnL})
+            * **Result:** ₹${totalPnL} (Per Lot: ₹${(totalPnL/qty).toFixed(0)})
             
-            **2. PERFORMANCE METRICS:**
-            * **Max Profit (MFE):** ₹${maxRunUp} (Did I leave money on the table?)
-            * **Max Loss (MAE):** ₹${maxDrawdown} (How much heat did I take?)
+            **2. RISK METRICS:**
+            * **Max Profit (MFE):** ₹${maxRunUp}
+            * **Max Loss (MAE):** ₹${maxDrawdown}
 
-            **3. IN-TRADE PRICE ACTION (During the trade):**
-            * The price path I survived: ${JSON.stringify(inTradeSample.map(d=>d.p))}
+            **3. IN-TRADE PATH:**
+            * Price Path: ${JSON.stringify(inTradeSample.map(d=>d.p))}
             
-            **4. POST-EXIT PRICE DATA (After I got out):**
+            **4. POST-EXIT PATH:**
             * 1 Min Later: ${snap1?.p || 'N/A'}
             * 5 Mins Later: ${snap5?.p || 'N/A'}
             * 10 Mins Later: ${snap10?.p || 'N/A'}
-            * Trend continued or reversed?
 
-            **YOUR TASK (Optimize My Strategy):**
-            1. **Best Initial SL:** Look at the MAE (${maxDrawdown}). Was my SL safe or lucky?
-            2. **Best Trailing Logic:** Look at the In-Trade path. Did a small pullback scare me out early?
-            3. **Best 'Move-to-Cost':** Profit peaked at ${maxRunUp}. Should I have locked it earlier?
+            **YOUR TASK:**
+            1. **Best Initial SL:** Look at the MAE (${maxDrawdown}). Was my SL too tight or too loose?
+            2. **Best Trailing Logic:** Did I get shaken out by noise?
+            3. **Profit Taking:** I reached +₹${maxRunUp}. Should I have locked it?
             
             **OUTPUT FORMAT (Strict HTML):**
             <h3>🚀 Optimal Strategy Parameters</h3>
             <ul>
-                <li><b>Best Initial SL:</b> [Value] (Reason based on MAE)</li>
-                <li><b>Best Trailing Gap:</b> [Value] (Reason based on volatility)</li>
-                <li><b>Best Target/Lock:</b> [Value] (Reason based on MFE)</li>
+                <li><b>Best Initial SL:</b> [Value] (Reason)</li>
+                <li><b>Best Trailing Gap:</b> [Value] (Reason)</li>
+                <li><b>Best Target/Lock:</b> [Value] (Reason)</li>
             </ul>
             <h3>💰 Simulation</h3>
             <p>Potential Outcome: <b>₹[Amount]</b> (vs Actual ₹${totalPnL})</p>
@@ -1861,143 +1936,122 @@ app.get('/analyze-sl/:id', async (req, res) => {
             [Brief comment on price action]
         `;
 
+        // --- CALL GEMINI ---
         const result = await client.models.generateContent({
             model: "gemini-3-flash-preview",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             config: { thinkingConfig: { thinkingLevel: "high" } }
         });
+        
+        const aiText = result.text ? result.text.replace(/\n/g, '<br>') : "AI Unavailable";
 
-        const analysisText = result.text ? result.text.replace(/\n/g, '<br>') : "AI Analysis Unavailable.";
+        // --- SAVE TO CACHE ---
+        await docRef.set({ aiAnalysis: aiText }, { merge: true });
 
-        // --- 4. RENDER HTML ---
-        res.send(`
-            <body style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:30px;">
-                <div style="max-width:900px; margin:auto;">
-                    
-                    <div style="background:#1e293b; border-radius:15px; padding:20px; border:1px solid #334155; margin-bottom:25px; box-shadow:0 10px 30px rgba(0,0,0,0.3);">
-                        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #475569; padding-bottom:15px; margin-bottom:15px;">
-                            <div>
-                                <h2 style="margin:0; color:#38bdf8;">🚀 Strategy Optimizer</h2>
-                                <div style="color:#94a3b8; font-size:13px;">${tradeDate}</div>
-                            </div>
-                            <div style="text-align:right;">
-                                <div style="font-size:12px; color:#cbd5e1;">ACTUAL TOTAL PnL</div>
-                                <div style="font-size:24px; font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}">
-                                    ${totalPnL>=0?'+':''}₹${totalPnL}
-                                </div>
-                            </div>
-                        </div>
+        // --- RETURN RENDERED HTML ---
+        res.send(renderAnalysisHTML(t, aiText, tradeId));
 
-                        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:15px; text-align:center; margin-bottom:10px;">
-                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
-                                <div style="font-size:10px; color:#94a3b8;">POSITION</div>
-                                <div style="font-weight:bold; color:#fbbf24; font-size:14px;">${positionType} (${qty} Lots)</div>
-                            </div>
-                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
-                                <div style="font-size:10px; color:#94a3b8;">ENTRY PRICE</div>
-                                <div style="font-weight:bold; font-size:14px;">${entryPrice.toFixed(0)}</div>
-                            </div>
-                            <div style="background:#0f172a; padding:10px; border-radius:10px;">
-                                <div style="font-size:10px; color:#94a3b8;">EXIT PRICE</div>
-                                <div style="font-weight:bold; font-size:14px;">${exitPrice}</div>
-                            </div>
-                        </div>
-
-                        <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:15px; text-align:center;">
-                            <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
-                                <div style="font-size:10px; color:#94a3b8;">MAX RUN-UP (MFE)</div>
-                                <div style="font-weight:bold; color:#4ade80; font-size:14px;">+₹${maxRunUp}</div>
-                            </div>
-                            <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
-                                <div style="font-size:10px; color:#94a3b8;">MAX DRAWDOWN (MAE)</div>
-                                <div style="font-weight:bold; color:#f87171; font-size:14px;">-₹${maxDrawdown}</div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div style="background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5; margin-bottom:25px; line-height:1.7; color:#e2e8f0;">
-                        ${analysisText}
-                    </div>
-
-                    <div style="background:#1e293b; padding:20px; border-radius:15px; border:1px solid #334155; margin-bottom:25px;">
-                        <h3 style="margin-top:0; color:#cbd5e1; font-size:16px; border-bottom:1px solid #475569; padding-bottom:10px;">⏱️ Post-Exit Price Snapshots</h3>
-                        
-                        ${postExitData.length > 0 ? `
-                        <table style="width:100%; border-collapse:collapse; color:#cbd5e1; font-size:14px;">
-                            <tr style="text-align:left; color:#94a3b8;">
-                                <th style="padding:10px;">Time Offset</th>
-                                <th>Price</th>
-                                <th>Diff from Exit</th>
-                            </tr>
-                            <tr style="border-bottom:1px solid #334155;">
-                                <td style="padding:10px;">+1 Min</td>
-                                <td>${snap1?.p || '-'}</td>
-                                <td style="color:${snap1 && ((positionType=='LONG' && snap1.p > exitPrice) || (positionType=='SHORT' && snap1.p < exitPrice)) ? '#4ade80' : '#f87171'}">
-                                    ${snap1 ? (snap1.p - exitPrice).toFixed(0) : '-'}
-                                </td>
-                            </tr>
-                            <tr style="border-bottom:1px solid #334155;">
-                                <td style="padding:10px;">+3 Mins</td>
-                                <td>${snap3?.p || '-'}</td>
-                                <td>${snap3 ? (snap3.p - exitPrice).toFixed(0) : '-'}</td>
-                            </tr>
-                            <tr style="border-bottom:1px solid #334155;">
-                                <td style="padding:10px;">+5 Mins</td>
-                                <td>${snap5?.p || '-'}</td>
-                                <td>${snap5 ? (snap5.p - exitPrice).toFixed(0) : '-'}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding:10px;">+10 Mins</td>
-                                <td>${snap10?.p || '-'}</td>
-                                <td>${snap10 ? (snap10.p - exitPrice).toFixed(0) : '-'}</td>
-                            </tr>
-                        </table>
-                        ` : `
-                        <div style="text-align:center; padding:20px; color:#facc15;">
-                            ⚠️ <b>No Post-Exit Data Yet.</b><br>
-                            <span style="font-size:12px; color:#94a3b8;">Recorder runs for 10 mins after exit. If you just exited, refresh in a few minutes.</span>
-                        </div>
-                        `}
-                    </div>
-
-                    <div style="background:#0f172a; padding:20px; border-radius:15px; border:1px solid #334155;">
-                        <h3 style="color:#94a3b8; margin-top:0;">💬 Ask the Quant Coach</h3>
-                        <div id="chatHistory" style="margin-bottom:15px; max-height:200px; overflow-y:auto;"></div>
-                        <div style="display:flex; gap:10px;">
-                            <input type="text" id="q" placeholder="Ex: Show calculation for Best Trailing Gap" 
-                                   style="flex:1; padding:15px; background:#334155; border:none; color:white; border-radius:8px;">
-                            <button onclick="ask()" style="padding:15px 25px; background:#6366f1; border:none; color:white; border-radius:8px; cursor:pointer; font-weight:bold;">ASK</button>
-                        </div>
-                    </div>
-
-                </div>
-
-                <script>
-                    async function ask() {
-                        const q = document.getElementById('q').value;
-                        const h = document.getElementById('chatHistory');
-                        h.innerHTML += '<div style="text-align:right; margin:10px 0;">'+
-                                       '<span style="background:#6366f1; color:white; padding:8px 12px; border-radius:12px 12px 0 12px;">'+q+'</span></div>';
-                        
-                        const res = await fetch('/ask-trade-question', {
-                            method:'POST', headers:{'Content-Type':'application/json'},
-                            body: JSON.stringify({ tradeId: "${tradeId}", question: q })
-                        });
-                        const data = await res.json();
-                        h.innerHTML += '<div style="text-align:left; margin:10px 0;">'+
-                                       '<span style="background:#334155; color:#e2e8f0; padding:10px; border-radius:12px 12px 12px 0; border:1px solid #475569;">🤖 '+data.answer+'</span></div>';
-                        document.getElementById('q').value = "";
-                    }
-                </script>
-            </body>
-        `);
-
-    } catch (e) { 
+    } catch (e) {
         console.error(e);
-        res.send("Error: " + e.message); 
+        res.send("Server Error: " + e.message);
     }
 });
 
+// 3️⃣ HELPER FUNCTION TO GENERATE HTML
+function renderAnalysisHTML(t, analysisText, tradeId) {
+    const totalPnL = t.pnl || 0;
+    const exitPrice = t.executedPrice || t.orderedPrice || 0;
+    const qty = t.qty || 1;
+    // Retrieve MAE/MFE for display
+    const maxRunUp = t.metrics?.mfe || t.analysisData?.maxRunUp || t.maxRunUp || 0;
+    const maxDrawdown = t.metrics?.mae || t.analysisData?.maxDrawdown || t.maxDrawdown || 0;
+    
+    // Position Calc
+    let positionType = "UNKNOWN";
+    let entryPrice = 0;
+    if (t.type === 'BUY') { 
+        positionType = "SHORT"; entryPrice = exitPrice + (totalPnL / qty); 
+    } else if (t.type === 'SELL') { 
+        positionType = "LONG"; entryPrice = exitPrice - (totalPnL / qty);
+    }
+
+    // Post-Exit Logic for Table
+    const postExitData = t.analysisData ? t.analysisData.data : [];
+    const startTime = t.analysisData ? t.analysisData.startTime : Date.now();
+    function getPriceAt(min) {
+        if (!postExitData.length) return null;
+        const target = startTime + (min * 60 * 1000);
+        return postExitData.reduce((prev, curr) => Math.abs(curr.t - target) < Math.abs(prev.t - target) ? curr : prev);
+    }
+    const snap1 = getPriceAt(1);
+    const snap3 = getPriceAt(3);
+    const snap5 = getPriceAt(5);
+    const snap10 = getPriceAt(10);
+
+    return `
+    <div style="background:#0f172a; color:white; font-family:'Segoe UI', sans-serif; padding:30px; min-height:100vh;">
+        <div style="max-width:900px; margin:auto;">
+            
+            <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
+                <h2 style="margin:0; color:#38bdf8;">🚀 Analysis Result</h2>
+                <a href="/analyze-sl/${tradeId}?refresh=true" style="background:#f59e0b; padding:8px 15px; border-radius:5px; text-decoration:none; color:#0f172a; font-weight:bold; font-size:12px;">
+                    🔄 Refresh AI
+                </a>
+            </div>
+
+            <div style="background:#1e293b; padding:20px; border-radius:10px; margin-bottom:20px; display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; text-align:center;">
+                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                    <small style="color:#94a3b8">PnL</small><br>
+                    <b style="color:${totalPnL>=0?'#4ade80':'#f87171'}">₹${totalPnL}</b>
+                 </div>
+                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                    <small style="color:#94a3b8">Drawdown (MAE)</small><br>
+                    <b style="color:#f87171">₹${maxDrawdown}</b>
+                 </div>
+                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                    <small style="color:#94a3b8">RunUp (MFE)</small><br>
+                    <b style="color:#4ade80">₹${maxRunUp}</b>
+                 </div>
+                 <div style="background:#0f172a; padding:10px; border-radius:8px;">
+                    <small style="color:#94a3b8">Exit Price</small><br>
+                    <b>${exitPrice}</b>
+                 </div>
+            </div>
+
+            <div style="background:#1e293b; padding:30px; border-radius:15px; border:1px solid #4f46e5; line-height:1.7; color:#e2e8f0;">
+                ${analysisText}
+            </div>
+            
+            <div style="background:#1e293b; padding:20px; border-radius:15px; border:1px solid #334155; margin-top:20px;">
+                <h3 style="margin-top:0; color:#cbd5e1; font-size:16px; border-bottom:1px solid #475569; padding-bottom:10px;">⏱️ Post-Exit Price Snapshots</h3>
+                ${postExitData.length > 0 ? `
+                <table style="width:100%; border-collapse:collapse; color:#cbd5e1; font-size:14px;">
+                    <tr style="text-align:left; color:#94a3b8;">
+                        <th style="padding:10px;">Offset</th><th>Price</th><th>Diff</th>
+                    </tr>
+                    <tr style="border-bottom:1px solid #334155;">
+                        <td style="padding:10px;">+1 Min</td><td>${snap1?.p || '-'}</td>
+                        <td style="color:${snap1 && ((positionType=='LONG' && snap1.p > exitPrice) || (positionType=='SHORT' && snap1.p < exitPrice)) ? '#4ade80' : '#f87171'}">${snap1 ? (snap1.p - exitPrice).toFixed(0) : '-'}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #334155;">
+                        <td style="padding:10px;">+3 Mins</td><td>${snap3?.p || '-'}</td>
+                        <td>${snap3 ? (snap3.p - exitPrice).toFixed(0) : '-'}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;">+5 Mins</td><td>${snap5?.p || '-'}</td>
+                        <td>${snap5 ? (snap5.p - exitPrice).toFixed(0) : '-'}</td>
+                    </tr>
+                </table>
+                ` : `<div style="text-align:center; color:#facc15;">⚠️ No Post-Exit Data Yet.</div>`}
+            </div>
+
+            <div style="margin-top:20px; text-align:center;">
+                <a href="/reports" style="color:#64748b; text-decoration:none;">&larr; Back to Reports</a>
+            </div>
+        </div>
+    </div>
+    `;
+}
 
 // ✅ EXCEL DOWNLOADER (FIXED: Strict Pairing + Chronological Order)
 app.get('/download-day-excel', (req, res) => {
