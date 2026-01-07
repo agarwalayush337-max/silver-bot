@@ -714,13 +714,24 @@ async function initWebSocket() {
                                         }
                                     }
 
-                                    // Apply Calculated Gap
-                                    if (botState.positionType === 'LONG') {
-                                        const trailingLevel = newPrice - trailingGap; // ✅ trailingGap is now safe to use
-                                        if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { newStop = trailingLevel; didChange = true; }
-                                    } else {
-                                        const trailingLevel = newPrice + trailingGap; // ✅ trailingGap is now safe to use
-                                        if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { newStop = trailingLevel; didChange = true; }
+                                    // 🔴 CRITICAL FIX: Only apply logic if a valid gap exists (trailing triggered)
+                                    if (trailingGap > 0) {
+                                        // Apply Calculated Gap
+                                        if (botState.positionType === 'LONG') {
+                                            const trailingLevel = newPrice - trailingGap; 
+                                            // Check if this level is higher than current stop (+buffer)
+                                            if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { 
+                                                newStop = trailingLevel; 
+                                                didChange = true; 
+                                            }
+                                        } else {
+                                            const trailingLevel = newPrice + trailingGap; 
+                                            // Check if this level is lower than current stop (-buffer)
+                                            if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { 
+                                                newStop = trailingLevel; 
+                                                didChange = true; 
+                                            }
+                                        }
                                     }
 
                                     if (didChange) {
