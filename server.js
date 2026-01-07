@@ -680,7 +680,7 @@ async function initWebSocket() {
                                     let didChange = false;
 
                                     // ✅ FIX 1: Define Default Trailing Gap (1.5x ATR)
-                                    let trailingGap = liveATR * 1.5; 
+                                    let trailingGap = 0 
 
                                     // STAGE A: Move to Cost if Profit > 1 ATR (Per Lot)
                                     // Logic: If Total Profit > (ATR * Qty)
@@ -699,7 +699,7 @@ async function initWebSocket() {
                                             newStop = costSL;
                                             didChange = true;
                                             // ✅ LOG: Shows Profit vs Target
-                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 1 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost + 50`);
+                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 0.8 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost + 50`);
                                         }
                                     }
 
