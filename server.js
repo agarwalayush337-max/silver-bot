@@ -674,7 +674,7 @@ async function initWebSocket() {
                                 
                                     // ✅ RULE 1: DYNAMIC TRAILING
                                     // Use Live ATR (limit min to 500)
-                                    const liveATR = Math.max(globalATR, 500) || 1000;
+                                    const liveATR = Math.max(globalATR, 1000) || 1000;
                                     
                                     let newStop = botState.currentStop;
                                     let didChange = false;
@@ -684,7 +684,7 @@ async function initWebSocket() {
 
                                     // STAGE A: Move to Cost if Profit > 1 ATR (Per Lot)
                                     // Logic: If Total Profit > (ATR * Qty)
-                                    if (currentProfit >= (liveATR * tradeQty)) {
+                                    if (currentProfit >= (0.8 * liveATR * tradeQty)) {
                                         
                                         // ✅ FIX: Calculate Cost + 50 (Brokerage Buffer)
                                         let costSL = botState.entryPrice;
@@ -704,12 +704,12 @@ async function initWebSocket() {
                                     }
 
                                     // STAGE B: Tighten Gap if Profit > 1.5 ATR (Per Lot)
-                                    if (currentProfit >= (1.5 * liveATR * tradeQty)) {
+                                    if (currentProfit >= (0.75 * liveATR * tradeQty)) {
                                         // Normal Trail Gap = 1 ATR
                                         trailingGap = liveATR; 
                                         
                                         // Super Trend: Tighten if Profit > 4 ATR (Per Lot)
-                                        if (currentProfit >= (4 * liveATR * tradeQty)) {
+                                        if (currentProfit >= (2 * liveATR * tradeQty)) {
                                             trailingGap = liveATR * 0.5;
                                         }
                                     }
@@ -1160,8 +1160,8 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
                 botState.currentTradeTicks = []; // Start Fresh Recording
 
                 // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
-                const liveATR = Math.max(globalATR, 500) || 1000;
-                const slPoints = Math.round(liveATR * 1.5);
+                const liveATR = Math.max(globalATR, 1000) || 1000;
+                const slPoints = Math.round(liveATR * 1.2);
                 const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
                 
                 botState.currentStop = slPrice;
@@ -1331,8 +1331,8 @@ setInterval(async () => {
             // 1. CALCULATE INDICATORS
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
-            const vAvg = SMA.calculate({period: 20, values: v});
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 14});
+            const vAvg = SMA.calculate({period: 10, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 15});
             const rsiArray = RSI.calculate({period: 14, values: cl}); // 🆕 RSI
 
             const curE50 = e50[e50.length-1];
@@ -1348,7 +1348,7 @@ setInterval(async () => {
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
 
             // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
-            globalATR = rawATR ? Math.max(rawATR, 500) : 1000; 
+            globalATR = rawATR ? Math.max(rawATR, 1000) : 1000; 
 
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
@@ -1362,7 +1362,7 @@ setInterval(async () => {
             if (isMarketOpen() && !botState.positionType) {
                 
                 // ✅ RULE: Volume Guardrails (1.4x to 3.5x)
-                const isVolValid = (volMult > 1.4 && volMult <= 3.5); 
+                const isVolValid = (volMult > 1.4 && volMult <= 3.2); 
 
                 const isBuySignal = (
                     cl[cl.length-2] > e50[e50.length-2] && 
