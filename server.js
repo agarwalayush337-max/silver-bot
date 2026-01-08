@@ -578,9 +578,6 @@ async function modifyExchangeSL(oldStop, newTrigger) {
         console.log(`❌ SL Modify Failed: ${errMsg}`);
     }
 }
-// --- GLOBAL VOL METRICS ---
-let lastVTT = 0;
-let realTimeVolume30s = 0; // Accumulates volume for the 30s cycle
 
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
