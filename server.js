@@ -1175,7 +1175,7 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
 
                 // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
                 const liveATR = Math.max(globalATR, 800) || 800;
-                const slPoints = Math.round(liveATR * 2,2);
+                const slPoints = Math.round(liveATR * 2.2);
                 const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
                 
                 botState.currentStop = slPrice;
@@ -1375,7 +1375,7 @@ async function runTradingLogic() {
             if (volumeHistory.length < 10) {
                 console.log(`⏳ Warming up Volume Data: ${volumeHistory.length}/10 chunks collected...`);
             }
-            const curRSI = rsiArray[rsiArray.length - 1]; 
+            const curRSI = rsiArray[rsiArray.length - 2]; 
             
            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
             const rawATR = atr[atr.length-2];
