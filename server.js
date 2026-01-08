@@ -280,6 +280,9 @@ let currentWs = null;
 let globalATR = 800; 
 // ✅ NEW: For Rate Limiting (Throttle)
 let lastSlUpdateTime = 0; 
+let lastVTT = 0;
+let realTimeVolume30s = 0; 
+let volumeHistory = [];
 
 
 
@@ -1351,8 +1354,29 @@ setInterval(async () => {
 
             const curE50 = e50[e50.length-1];
             const curE200 = e200[e200.length-1];
-            const curV = v[v.length-1];
             const curAvgV = vAvg[vAvg.length-1];
+
+            // --- 🚀 NEW ROLLING VOLUME ENGINE ---
+            // 1. Push current 30s volume to history
+            volumeHistory.push(realTimeVolume30s);
+            
+            // 2. Keep only the last 10 chunks (10 * 30s = 5 Minutes)
+            if (volumeHistory.length > 10) {
+                volumeHistory.shift(); // Remove the oldest chunk
+            }
+            
+            // 3. Reset the live counter for the next cycle
+            realTimeVolume30s = 0;
+            
+            // 4. SUM UP the history to get "Actual 5-Min Volume"
+            const curV = volumeHistory.reduce((a, b) => a + b, 0);
+            
+            // ⚠️ WARM-UP CHECK: 
+            // If we just started, we don't have 5 mins of data yet.
+            // We force curV to 0 so we don't take bad trades during warm-up.
+            if (volumeHistory.length < 10) {
+                console.log(`⏳ Warming up Volume Data: ${volumeHistory.length}/10 chunks collected...`);
+            }
             const curRSI = rsiArray[rsiArray.length - 1]; 
             
            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
