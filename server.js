@@ -575,11 +575,14 @@ async function modifyExchangeSL(oldStop, newTrigger) {
         console.log(`❌ SL Modify Failed: ${errMsg}`);
     }
 }
-// --- 🔌 WEBSOCKET (High-Precision Recorder) ---
+// --- GLOBAL VOL METRICS ---
+let lastVTT = 0;
+let realTimeVolume30s = 0; // Accumulates volume for the 30s cycle
+
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
-        console.log("🔌 Initializing WS (V3 Binary Mode)...");
+        console.log("🔌 Initializing WS (FULL MODE for Volume)...");
         const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", { headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' } });
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(response.data.data.authorizedRedirectUri, { followRedirects: true });
@@ -590,10 +593,12 @@ async function initWebSocket() {
             const binaryMsg = Buffer.from(JSON.stringify({ 
                 guid: "bot-" + Date.now(), 
                 method: "sub", 
-                data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
+                // ✅ MODE CHANGED TO "full" TO GET VOLUME (VTT)
+                data: { mode: "full", instrumentKeys: [botState.activeContract] } 
             }));
             currentWs.send(binaryMsg);
         };
+
         currentWs.onmessage = async (msg) => {
             try {
                 if (!FeedResponse) return;
@@ -604,17 +609,36 @@ async function initWebSocket() {
                 if (object.feeds) {
                     for (const key in object.feeds) {
                         const feed = object.feeds[key];
+                        
+                        // 1. GET PRICE
                         let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
+                        // 2. GET VOLUME (VTT - Volume Traded Today)
+                        // It is located inside the "Full Feed" object
+                        let currentVTT = parseInt(feed.fullFeed?.marketFF?.vtt || feed.fullFeed?.indexFF?.vtt || 0);
+
                         if (newPrice > 0) {
-                            const activeToken = botState.activeContract.split('|')[1]; 
-                            
+                            // ✅ Check if this update belongs to our active contract
+                            const activeToken = botState.activeContract.split('|')[1];
                             if (key.includes(activeToken) || Object.keys(object.feeds).length === 1) {
+                                
                                 lastKnownLtp = newPrice;
 
-                                // --- INSIDE currentWs.onmessage (After getting newPrice) ---
-                    
-                                // 0️⃣ TICK RECORDER (For AI Analysis)
+                                // 📊 VOLUME CALCULATION ENGINE
+                                if (currentVTT > 0) {
+                                    if (lastVTT === 0) {
+                                        // First tick after connect: Just store baseline
+                                        lastVTT = currentVTT;
+                                    } else {
+                                        const delta = currentVTT - lastVTT;
+                                        if (delta > 0) {
+                                            realTimeVolume30s += delta; // Add to our "Cup"
+                                            lastVTT = currentVTT;       // Update baseline
+                                        }
+                                    }
+                                }
+
+                                // --- 0️⃣ TICK RECORDER (For AI Analysis) ---
                                 const tickTime = getIST(); 
                                 const tickLog = { t: tickTime.toLocaleTimeString(), p: newPrice }; 
                                 
@@ -630,21 +654,19 @@ async function initWebSocket() {
                                         // Find the completed trade in history
                                         const pastTrade = botState.history.find(t => t.id === botState.postExitWatch.id);
                                         if (pastTrade) {
-                                            // Initialize array if missing
                                             if (!pastTrade.tickData) pastTrade.tickData = [];
-                                            // Add tick
                                             pastTrade.tickData.push(tickLog);
                                             
-                                            // OPTIONAL: Save every 1 min to prevent data loss if crash (modulo check)
+                                            // OPTIONAL: Save every 1 min to prevent data loss
                                             if (pastTrade.tickData.length % 12 === 0) saveTrade(pastTrade);
                                         }
                                     } else {
-                                        // ✅ FIX 2: TIME EXPIRED - SAVE DATA PERMANENTLY
+                                        // ✅ TIME EXPIRED - SAVE DATA PERMANENTLY
                                         console.log(`⏹️ Post-Trade Recording Finished for ${botState.postExitWatch.id}`);
                                         
                                         const finishedTrade = botState.history.find(t => t.id === botState.postExitWatch.id);
                                         if (finishedTrade) {
-                                            await saveTrade(finishedTrade); // <--- CRITICAL FIX: Actually saves to Firestore
+                                            await saveTrade(finishedTrade);
                                             console.log("💾 Post-Trade Data Saved to DB.");
                                         }
                                         
@@ -652,9 +674,8 @@ async function initWebSocket() {
                                         saveSettings(); 
                                     }
                                 }
-                                                    
-                
-                                // 1️⃣ LIVE TRADE TRACKING
+
+                                // --- 1️⃣ LIVE TRADE TRACKING ---
                                 if (botState.positionType) {
                                     const tradeQty = botState.quantity || 1;
                                     let currentProfit = 0;
@@ -666,67 +687,54 @@ async function initWebSocket() {
                                     // Track Max Run Up (MFE)
                                     if (currentProfit > botState.maxRunUp) botState.maxRunUp = currentProfit;
                                 
-                                    // ✅ FIX 1: TRACK MAX DRAWDOWN (MAE)
-                                    // Initialize if undefined
+                                    // Track Max Drawdown (MAE)
                                     if (botState.maxDrawdown === undefined) botState.maxDrawdown = 0;
-                                    // Capture lowest PnL (e.g., -500 is "less than" 0)
                                     if (currentProfit < botState.maxDrawdown) botState.maxDrawdown = currentProfit;
                                 
-                                    // ✅ RULE 1: DYNAMIC TRAILING
-                                    // Use Live ATR (limit min to 500)
+                                    // ✅ DYNAMIC TRAILING LOGIC
+                                    // Use Live ATR (limit min to 1000)
                                     const liveATR = Math.max(globalATR, 1000) || 1000;
                                     
                                     let newStop = botState.currentStop;
                                     let didChange = false;
+                                    let trailingGap = 0;
 
-                                    // ✅ FIX 1: Define Default Trailing Gap (1.5x ATR)
-                                    let trailingGap = 0 
-
-                                    // STAGE A: Move to Cost if Profit > 1 ATR (Per Lot)
-                                    // Logic: If Total Profit > (ATR * Qty)
+                                    // STAGE A: Move to Cost if Profit > 0.8 ATR
                                     if (currentProfit >= (0.8 * liveATR * tradeQty)) {
-                                        
-                                        // ✅ FIX: Calculate Cost + 50 (Brokerage Buffer)
                                         let costSL = botState.entryPrice;
                                         if (botState.positionType === 'LONG') costSL = botState.entryPrice + 50;
                                         if (botState.positionType === 'SHORT') costSL = botState.entryPrice - 50;
 
-                                        // Check if this new "Cost + 50" level is better than the current Stop
-                                        // For LONG, Better = Higher | For SHORT, Better = Lower
+                                        // Check if this new "Cost + 50" level is better
                                         const isBetter = botState.positionType === 'LONG' ? (costSL > botState.currentStop) : (costSL < botState.currentStop);
                                         
                                         if (isBetter) {
                                             newStop = costSL;
                                             didChange = true;
-                                            // ✅ LOG: Shows Profit vs Target
-                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 0.8 ATR (₹${(liveATR * tradeQty).toFixed(0)}) | Moving SL to Cost + 50`);
+                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 0.8 ATR | Moving SL to Cost + 50`);
                                         }
                                     }
 
-                                    // STAGE B: Tighten Gap if Profit > 1.5 ATR (Per Lot)
+                                    // STAGE B: Tighten Gap if Profit > 0.75 ATR
                                     if (currentProfit >= (0.75 * liveATR * tradeQty)) {
-                                        // Normal Trail Gap = 1 ATR
-                                        trailingGap = liveATR; 
+                                        trailingGap = liveATR; // Normal Gap
                                         
-                                        // Super Trend: Tighten if Profit > 4 ATR (Per Lot)
+                                        // Super Trend: Tighten if Profit > 2 ATR
                                         if (currentProfit >= (2 * liveATR * tradeQty)) {
                                             trailingGap = liveATR * 0.5;
                                         }
                                     }
 
-                                    // 🔴 CRITICAL FIX: Only apply logic if a valid gap exists (trailing triggered)
+                                    // Apply Trailing Gap if Triggered
                                     if (trailingGap > 0) {
-                                        // Apply Calculated Gap
                                         if (botState.positionType === 'LONG') {
                                             const trailingLevel = newPrice - trailingGap; 
-                                            // Check if this level is higher than current stop (+buffer)
                                             if (trailingLevel > newStop && trailingLevel > botState.currentStop + 50) { 
                                                 newStop = trailingLevel; 
                                                 didChange = true; 
                                             }
                                         } else {
                                             const trailingLevel = newPrice + trailingGap; 
-                                            // Check if this level is lower than current stop (-buffer)
                                             if (trailingLevel < newStop && trailingLevel < botState.currentStop - 50) { 
                                                 newStop = trailingLevel; 
                                                 didChange = true; 
@@ -734,6 +742,7 @@ async function initWebSocket() {
                                         }
                                     }
 
+                                    // Update Exchange SL
                                     if (didChange) {
                                         const oldStop = botState.currentStop; 
                                         botState.currentStop = newStop;
@@ -771,7 +780,7 @@ async function initWebSocket() {
                                     }
                                 }
 
-                                // 2️⃣ POST-TRADE MONITORING
+                                // --- 2️⃣ POST-TRADE MONITORING ---
                                 const now = Date.now();
                                 for (const oid in botState.activeMonitors) {
                                     const session = botState.activeMonitors[oid];
@@ -782,10 +791,8 @@ async function initWebSocket() {
 
                                     if (now - session.startTime > 600000) {
                                         console.log(`✅ Finished Analyzing Trade ${oid}. Saving to Firebase.`);
-                                        // ✅ Fix: Search history by looking for the ID in ANY field to be safer
                                         const logIndex = botState.history.findIndex(h => h.id == oid || (h.analysisData && h.analysisData.orderId == oid));
                                         
-                                        // ✅ SAFETY FIX: Only save if log exists and analysis data is valid
                                         if (logIndex !== -1 && session.data && session.data.length > 0) {
                                             botState.history[logIndex].analysisData = {
                                                 maxRunUp: session.maxRunUp,
@@ -795,11 +802,7 @@ async function initWebSocket() {
                                                 lowAfter: session.lowestAfterExit
                                             };
                                             await saveTrade(botState.history[logIndex]);
-                                        } else {
-                                            // Prevents Firestore "Undefined" crash
-                                            console.warn(`⚠️ Skipping Firestore save for ${oid}: Log not found or data empty.`);
                                         }
-                                        
                                         delete botState.activeMonitors[oid]; 
                                     }
                                 }
@@ -812,7 +815,7 @@ async function initWebSocket() {
                 console.error("❌ Decode Logic Error:", e.message); 
             }
         };
-        currentWs.onclose = () => { currentWs = null; };
+        currentWs.onclose = () => { currentWs = null; lastVTT = 0; };
     } catch (e) { 
         currentWs = null; 
     }
