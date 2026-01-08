@@ -700,7 +700,7 @@ async function initWebSocket() {
                                     let trailingGap = 0;
 
                                     // STAGE A: Move to Cost if Profit > 0.8 ATR
-                                    if (currentProfit >= (0.8 * liveATR * tradeQty)) {
+                                    if (currentProfit >= (0.7 * liveATR * tradeQty)) {
                                         let costSL = botState.entryPrice;
                                         if (botState.positionType === 'LONG') costSL = botState.entryPrice + 50;
                                         if (botState.positionType === 'SHORT') costSL = botState.entryPrice - 50;
@@ -716,12 +716,12 @@ async function initWebSocket() {
                                     }
 
                                     // STAGE B: Tighten Gap if Profit > 0.75 ATR
-                                    if (currentProfit >= (0.75 * liveATR * tradeQty)) {
-                                        trailingGap = liveATR; // Normal Gap
+                                    if (currentProfit >= (0.7 * liveATR * tradeQty)) {
+                                        trailingGap = liveATR * 1.4; // Normal Gap
                                         
                                         // Super Trend: Tighten if Profit > 2 ATR
                                         if (currentProfit >= (2 * liveATR * tradeQty)) {
-                                            trailingGap = liveATR * 0.5;
+                                            trailingGap = liveATR * 0.7;
                                         }
                                     }
 
@@ -1174,8 +1174,8 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
                 botState.currentTradeTicks = []; // Start Fresh Recording
 
                 // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
-                const liveATR = Math.max(globalATR, 1000) || 1000;
-                const slPoints = Math.round(liveATR * 1.2);
+                const liveATR = Math.max(globalATR, 800) || 800;
+                const slPoints = Math.round(liveATR * 2,2);
                 const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
                 
                 botState.currentStop = slPrice;
@@ -1346,8 +1346,8 @@ async function runTradingLogic() {
             // 1. CALCULATE INDICATORS
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
-            const vAvg = SMA.calculate({period: 10, values: v});
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 15});
+            const vAvg = SMA.calculate({period: 30, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: 24});
             const rsiArray = RSI.calculate({period: 14, values: cl}); // 🆕 RSI
 
             const curE50 = e50[e50.length-2];
@@ -1384,7 +1384,7 @@ async function runTradingLogic() {
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
 
             // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
-            globalATR = rawATR ? Math.max(rawATR, 1000) : 1000; 
+            globalATR = rawATR ? Math.max(rawATR, 800) : 800; 
 
             const bH = Math.max(...h.slice(-11, -1));
             const bL = Math.min(...l.slice(-11, -1));
@@ -1398,7 +1398,7 @@ async function runTradingLogic() {
             if (isMarketOpen() && !botState.positionType) {
                 
                 // ✅ RULE: Volume Guardrails (1.4x to 3.5x)
-                const isVolValid = (volMult > 1.4 && volMult <= 3.2); 
+                const isVolValid = (volMult > 1.6 && volMult <= 3.3); 
 
                 const isBuySignal = (
                     cl[cl.length-2] > e50[e50.length-2] && 
@@ -1414,7 +1414,7 @@ async function runTradingLogic() {
 
                 // Check Cooling Period
                 const msSinceExit = Date.now() - botState.lastExitTime;
-                const inCoolingPeriod = msSinceExit < 120000;
+                const inCoolingPeriod = msSinceExit < 0;
                 const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
 
                 // --- 4. SIGNAL EXECUTION BLOCK ---
