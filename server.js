@@ -1309,7 +1309,8 @@ setInterval(() => {
 // --- TRADING ENGINE (Watcher & Entry) ---
 // --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
 // --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
-setInterval(async () => {
+// ✅ Name the function so we can call it precisely
+async function runTradingLogic() {
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
   
@@ -1349,9 +1350,9 @@ setInterval(async () => {
             const atr = ATR.calculate({high: h, low: l, close: cl, period: 15});
             const rsiArray = RSI.calculate({period: 14, values: cl}); // 🆕 RSI
 
-            const curE50 = e50[e50.length-1];
-            const curE200 = e200[e200.length-1];
-            const curAvgV = vAvg[vAvg.length-1];
+            const curE50 = e50[e50.length-2];
+            const curE200 = e200[e200.length-2];
+            const curAvgV = vAvg[vAvg.length-2];
 
             // --- 🚀 NEW ROLLING VOLUME ENGINE ---
             // 1. Push current 30s volume to history
@@ -1377,7 +1378,7 @@ setInterval(async () => {
             const curRSI = rsiArray[rsiArray.length - 1]; 
             
            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
-            const rawATR = atr[atr.length-1];
+            const rawATR = atr[atr.length-2];
             
             // 1. Store the REAL ATR for display/logging
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
@@ -1458,8 +1459,27 @@ setInterval(async () => {
     } catch (e) { 
         if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
     }
-}, 30000);
+} // <--- This closes runTradingLogic()
 
+// --- ⏱️ PRECISE CLOCK SYNC ENGINE ---
+function startPreciseLoop() {
+    const now = Date.now();
+    const interval = 30000; 
+    
+    // Calculate exact ms until the next :00 or :30 mark
+    // We add +200ms buffer to ensure Upstox has definitely closed the candle
+    const delay = interval - (now % interval) + 200; 
+
+    console.log(`⏳ Syncing: Waiting ${(delay/1000).toFixed(1)}s to hit xx:xx:00/30...`);
+
+    setTimeout(async () => {
+        await runTradingLogic(); // Run your existing logic
+        startPreciseLoop();      // Restart the smart timer
+    }, delay);
+}
+
+// 🚀 Start the engine
+startPreciseLoop();
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
