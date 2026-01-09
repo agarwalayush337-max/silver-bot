@@ -1492,7 +1492,6 @@ function startPreciseLoop() {
     // We add +200ms buffer to ensure Upstox has definitely closed the candle
     const delay = interval - (now % interval) + 200; 
 
-    console.log(`⏳ Syncing: Waiting ${(delay/1000).toFixed(1)}s to hit xx:xx:00/30...`);
 
     setTimeout(async () => {
         await runTradingLogic(); // Run your existing logic
