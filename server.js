@@ -615,8 +615,30 @@ async function initWebSocket() {
 
                         // 2. GET VOLUME (VTT - Volume Traded Today)
                         // It is located inside the "Full Feed" object
-                        let currentVTT = parseInt(feed.fullFeed?.marketFF?.vtt || feed.fullFeed?.indexFF?.vtt || 0);
+                        // ✅ FIX: Check 'ff' (Raw JSON) AND 'fullFeed' (SDK format)
+                            const rawVTT = feed.ff?.marketFF?.vtt       || 
+                                           feed.ff?.indexFF?.vtt        || 
+                                           feed.fullFeed?.marketFF?.vtt || 
+                                           feed.fullFeed?.indexFF?.vtt  || 0;
 
+                            let currentVTT = parseInt(rawVTT);
+
+                            // 🔍 DEBUG: Print if we actually found volume
+                            // if (currentVTT > 0) console.log(`🔍 VTT Found: ${currentVTT}`);
+
+                            if (currentVTT > 0) {
+                                if (lastVTT === 0) {
+                                    // First tick: Just set baseline
+                                    lastVTT = currentVTT;
+                                } else {
+                                    const delta = currentVTT - lastVTT;
+                                    // Only add positive delta (ignore weird resets)
+                                    if (delta > 0) {
+                                        realTimeVolume30s += delta; 
+                                        lastVTT = currentVTT;
+                                    }
+                                }
+                            }
                         if (newPrice > 0) {
                             // ✅ Check if this update belongs to our active contract
                             const activeToken = botState.activeContract.split('|')[1];
