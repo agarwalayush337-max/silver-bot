@@ -104,6 +104,32 @@ const STRATEGY_RULES = `
     - Price < Breakout Low (bL)
 `;
 
+
+// ... under STRATEGY_RULES ...
+
+const STRATEGY_PARAMS = {
+    // 1. Indicator Settings
+    ATR_PERIOD: 18,              // Changed from 24
+    ATR_FLOOR: 1000,             // Changed from 800
+    VOL_MA_PERIOD: 30,           // Volume Moving Average Period
+    BREAKOUT_PERIOD: 10,         // Donchian Channel / Breakout Lookback
+
+    // 2. Entry Filters
+    VOL_MULT_MIN: 1.5,           // Min Volume vs Avg
+    VOL_MULT_MAX: 3.5,           // Max Volume vs Avg (Climax protection)
+    TRADE_PAUSE_MIN: 3,          // Cooling period in minutes
+
+    // 3. Risk Management (Multipliers of ATR)
+    SL_ATR_MULT: 1.8,            // Initial Stop Loss width
+    
+    // 4. Trailing Stop Logic (Multipliers of ATR)
+    TRAIL_COST_TRIGGER: 1.1,     // Profit needed to move SL to Cost
+    TRAIL_START_TRIGGER: 0.8,    // Profit needed to start Trailing
+    TRAIL_SUPER_TRIGGER: 2.0,    // Profit needed to tighten trailing aggressively
+    TRAIL_GAP_MULT: 0.6          // The distance to keep behind price when trailing
+};
+
+
 // Apply the lock
 app.use(authMiddleware);
 
@@ -715,38 +741,38 @@ async function initWebSocket() {
                                 
                                     // ✅ DYNAMIC TRAILING LOGIC
                                     // Use Live ATR (limit min to 1000)
-                                    const liveATR = Math.max(globalATR, 1000) || 1000;
+                                    const liveATR = Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR) || STRATEGY_PARAMS.ATR_FLOOR;
                                     
                                     let newStop = botState.currentStop;
                                     let didChange = false;
                                     let trailingGap = 0;
 
-                                    // STAGE A: Move to Cost if Profit > 0.8 ATR
-                                    if (currentProfit >= (0.7 * liveATR * tradeQty)) {
+                                    // REPLACE THE ENTIRE "STAGE A" and "STAGE B" BLOCK WITH:
+
+                                    // STAGE A: Move to Cost (Using configured trigger)
+                                    if (currentProfit >= (STRATEGY_PARAMS.TRAIL_COST_TRIGGER * liveATR * tradeQty)) {
                                         let costSL = botState.entryPrice;
                                         if (botState.positionType === 'LONG') costSL = botState.entryPrice + 50;
                                         if (botState.positionType === 'SHORT') costSL = botState.entryPrice - 50;
-
-                                        // Check if this new "Cost + 50" level is better
+                                    
                                         const isBetter = botState.positionType === 'LONG' ? (costSL > botState.currentStop) : (costSL < botState.currentStop);
                                         
                                         if (isBetter) {
                                             newStop = costSL;
                                             didChange = true;
-                                            console.log(`🛡️ Profit ₹${currentProfit.toFixed(0)} > 0.8 ATR | Moving SL to Cost + 50`);
+                                            console.log(`🛡️ Profit > ${STRATEGY_PARAMS.TRAIL_COST_TRIGGER} ATR | Moving SL to Cost + 50`);
                                         }
                                     }
-
-                                    // STAGE B: Tighten Gap if Profit > 0.75 ATR
-                                    if (currentProfit >= (0.7 * liveATR * tradeQty)) {
-                                        trailingGap = liveATR * 1.4; // Normal Gap
+                                    
+                                    // STAGE B: Tighten Gap (Using configured trigger and gap)
+                                    if (currentProfit >= (STRATEGY_PARAMS.TRAIL_START_TRIGGER * liveATR * tradeQty)) {
+                                        trailingGap = liveATR * STRATEGY_PARAMS.TRAIL_GAP_MULT; // Uses 0.6 as requested
                                         
-                                        // Super Trend: Tighten if Profit > 2 ATR
-                                        if (currentProfit >= (2 * liveATR * tradeQty)) {
-                                            trailingGap = liveATR * 0.7;
+                                        // Optional: Super Trend Tightening (If profit is huge, e.g., > 2.0 ATR)
+                                        if (currentProfit >= (STRATEGY_PARAMS.TRAIL_SUPER_TRIGGER * liveATR * tradeQty)) {
+                                            trailingGap = liveATR * (STRATEGY_PARAMS.TRAIL_GAP_MULT * 0.8); // Even tighter
                                         }
                                     }
-
                                     // Apply Trailing Gap if Triggered
                                     if (trailingGap > 0) {
                                         if (botState.positionType === 'LONG') {
@@ -1196,8 +1222,8 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
                 botState.currentTradeTicks = []; // Start Fresh Recording
 
                 // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
-                const liveATR = Math.max(globalATR, 800) || 800;
-                const slPoints = Math.round(liveATR * 2.2);
+                const liveATR = Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR) || STRATEGY_PARAMS.ATR_FLOOR;
+                const slPoints = Math.round(liveATR * STRATEGY_PARAMS.SL_ATR_MULT);
                 const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
                 
                 botState.currentStop = slPrice;
@@ -1368,8 +1394,8 @@ async function runTradingLogic() {
             // 1. CALCULATE INDICATORS
             const e50 = EMA.calculate({period: 50, values: cl});
             const e200 = EMA.calculate({period: 200, values: cl});
-            const vAvg = SMA.calculate({period: 30, values: v});
-            const atr = ATR.calculate({high: h, low: l, close: cl, period: 24});
+            const vAvg = SMA.calculate({period: STRATEGY_PARAMS.VOL_MA_PERIOD, values: v});
+            const atr = ATR.calculate({high: h, low: l, close: cl, period: STRATEGY_PARAMS.ATR_PERIOD});
             const rsiArray = RSI.calculate({period: 14, values: cl}); // 🆕 RSI
 
             const curE50 = e50[e50.length-2];
@@ -1406,10 +1432,10 @@ async function runTradingLogic() {
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
 
             // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
-            globalATR = rawATR ? Math.max(rawATR, 800) : 800; 
-
-            const bH = Math.max(...h.slice(-11, -1));
-            const bL = Math.min(...l.slice(-11, -1));
+            globalATR = rawATR ? Math.max(rawATR, STRATEGY_PARAMS.ATR_FLOOR) : STRATEGY_PARAMS.ATR_FLOOR;
+            
+            const bH = Math.max(...h.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
+            const bL = Math.min(...l.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
             const volMult = curV / curAvgV; 
 
             // 2. DETAILED LOG (Now shows REAL ATR)
@@ -1420,7 +1446,7 @@ async function runTradingLogic() {
             if (isMarketOpen() && !botState.positionType) {
                 
                 // ✅ RULE: Volume Guardrails (1.4x to 3.5x)
-                const isVolValid = (volMult > 1.6 && volMult <= 3.3); 
+                const isVolValid = (volMult > STRATEGY_PARAMS.VOL_MULT_MIN && volMult <= STRATEGY_PARAMS.VOL_MULT_MAX); 
 
                 const isBuySignal = (
                     cl[cl.length-2] > e50[e50.length-2] && 
@@ -1437,8 +1463,8 @@ async function runTradingLogic() {
                 // Check Cooling Period
                 const msSinceExit = Date.now() - botState.lastExitTime;
                 const inCoolingPeriod = msSinceExit < 0;
-                const waitSec = Math.ceil((120000 - msSinceExit) / 1000);
-
+                const waitSec = Math.ceil(((STRATEGY_PARAMS.TRADE_PAUSE_MIN * 60000) - msSinceExit) / 1000);
+                
                 // --- 4. SIGNAL EXECUTION BLOCK ---
                 if (isBuySignal || isSellSignal) {
                     const signalType = isBuySignal ? "BUY" : "SELL";
