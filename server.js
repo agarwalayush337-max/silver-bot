@@ -309,6 +309,7 @@ let lastSlUpdateTime = 0;
 let lastVTT = 0;
 let realTimeVolume30s = 0; 
 let volumeHistory = [];
+let lastVolumeBlockTime = 0; // ⏱️ Tracks when we last saved volume history
 
 
 
@@ -1400,27 +1401,22 @@ async function runTradingLogic() {
             const curE200 = e200[e200.length-2];
             const curAvgV = vAvg[vAvg.length-2];
 
-            // --- 🚀 NEW ROLLING VOLUME ENGINE ---
-            // 1. Push current 30s volume to history
-            volumeHistory.push(realTimeVolume30s);
+            // --- 🚀 SMART VOLUME ENGINE (BURST MODE COMPATIBLE) ---
+            const nowTime = Date.now();
             
-            // 2. Keep only the last 10 chunks (10 * 30s = 5 Minutes)
-            if (volumeHistory.length > 10) {
-                volumeHistory.shift(); // Remove the oldest chunk
+            // A) Only "Commit" volume to history every ~30 seconds
+            if (nowTime - lastVolumeBlockTime >= 30000) {
+                volumeHistory.push(realTimeVolume30s);
+                if (volumeHistory.length > 10) volumeHistory.shift(); 
+                
+                realTimeVolume30s = 0; 
+                lastVolumeBlockTime = nowTime;
             }
             
-            // 3. Reset the live counter for the next cycle
-            realTimeVolume30s = 0;
+            // B) Calculate Total Volume = (Old History) + (Current Live Bucket)
+            // This captures live volume growth during 9:00:05, 9:00:10 etc.
+            let curV = volumeHistory.reduce((a, b) => a + b, 0) + realTimeVolume30s;
             
-            // 4. SUM UP the history to get "Actual 5-Min Volume"
-            const curV = volumeHistory.reduce((a, b) => a + b, 0);
-            
-            // ⚠️ WARM-UP CHECK: 
-            // If we just started, we don't have 5 mins of data yet.
-            // We force curV to 0 so we don't take bad trades during warm-up.
-            if (volumeHistory.length < 10) {
-                console.log(`⏳ Warming up Volume Data: ${volumeHistory.length}/10 chunks collected...`);
-            }
             const curRSI = rsiArray[rsiArray.length - 2]; 
             
            // ✅ ATR LOGIC: MIN 500 OR DEFAULT 1000
@@ -1508,18 +1504,34 @@ async function runTradingLogic() {
 } // <--- This closes runTradingLogic()
 
 // --- ⏱️ PRECISE CLOCK SYNC ENGINE ---
+// --- ⏱️ PRECISE CLOCK SYNC ENGINE (With 9:00 AM Burst) ---
 function startPreciseLoop() {
-    const now = Date.now();
-    const interval = 30000; 
+    const t = getIST(); // Use IST Time
+    const sec = t.getSeconds();
+    const ms = t.getMilliseconds();
     
-    // Calculate exact ms until the next :00 or :30 mark
-    // We add +200ms buffer to ensure Upstox has definitely closed the candle
-    const delay = interval - (now % interval) + 200; 
+    let nextSec = -1;
 
+    // 🚀 BURST MODE: 9:00 AM Only
+    // Triggers at: :05, :10, :15, :30 (and :00 via previous loop)
+    if (t.getHours() === 9 && t.getMinutes() === 0) {
+        const targets = [5, 10, 15, 30, 60]; // 60 = Next Minute :00
+        nextSec = targets.find(s => s > sec);
+    } 
+
+    // 🛑 STANDARD MODE: Every 30s (00, 30)
+    // Runs if not in burst mode OR if we passed the last burst target
+    if (!nextSec) {
+        nextSec = (sec < 30) ? 30 : 60;
+    }
+
+    // Calculate Delay to next target
+    // We add +200ms buffer to ensure Upstox has definitely closed the candle/tick
+    const delay = ((nextSec - sec) * 1000) - ms + 200; 
 
     setTimeout(async () => {
-        await runTradingLogic(); // Run your existing logic
-        startPreciseLoop();      // Restart the smart timer
+        await runTradingLogic(); 
+        startPreciseLoop();      
     }, delay);
 }
 
