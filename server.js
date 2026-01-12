@@ -639,16 +639,14 @@ async function initWebSocket() {
                         // 1. GET PRICE
                         let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
 
-                        // 2. GET VOLUME (VTT - Volume Traded Today)
-                        // It is located inside the "Full Feed" object
-                        // ✅ FIX: Check 'ff' (Raw JSON) AND 'fullFeed' (SDK format)
-                            const rawVTT = feed.ff?.marketFF?.vtt       || 
-                                           feed.ff?.indexFF?.vtt        || 
-                                           feed.fullFeed?.marketFF?.vtt || 
-                                           feed.fullFeed?.indexFF?.vtt  || 0;
-
-                            let currentVTT = parseInt(rawVTT);
-
+                        // 2. GET VOLUME (Restored from Server 36)
+                        // We MUST check 'feed.ff' first because Upstox sends minified keys
+                        const rawVTT = feed.ff?.marketFF?.vtt       || 
+                                       feed.ff?.indexFF?.vtt        || 
+                                       feed.fullFeed?.marketFF?.vtt || 
+                                       feed.fullFeed?.indexFF?.vtt  || 0;
+                        
+                        let currentVTT = parseInt(rawVTT);
                             // 🔍 DEBUG: Print if we actually found volume
                             // if (currentVTT > 0) console.log(`🔍 VTT Found: ${currentVTT}`);
 
