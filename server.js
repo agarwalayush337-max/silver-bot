@@ -617,13 +617,23 @@ async function initWebSocket() {
 
         currentWs.onopen = () => {
             console.log(`✅ WebSocket Connected! Subscribing to ${botState.activeContract}...`);
-            const binaryMsg = Buffer.from(JSON.stringify({ 
-                guid: "bot-" + Date.now(), 
+            
+            // 🚀 REQUEST 1: High-Speed Price (LTPC)
+            const priceSub = Buffer.from(JSON.stringify({ 
+                guid: "price-" + Date.now(), 
                 method: "sub", 
-                // ✅ MODE CHANGED TO "full" TO GET VOLUME (VTT)
+                data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
+            }));
+            
+            // 📊 REQUEST 2: Volume Data (FULL)
+            const volumeSub = Buffer.from(JSON.stringify({ 
+                guid: "vol-" + Date.now(), 
+                method: "sub", 
                 data: { mode: "full", instrumentKeys: [botState.activeContract] } 
             }));
-            currentWs.send(binaryMsg);
+        
+            currentWs.send(priceSub);
+            currentWs.send(volumeSub);
         };
 
         currentWs.onmessage = async (msg) => {
@@ -638,7 +648,11 @@ async function initWebSocket() {
                         const feed = object.feeds[key];
                         
                         // 1. GET PRICE
-                        let newPrice = feed.ltpc?.ltp || feed.fullFeed?.marketFF?.ltpc?.ltp || feed.fullFeed?.indexFF?.ltpc?.ltp;
+                        // 1. GET PRICE (Prioritize the fast 'ltpc' object for instant updates)
+                        let newPrice = feed.ltpc?.ltp ||                       // High-speed LTPC packet
+                                       feed.fullFeed?.marketFF?.ltpc?.ltp ||   // Legacy Full packet
+                                       feed.ff?.marketFF?.ltpc?.ltp ||         // Minified Full packet
+                                       feed.fullFeed?.indexFF?.ltpc?.ltp;      // Index packet
 
                         // 2. GET VOLUME (Restored from Server 36)
                         // We MUST check 'feed.ff' first because Upstox sends minified keys
@@ -952,7 +966,7 @@ async function performAutoLogin() {
 
 // --- DATA ENGINE ---
 async function getMergedCandles() {
-    const today = new Date();
+    const today = getIST();
     const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
     const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
     const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
@@ -1369,7 +1383,7 @@ async function runTradingLogic() {
 
     try {
         // 2. Fetch Candle Data for ACTIVE contract
-        const today = new Date();
+        const today = getIST();
         const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
         const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
         const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
