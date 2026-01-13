@@ -1510,7 +1510,7 @@ function startPreciseLoop() {
     const sec = t.getSeconds();
     const ms = t.getMilliseconds();
     
-    let nextSec = -1;
+    let nextSec = null;
 
     // 🚀 BURST MODE: 9:00 AM Only
     // Triggers at: :05, :10, :15, :30 (and :00 via previous loop)
