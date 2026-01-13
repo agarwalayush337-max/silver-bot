@@ -967,7 +967,7 @@ async function performAutoLogin() {
 // --- DATA ENGINE ---
 async function getMergedCandles() {
     const today = getIST();
-    const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
+    const tenDaysAgo = getIST(); tenDaysAgo.setDate(today.getDate() - 10);
     const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
     const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
 
@@ -1384,7 +1384,7 @@ async function runTradingLogic() {
     try {
         // 2. Fetch Candle Data for ACTIVE contract
         const today = getIST();
-        const tenDaysAgo = new Date(); tenDaysAgo.setDate(today.getDate() - 10);
+        const tenDaysAgo = getIST(); tenDaysAgo.setDate(today.getDate() - 10);
         const urlIntraday = `https://api.upstox.com/v3/historical-candle/intraday/${encodeURIComponent(botState.activeContract)}/minutes/5`;
         const urlHistory = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(botState.activeContract)}/minutes/5/${formatDate(today)}/${formatDate(tenDaysAgo)}`;
 
