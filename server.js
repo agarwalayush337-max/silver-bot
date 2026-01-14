@@ -1555,8 +1555,8 @@ function startPreciseLoop() {
     const delay = ((nextSec - sec) * 1000) - ms + 200; 
 
     setTimeout(async () => {
-        await runTradingLogic(); 
-        startPreciseLoop();      
+        startPreciseLoop();      // ✅ Schedule next run IMMEDIATELY (keeps time locked)
+        await runTradingLogic(); // 🚀 Run logic in parallel
     }, delay);
 }
 
