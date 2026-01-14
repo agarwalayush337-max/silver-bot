@@ -302,6 +302,7 @@ let ACCESS_TOKEN = null;
 let lastKnownLtp = 0; 
 let sseClients = []; 
 let currentWs = null; 
+let isInitializing = false;
 // ✅ NEW: Store ATR here so WebSocket can read it instantly
 let globalATR = 800; 
 // ✅ NEW: For Rate Limiting (Throttle)
@@ -609,33 +610,38 @@ async function modifyExchangeSL(oldStop, newTrigger) {
 async function initWebSocket() {
     if (!ACCESS_TOKEN || currentWs) return;
     try {
+        isInitializing = true; // ✅ ADD THIS LINE
         console.log("🔌 Initializing WS (FULL MODE for Volume)...");
         const response = await axios.get("https://api.upstox.com/v3/feed/market-data-feed/authorize", { headers: { 'Authorization': 'Bearer ' + ACCESS_TOKEN, 'Accept': 'application/json' } });
         const WebSocket = require('ws'); 
         currentWs = new WebSocket(response.data.data.authorizedRedirectUri, { followRedirects: true });
         currentWs.binaryType = "arraybuffer"; 
 
-        currentWs.onopen = () => {
+        // ✅ CHANGED: Use 'function()' instead of '() =>' so we can access 'this'
+        currentWs.onopen = function() {
             console.log(`✅ WebSocket Connected! Subscribing to ${botState.activeContract}...`);
             
-            // 🚀 REQUEST 1: High-Speed Price (LTPC)
+            // Define the subscription messages locally
             const priceSub = Buffer.from(JSON.stringify({ 
                 guid: "price-" + Date.now(), 
                 method: "sub", 
                 data: { mode: "ltpc", instrumentKeys: [botState.activeContract] } 
             }));
             
-            // 📊 REQUEST 2: Volume Data (FULL)
             const volumeSub = Buffer.from(JSON.stringify({ 
                 guid: "vol-" + Date.now(), 
                 method: "sub", 
                 data: { mode: "full", instrumentKeys: [botState.activeContract] } 
             }));
-        
-            currentWs.send(priceSub);
-            currentWs.send(volumeSub);
+            
+            // ✅ CRITICAL FIX: Only send if THIS specific socket is ready
+            // We use 'this.readyState' (which refers to the socket that just opened)
+            // instead of 'currentWs.readyState' (which might be null or overwritten)
+            if (this.readyState === 1) {
+                this.send(priceSub);
+                this.send(volumeSub);
+            }
         };
-
         currentWs.onmessage = async (msg) => {
             try {
                 if (!FeedResponse) return;
@@ -876,9 +882,14 @@ async function initWebSocket() {
                 console.error("❌ Decode Logic Error:", e.message); 
             }
         };
-        currentWs.onclose = () => { currentWs = null; lastVTT = 0; };
+        currentWs.onclose = () => { 
+            currentWs = null; 
+            lastVTT = 0; 
+            isInitializing = false; // ✅ ADD THIS
+        };
     } catch (e) { 
         currentWs = null; 
+        isInitializing = false; // ✅ ADD THIS
     }
 }
 
