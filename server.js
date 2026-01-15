@@ -110,7 +110,7 @@ const STRATEGY_RULES = `
 const STRATEGY_PARAMS = {
     // 1. Indicator Settings
     ATR_PERIOD: 18,              // Changed from 24
-    ATR_FLOOR: 1000,             // Changed from 800
+    ATR_FLOOR: 800,             // Changed from 800
     VOL_MA_PERIOD: 30,           // Volume Moving Average Period
     BREAKOUT_PERIOD: 10,         // Donchian Channel / Breakout Lookback
 
