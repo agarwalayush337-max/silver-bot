@@ -639,10 +639,22 @@ async function initWebSocket() {
             // We use 'this.readyState' (which refers to the socket that just opened)
             // instead of 'currentWs.readyState' (which might be null or overwritten)
             if (this.readyState === 1) {
+                // 1. Send LTPC (Fast Price) Immediately
+                console.log("🚀 fast-LTPC Subscribed");
                 this.send(priceSub);
-                this.send(volumeSub);
+
+                // 2. Wait 2 Seconds, then Upgrade to Full Mode (Volume)
+                // This ensures the connection is stable before adding heavy data
+                setTimeout(() => {
+                    if (this.readyState === 1) {
+                        console.log("⏱️ Upgrading to Full Mode (Volume)...");
+                        this.send(volumeSub);
+                    }
+                }, 2000); 
             }
         };
+
+        
         currentWs.onmessage = async (msg) => {
             try {
                 if (!FeedResponse) return;
@@ -1823,25 +1835,29 @@ app.post('/sync-price', async (req, res) => {
                     openPos.qty = 0; openPos.side = null; openPos.price = 0;
                 }
             }
-
+            
             // Restore metadata for the trade if it exists
             const existingLog = botState.history.find(h => h.id === order.order_id);
-            const preservedData = (existingLog && existingLog.analysisData) ? existingLog.analysisData : null;
+            
+            // ✅ FIX 1 & 2: Restore ALL missing data (Metrics, Analysis, Ticks)
+            const preservedMetrics = existingLog ? existingLog.metrics : null;
+            const preservedAnalysis = existingLog ? existingLog.analysisData : null;
+            const preservedTicks = existingLog ? existingLog.tickData : null;
             const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
             const tradeLog = {
                 date: todayStr, time: execTime, type: txnType, 
-                qty: parseInt(order.quantity) || 1, // ✅ Dynamic Qty Sync
+                qty: parseInt(order.quantity) || 1, 
                 orderedPrice: limitPrice,
                 executedPrice: realPrice, id: order.order_id, status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null, 
                 tag: preservedTag,
-                analysisData: preservedData // ✅ Now guaranteed to be null or an object
+                
+                // ✅ RESTORED FIELDS
+                metrics: preservedMetrics,       // E50, E200, RSI
+                analysisData: preservedAnalysis, // MAE, MFE
+                tickData: preservedTicks         // Charts
             };
-            
-            processedLogs.unshift(tradeLog);
-            if(db) saveTrade(tradeLog); 
-        });
 
         // 4. Merge system logs back into history
         botState.history = botState.history.filter(h => h.type === 'SYSTEM' || (h.date && h.date !== todayStr));
@@ -1959,7 +1975,7 @@ app.get('/reports', (req, res) => {
                 <td class="${t.type === 'BUY' ? 'buy' : 'sell'}"><b>${t.type}</b></td>
                 <td>${t.qty}</td>
                 <td>${t.executedPrice}</td>
-                <td style="font-weight:bold; color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">${t.pnl !== undefined ? '₹'+t.pnl : '-'}</td>
+                <td style="font-weight:bold; color:${(t.pnl||0)>=0?'#4ade80':'#f87171'}">${(t.pnl !== undefined && t.pnl !== null) ? '₹' + parseFloat(t.pnl).toFixed(2) : '-'}</td>
                 <td>${analyzeBtn}</td>
             </tr>`;
         });
@@ -2302,9 +2318,12 @@ app.get('/download-day-excel', (req, res) => {
                 // Determine Direction (LONG/SHORT)
                 const direction = entryTrade.type === 'BUY' ? 'LONG' : 'SHORT';
                 const m = entryTrade.metrics || {}; 
+                // ✅ Fetch MAE/MFE from Exit metrics or Analysis Data
+                const mExit = exitTrade.metrics || {};
+                const analysis = exitTrade.analysisData || {};
 
                 pairedRows.push({
-                    "DATE": entryTrade.date, // Use Entry Date (matches your sheet)
+                    "DATE": entryTrade.date, 
                     "TYPE": direction,
                     "QUANTITY": exitTrade.qty,
                     "ENTRY PRICE": entryTrade.executedPrice,
@@ -2317,7 +2336,11 @@ app.get('/download-day-excel', (req, res) => {
                     "VOLUME": m.vol || '-',
                     "AVG VOLUME": m.avgVol || '-',
                     "VOLUME MULTIPLE": m.volMult || '-',
-                    "RSI": m.rsi || '-'
+                    "RSI": m.rsi || '-',
+                    // ✅ FIX 3: Added New Columns
+                    "ATR": m.atr || '-',
+                    "MAE": mExit.mae || analysis.maxDrawdown || '-',
+                    "MFE": mExit.mfe || analysis.maxRunUp || '-'
                 });
             }
         });
