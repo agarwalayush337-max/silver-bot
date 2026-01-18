@@ -2344,8 +2344,8 @@ app.get('/download-day-excel', (req, res) => {
                     "RSI": m.rsi || '-',
                     // ✅ FIX 3: Added New Columns
                     "ATR": m.atr || '-',
-                    "MAE": mExit.mae || analysis.maxDrawdown || '-',
-                    "MFE": mExit.mfe || analysis.maxRunUp || '-'
+                    "MFE": mExit.mfe || analysis.maxRunUp || '-',
+                    "MAE": mExit.mae || analysis.maxDrawdown || '-'
                 });
             }
         });
