@@ -111,6 +111,7 @@ const STRATEGY_PARAMS = {
     // 1. Indicator Settings
     ATR_PERIOD: 18,              // Changed from 24
     ATR_FLOOR: 800,             // Changed from 800
+    ATR_CEILING: 1200,        // Max SL distance (Volatility Cap)
     VOL_MA_PERIOD: 30,           // Volume Moving Average Period
     BREAKOUT_PERIOD: 10,         // Donchian Channel / Breakout Lookback
 
@@ -120,13 +121,13 @@ const STRATEGY_PARAMS = {
     TRADE_PAUSE_MIN: 3,          // Cooling period in minutes
 
     // 3. Risk Management (Multipliers of ATR)
-    SL_ATR_MULT: 1.8,            // Initial Stop Loss width
+    SL_ATR_MULT: 1.2,            // Initial Stop Loss width
     
     // 4. Trailing Stop Logic (Multipliers of ATR)
     TRAIL_COST_TRIGGER: 1.1,     // Profit needed to move SL to Cost
-    TRAIL_START_TRIGGER: 0.8,    // Profit needed to start Trailing
+    TRAIL_START_TRIGGER: 1.5,    // Profit needed to start Trailing
     TRAIL_SUPER_TRIGGER: 2.0,    // Profit needed to tighten trailing aggressively
-    TRAIL_GAP_MULT: 0.6          // The distance to keep behind price when trailing
+    TRAIL_GAP_MULT: 1          // The distance to keep behind price when trailing
 };
 
 
@@ -1451,7 +1452,7 @@ async function runTradingLogic() {
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
 
             // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
-            globalATR = rawATR ? Math.max(rawATR, STRATEGY_PARAMS.ATR_FLOOR) : STRATEGY_PARAMS.ATR_FLOOR;
+            globalATR = rawATR ? Math.min(STRATEGY_PARAMS.ATR_CEILING, Math.max(STRATEGY_PARAMS.ATR_FLOOR, (indicators.atr || 0)));
             
             const bH = Math.max(...h.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
             const bL = Math.min(...l.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
@@ -1528,40 +1529,67 @@ async function runTradingLogic() {
     }
 } // <--- This closes runTradingLogic()
 
-// --- ⏱️ PRECISE CLOCK SYNC ENGINE ---
-// --- ⏱️ PRECISE CLOCK SYNC ENGINE (With 9:00 AM Burst) ---
+// Global State Trackers
+let lastProcessedCandle = null;
+let lastBurstTriggerTime = 0;
+let currentScheduleState = 'INIT'; // Tracks current mode to prevent log clutter
+
 function startPreciseLoop() {
-    const t = getIST(); // Use IST Time
-    const sec = t.getSeconds();
-    const ms = t.getMilliseconds();
-    
-    let nextSec = null;
+    console.log("✅ Silver Saarthi Scheduler Started");
 
-    // 🚀 BURST MODE: 9:00 AM Only
-    // Triggers at: :05, :10, :15, :30 (and :00 via previous loop)
-    if (t.getHours() === 9 && t.getMinutes() === 0) {
-        const targets = [5, 10, 15, 30, 60]; // 60 = Next Minute :00
-        nextSec = targets.find(s => s > sec);
-    } 
+    setInterval(async () => {
+        const now = new Date();
+        const hour = now.getHours();
+        const minute = now.getMinutes();
+        const second = now.getSeconds();
 
-    // 🛑 STANDARD MODE: Every 30s (00, 30)
-    // Runs if not in burst mode OR if we passed the last burst target
-    if (!nextSec) {
-        nextSec = (sec < 30) ? 30 : 60;
-    }
+        // Define Zones
+        // Morning Burst: 09:00 - 09:59
+        // Evening Burst: 18:00 - 18:59
+        const isBurstZone = (hour === 9) || (hour === 18);
 
-    // Calculate Delay to next target
-    // We add +200ms buffer to ensure Upstox has definitely closed the candle/tick
-    const delay = ((nextSec - sec) * 1000) - ms + 200; 
+        // --- 1. CLEAN LOGGING LOGIC (Only log on switch) ---
+        if (isBurstZone && currentScheduleState !== 'BURST') {
+            console.log(`⚡ SWITCHING MODE: Entering BURST MODE (Fast Execution) at ${hour}:${minute}`);
+            currentScheduleState = 'BURST';
+        } 
+        else if (!isBurstZone && currentScheduleState !== 'SNIPER') {
+            console.log(`🎯 SWITCHING MODE: Entering SNIPER MODE (Candle Close) at ${hour}:${minute}`);
+            currentScheduleState = 'SNIPER';
+        }
 
-    setTimeout(async () => {
-        startPreciseLoop();      // ✅ Schedule next run IMMEDIATELY (keeps time locked)
-        await runTradingLogic(); // 🚀 Run logic in parallel
-    }, delay);
+        // --- 2. EXECUTION LOGIC ---
+        if (isBurstZone) {
+            // === BURST MODE ===
+            // Check every 5 seconds silently
+            if (second % 5 === 0) {
+                const currentTime = now.getTime();
+                if (currentTime - lastBurstTriggerTime > 4000) {
+                    lastBurstTriggerTime = currentTime;
+                    // No console.log here to keep it clean
+                    await runTradingLogic(); 
+                }
+            }
+        } else {
+            // === SNIPER MODE ===
+            // Check only at Candle Close (XX:00, XX:05...)
+            // Checks :01 to :03 to handle data delay safely
+            const isNewCandleTime = (minute % 5 === 0) && (second >= 1 && second <= 3);
+
+            if (isNewCandleTime) {
+                const candleID = `${hour}:${minute}`;
+                
+                if (lastProcessedCandle !== candleID) {
+                    // We log this because a Candle Close is a significant event
+                    console.log(`🕯️ New Candle Closed (${candleID}). Verifying Trend...`);
+                    lastProcessedCandle = candleID;
+                    await runTradingLogic(); 
+                }
+            }
+        }
+
+    }, 1000); // Heartbeat every 1 second
 }
-
-// 🚀 Start the engine
-startPreciseLoop();
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
