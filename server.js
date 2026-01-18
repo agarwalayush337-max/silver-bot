@@ -1858,7 +1858,12 @@ app.post('/sync-price', async (req, res) => {
                 analysisData: preservedAnalysis, // MAE, MFE
                 tickData: preservedTicks         // Charts
             };
+            
+            processedLogs.unshift(tradeLog);
+            if(db) saveTrade(tradeLog); 
+        });
 
+        
         // 4. Merge system logs back into history
         botState.history = botState.history.filter(h => h.type === 'SYSTEM' || (h.date && h.date !== todayStr));
         botState.history = [...processedLogs, ...botState.history];
