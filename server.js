@@ -761,7 +761,7 @@ async function initWebSocket() {
                                 
                                     // ✅ DYNAMIC TRAILING LOGIC
                                     // Use Live ATR (limit min to 1000)
-                                    const liveATR = Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR) || STRATEGY_PARAMS.ATR_FLOOR;
+                                    const liveATR = Math.min(STRATEGY_PARAMS.ATR_CEILING, Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR));
                                     
                                     let newStop = botState.currentStop;
                                     let didChange = false;
@@ -1247,7 +1247,7 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
                 botState.currentTradeTicks = []; // Start Fresh Recording
 
                 // ✅ DYNAMIC ATR STOP LOSS (1.5x ATR, Min 500)
-                const liveATR = Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR) || STRATEGY_PARAMS.ATR_FLOOR;
+                const liveATR = Math.min(STRATEGY_PARAMS.ATR_CEILING, Math.max(globalATR, STRATEGY_PARAMS.ATR_FLOOR));
                 const slPoints = Math.round(liveATR * STRATEGY_PARAMS.SL_ATR_MULT);
                 const slPrice = type === "BUY" ? Math.round(result.price - slPoints) : Math.round(result.price + slPoints);
                 
@@ -1452,7 +1452,9 @@ async function runTradingLogic() {
             const displayATR = rawATR ? rawATR.toFixed(0) : "0";
 
             // 2. Set the GLOBAL ATR for Strategy (Safety Floor)
-            globalATR = rawATR ? Math.min(STRATEGY_PARAMS.ATR_CEILING, Math.max(STRATEGY_PARAMS.ATR_FLOOR, (indicators.atr || 0)));
+            globalATR = rawATR 
+                ? Math.min(STRATEGY_PARAMS.ATR_CEILING, Math.max(STRATEGY_PARAMS.ATR_FLOOR, rawATR)) 
+                : STRATEGY_PARAMS.ATR_FLOOR;
             
             const bH = Math.max(...h.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
             const bL = Math.min(...l.slice(-(STRATEGY_PARAMS.BREAKOUT_PERIOD + 1), -1));
