@@ -1383,7 +1383,7 @@ setInterval(() => {
 // --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
 // --- TRADING ENGINE (Watcher & Signal Logic - Runs every 30s) ---
 // ✅ Name the function so we can call it precisely
-async function runTradingLogic() {
+async function runTradingLogic(allowTrade = true) {
     await validateToken(); 
     if (!ACCESS_TOKEN || !isApiAvailable()) return;
   
@@ -1463,7 +1463,8 @@ async function runTradingLogic() {
             // 2. DETAILED LOG (Now shows REAL ATR)
             const shortName = botState.contractName.replace("SILVER MIC ", ""); 
             console.log(`📊 [${shortName}] LTP:${lastKnownLtp} E50:${curE50.toFixed(0)} E200:${curE200.toFixed(0)} Vol:${curV} AvgV:${curAvgV.toFixed(0)} ATR:${displayATR} (Used:${globalATR.toFixed(0)}) RSI:${curRSI.toFixed(1)}`);
-
+            // ✅ STOP HERE if we are in "Log Only" mode
+            if (!allowTrade) return;
             // 3. SIGNAL LOGIC
             if (isMarketOpen() && !botState.positionType) {
                 
@@ -1552,7 +1553,7 @@ function startPreciseLoop() {
 
         // --- 1. CLEAN LOGGING LOGIC (Only log on switch) ---
         if (isBurstZone && currentScheduleState !== 'BURST') {
-            console.log(`⚡ SWITCHING MODE: Entering BURST MODE (Fast Execution) at ${hour}:${minute}`);
+            console.log(`⚡ SWITCHING MODE: Entering BURST MODE (Every 5s) at ${hour}:${minute}`);
             currentScheduleState = 'BURST';
         } 
         else if (!isBurstZone && currentScheduleState !== 'SNIPER') {
@@ -1561,37 +1562,37 @@ function startPreciseLoop() {
         }
 
         // --- 2. EXECUTION LOGIC ---
+        const currentTime = now.getTime();
+        const isReady = (currentTime - lastBurstTriggerTime > 2000); 
+
         if (isBurstZone) {
-            // === BURST MODE ===
-            // Check every 5 seconds silently
-            if (second % 5 === 0) {
-                const currentTime = now.getTime();
-                if (currentTime - lastBurstTriggerTime > 4000) {
-                    lastBurstTriggerTime = currentTime;
-                    // No console.log here to keep it clean
-                    await runTradingLogic(); 
-                }
+            // === BURST MODE: Every 5 Seconds (Always Trade) ===
+            if (second % 5 === 0 && isReady) {
+                lastBurstTriggerTime = currentTime;
+                await runTradingLogic(true); // ✅ Trade Allowed
             }
         } else {
-            // === SNIPER MODE ===
-            // Check only at Candle Close (XX:00, XX:05...)
-            // Checks :01 to :03 to handle data delay safely
-            const isNewCandleTime = (minute % 5 === 0) && (second >= 1 && second <= 3);
-
-            if (isNewCandleTime) {
-                const candleID = `${hour}:${minute}`;
+            // === SNIPER MODE: Log Every 30s, Trade Only on 5-Min Close ===
+            if (second % 30 === 0 && isReady) {
+                lastBurstTriggerTime = currentTime;
                 
-                if (lastProcessedCandle !== candleID) {
-                    // We log this because a Candle Close is a significant event
-                    console.log(`🕯️ New Candle Closed (${candleID}). Verifying Trend...`);
-                    lastProcessedCandle = candleID;
-                    await runTradingLogic(); 
+                // Rule: Trade only at 00, 05, 10... (on the :00 second mark)
+                // Note: We check 'second < 5' to be safe against lag
+                const isCandleClose = (minute % 5 === 0) && (second < 5);
+                
+                if (isCandleClose) {
+                    console.log(`🕯️ Candle Closed (${hour}:${minute}). Checking Signal...`);
+                    await runTradingLogic(true); // ✅ Trade Allowed
+                } else {
+                    // Just Log Price (No Trading)
+                    await runTradingLogic(false); // ❌ Log Only
                 }
             }
         }
 
     }, 1000); // Heartbeat every 1 second
 }
+
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
