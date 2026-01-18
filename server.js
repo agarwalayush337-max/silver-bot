@@ -466,7 +466,7 @@ async function loadState() {
         }
 
         // 2. Load Trades
-        const snapshot = await db.collection('trades').orderBy('date', 'desc').limit(200).get();
+        const snapshot = await db.collection('trades').orderBy('date', 'desc').get();
         let rawHistory = [];
         snapshot.forEach(d => rawHistory.push(d.data()));
 
