@@ -1561,7 +1561,7 @@ function startPreciseLoop() {
     console.log("✅ Silver Saarthi Scheduler Started");
 
     setInterval(async () => {
-        const now = new Date();
+        const now = getIST();    
         const hour = now.getHours();
         const minute = now.getMinutes();
         const second = now.getSeconds();
