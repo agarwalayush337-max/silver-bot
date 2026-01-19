@@ -1604,7 +1604,7 @@ function startPreciseLoop() {
 
     }, 1000); // Heartbeat every 1 second
 }
-
+startPreciseLoop();
 
 // --- 📡 API & DASHBOARD ---
 app.get('/live-updates', (req, res) => {
@@ -2595,6 +2595,5 @@ setTimeout(() => {
         performAutoLogin();
     }
 }, 20000); // 20-second delay to prevent crashing a cold server
-startPreciseLoop();
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
