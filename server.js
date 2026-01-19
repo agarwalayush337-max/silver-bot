@@ -2602,6 +2602,7 @@ setTimeout(() => {
         console.log("♻️ Crash Recovery Detected: Attempting Auto-Login...");
         performAutoLogin();
     }
-}, 20000); // 20-second delay to prevent crashing a cold server
+}, 20000); 
 
+// ✅ START SERVER (No extra bracket below this line)
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
