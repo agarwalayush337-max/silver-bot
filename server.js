@@ -1348,35 +1348,38 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
         return false;
     }
 }
+
+let lastValidationTime = 0; // ⏱️ Tracks the last time we checked Upstox
 // --- TOKEN VALIDATION HELPER ---
-// ✅ UPDATED: REAL TOKEN VALIDATION
 async function validateToken() {
     if (!ACCESS_TOKEN) return false;
 
+    // ✅ 5-MINUTE THROTTLE (300,000 ms)
+    // If we checked recently, assume token is still good.
+    // This prevents "429 Rate Limit" errors from Upstox.
+    const now = Date.now();
+    if (now - lastValidationTime < 300000) {
+        return true; 
+    }
+
     try {
-        // "Ping" Upstox to check if the token is still valid
-        // We use the User Profile API as a lightweight check
+        // Real API Call (Only runs once every 5 mins)
         await axios.get('https://api.upstox.com/v2/user/profile', {
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
+        
+        lastValidationTime = now; // 🕒 Update the timestamp
         return true;
+
     } catch (e) {
-        // If Upstox returns 401, the token is definitely Invalid/Revoked
         if (e.response && e.response.status === 401) {
-            console.log("⚠️ Token is Invalid/Revoked. Switching to OFFLINE.");
-            ACCESS_TOKEN = null; // 🚨 This triggers the Dashboard to show OFFLINE
-            
-            // Kill the WebSocket too since the token is dead
-            if (currentWs) {
-                try { currentWs.close(); } catch(err) {}
-                currentWs = null;
-            }
-            
-            pushToDashboard(); // Force immediate UI update
+            console.log("⚠️ Token Expired. Switching to OFFLINE.");
+            ACCESS_TOKEN = null;
+            if (currentWs) { try { currentWs.close(); } catch(err) {} currentWs = null; }
+            pushToDashboard(); 
             return false;
         }
-        // If it's a different error (like network issue), we assume token is OK for now
-        return true;
+        return true; // Treat network errors as "Token OK" to stay online
     }
 }
 
@@ -1540,7 +1543,12 @@ async function runTradingLogic(allowTrade = true) {
             } 
         }
     } catch (e) { 
-        if(e.response?.status===401) { ACCESS_TOKEN = null; performAutoLogin(); } 
+        console.error("❌ Logic Error:", e.message); // ✅ NOW WE CAN SEE ERRORS
+        if(e.response?.status===401) { 
+            console.log("⚠️ 401 Error Detected. Resetting Token.");
+            ACCESS_TOKEN = null; 
+            performAutoLogin(); 
+        } 
     }
 } // <--- This closes runTradingLogic()
 
