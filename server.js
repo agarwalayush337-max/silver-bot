@@ -841,9 +841,10 @@ async function initWebSocket() {
                                         modifyExchangeSL(oldStop, newStop); 
                                     }
                                     
-                                    // Stop Loss Hit Logic
-                                    if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop) || 
-                                        (botState.positionType === 'SHORT' && newPrice >= botState.currentStop)) {
+                                    // Stop Loss Hit Logic (With 200 Point Buffer)
+                                    // Triggers "Exit Verification" early if price is near SL
+                                    if ((botState.positionType === 'LONG' && newPrice <= botState.currentStop + 200) || 
+                                        (botState.positionType === 'SHORT' && newPrice >= botState.currentStop - 200)) {
                                         
                                         if (botState.positionType !== 'EXITING' && botState.positionType !== 'NONE') {
                                             console.log(`🛑 Stop Loss Hit. Verifying ${botState.quantity}L Exit...`);
@@ -1069,10 +1070,21 @@ async function verifyOrderStatus(orderId, context, tempLogId = null) {
                 
                 if (logIndex !== -1) {
                     // Update Core Data
+                    // Update Core Data
                     botState.history[logIndex].id = orderId; // 🔄 Swap Temp ID for Real ID
                     botState.history[logIndex].executedPrice = realPrice;
                     botState.history[logIndex].time = execTime;
                     botState.history[logIndex].status = "FILLED";
+
+                    // ✅ SAFETY: Ensure we don't lose the Tick Data we just collected
+                    if (botState.currentTradeTicks && botState.currentTradeTicks.length > 0) {
+                        botState.history[logIndex].tickData = [...botState.currentTradeTicks];
+                    }
+                    
+                    // ✅ SAFETY: Update MAE/MFE one last time from global state
+                    if (!botState.history[logIndex].metrics) botState.history[logIndex].metrics = {};
+                    botState.history[logIndex].metrics.mfe = botState.maxRunUp;
+                    botState.history[logIndex].metrics.mae = botState.maxDrawdown;
                     
                     // Capture Filled Quantity
                     const filledQty = parseInt(order.filled_quantity);
@@ -1870,33 +1882,35 @@ app.post('/sync-price', async (req, res) => {
                 }
             }
             
-            // Restore metadata for the trade if it exists
+            // ✅ INTELLIGENT RESTORATION: Search for existing data in memory
             const existingLog = botState.history.find(h => h.id === order.order_id);
             
-            // ✅ FIX 1 & 2: Restore ALL missing data (Metrics, Analysis, Ticks)
-            const preservedMetrics = existingLog ? existingLog.metrics : null;
-            const preservedAnalysis = existingLog ? existingLog.analysisData : null;
-            const preservedTicks = existingLog ? existingLog.tickData : null;
-            const preservedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
+            // Rescue Data (Tick Data, Metrics, Analysis)
+            const rescuedMetrics = existingLog ? existingLog.metrics : null;
+            const rescuedAnalysis = existingLog ? existingLog.analysisData : null;
+            const rescuedTicks = existingLog ? existingLog.tickData : null;
+            const rescuedTag = order.tag || (existingLog ? existingLog.tag : "MANUAL");
 
+            // Fallback: If we have ticks but no analysis, we try to preserve what we have
+            let finalAnalysis = rescuedAnalysis;
+            
             const tradeLog = {
                 date: todayStr, time: execTime, type: txnType, 
                 qty: parseInt(order.quantity) || 1, 
                 orderedPrice: limitPrice,
                 executedPrice: realPrice, id: order.order_id, status: status,
                 pnl: tradePnL !== 0 ? tradePnL : null, 
-                tag: preservedTag,
+                tag: rescuedTag,
                 
-                // ✅ RESTORED FIELDS
-                metrics: preservedMetrics,       // E50, E200, RSI
-                analysisData: preservedAnalysis, // MAE, MFE
-                tickData: preservedTicks         // Charts
+                // 🛡️ INJECT PRESERVED DATA
+                metrics: rescuedMetrics,       
+                analysisData: finalAnalysis,   
+                tickData: rescuedTicks         
             };
             
             processedLogs.unshift(tradeLog);
             if(db) saveTrade(tradeLog); 
         });
-
         
         // 4. Merge system logs back into history
         botState.history = botState.history.filter(h => h.type === 'SYSTEM' || (h.date && h.date !== todayStr));
@@ -2005,7 +2019,8 @@ app.get('/reports', (req, res) => {
             const rowColor = (t.pnl && t.pnl !== 0) ? (t.pnl > 0 ? 'rgba(74, 222, 128, 0.05)' : 'rgba(248, 113, 113, 0.05)') : 'transparent';
             
             // ✅ "Analyze" Button (Only shows if trade is closed/has PnL)
-            const analyzeBtn = (t.pnl !== undefined) 
+            // Fix: Added check for 'null' to prevent it showing on synced Entry orders
+            const analyzeBtn = (t.pnl !== undefined && t.pnl !== null) 
                 ? `<a href="/analyze-sl/${t.id}" target="_blank" class="btn btn-blue">🧠 Analyze</a>` 
                 : '-';
 
@@ -2628,7 +2643,40 @@ setTimeout(() => {
         console.log("♻️ Crash Recovery Detected: Attempting Auto-Login...");
         performAutoLogin();
     }
-}, 20000); 
+}, 20000);
+
+// --- 🛡️ ORDER INTEGRITY AUDITOR: Lazy Verification ---
+async function verifyOrderIntegrity() {
+    // 1. Basic Checks: Must be online, logged in, and have an active trade + SL order
+    if (!botState.positionType || !botState.slOrderId || !ACCESS_TOKEN) return;
+
+    // 2. 🧠 SMART FILTER: Only check if price is close to SL
+    // This prevents hitting the API when the trade is safe and profitable.
+    const distToSL = Math.abs(lastKnownLtp - botState.currentStop);
+    const pricePercent = lastKnownLtp * 0.002; // ✅ 0.2% Range (Tight Danger Zone)
+
+    // If we are safe (more than 0.2% away from SL), DO NOT CALL API.
+    if (distToSL > pricePercent) return; 
+
+    try {
+        console.log("👻 Ghost Hunter: Price is close to SL. Verifying status...");
+        
+        const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { 
+            headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
+        });
+        
+        const slOrder = res.data.data.find(o => o.order_id === botState.slOrderId);
+
+        if (slOrder && slOrder.status === 'complete') {
+            console.log(`👻 GHOST EXIT CONFIRMED! SL ${botState.slOrderId} filled silently.`);
+            await verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
+        }
+    } catch (e) {
+        // Ignore errors, we'll try again next cycle
+    }
+}
+
+setInterval(verifyOrderIntegrity, 5000); // ✅ Check every 5 seconds
 
 // ✅ START SERVER (No extra bracket below this line)
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
