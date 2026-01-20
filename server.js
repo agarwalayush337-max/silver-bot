@@ -379,7 +379,9 @@ function generateLogHTML(logs) {
             
             <span style="text-align:center; color:#cbd5e1;">${t.qty}L</span> 
             
-            <span style="text-align:right; color:#cbd5e1;">₹${t.orderedPrice || '-'}</span>
+            <span style="text-align:right; color:#cbd5e1;">
+                ₹${t.orderedPrice ? parseFloat(t.orderedPrice).toFixed(2) : '-'}
+            </span>
             
             <span style="text-align:right; font-weight:bold; color:white;">₹${t.executedPrice || '-'}</span> 
             
@@ -525,7 +527,8 @@ function pushToDashboard() {
     const pnlData = calculateLivePnL();
     
     const todayStr = formatDate(getIST());
-    const todayLogs = botState.history.filter(t => t.date === todayStr && !t.type.includes('SYSTEM') && t.status !== 'CANCELLED');
+   // ✅ FIX: Added "&& t.status !== 'REJECTED'" to hide failed orders from live view
+    const todayLogs = botState.history.filter(t => t.date === todayStr && !t.type.includes('SYSTEM') && t.status !== 'CANCELLED' && t.status !== 'REJECTED');
     const displayLogs = generateLogHTML(todayLogs);
 
     // ✅ NEW: Calculate Locked Profit (Projected PnL at SL)
@@ -1099,8 +1102,15 @@ async function verifyOrderStatus(orderId, context, tempLogId = null) {
                         const entryPrice = botState.entryPrice;
 
                         // Calculate PnL based on direction
-                        if (order.transaction_type === 'SELL') tradePnL = (realPrice - entryPrice) * qty;
-                        else tradePnL = (entryPrice - realPrice) * qty;
+                        // ✅ SAFETY: Check if Entry Price is valid (Non-Zero)
+                        // This prevents the "-9 Lakhs" error if this function runs twice
+                        if (entryPrice > 0) {
+                            if (order.transaction_type === 'SELL') tradePnL = (realPrice - entryPrice) * qty;
+                            else tradePnL = (entryPrice - realPrice) * qty;
+                        } else {
+                            console.log("⚠️ Entry Price Missing (Race Condition Detected)! Skipping PnL calc.");
+                            tradePnL = 0; 
+                        }
 
                         // Save PnL
                         botState.history[logIndex].pnl = tradePnL;
@@ -1600,6 +1610,22 @@ function startPreciseLoop() {
         // Morning Burst: 09:00 - 09:59
         // Evening Burst: 18:00 - 18:59
         const isBurstZone = (hour === 9) || (hour === 18);
+
+        // ✅ PRE-MARKET REFRESH (08:59 AM IST)
+        // Forces a fresh WebSocket connection 5 seconds before market open.
+        // This prevents the "Session Downgrade" issue where Upstox stops sending Volume.
+        if (hour === 8 && minute === 59 && second === 30) {
+            console.log("⏰ PRE-MARKET REFRESH: Forcing WebSocket Reconnect to ensure Full Mode...");
+            if (currentWs) {
+                try { currentWs.close(); } catch(e) {}
+                currentWs = null;
+            }
+            // Force reset volume trackers so we start fresh
+            realTimeVolume30s = 0;
+            lastVTT = 0; 
+            
+            initWebSocket(); // Resets connection and resends "FULL" command
+        }
 
         // --- 1. CLEAN LOGGING LOGIC (Only log on switch) ---
         if (isBurstZone && currentScheduleState !== 'BURST') {
@@ -2648,7 +2674,8 @@ setTimeout(() => {
 // --- 🛡️ ORDER INTEGRITY AUDITOR: Lazy Verification ---
 async function verifyOrderIntegrity() {
     // 1. Basic Checks: Must be online, logged in, and have an active trade + SL order
-    if (!botState.positionType || !botState.slOrderId || !ACCESS_TOKEN) return;
+    // ✅ FIX: Block execution if we are already in the middle of an exit ('EXITING')
+    if (!botState.positionType || botState.positionType === 'EXITING' || !botState.slOrderId || !ACCESS_TOKEN) return;
 
     // 2. 🧠 SMART FILTER: Only check if price is close to SL
     // This prevents hitting the API when the trade is safe and profitable.
@@ -2664,13 +2691,25 @@ async function verifyOrderIntegrity() {
         const res = await axios.get("https://api.upstox.com/v2/order/retrieve-all", { 
             headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Accept': 'application/json' }
         });
+
+        // ✅ DOUBLE CHECK: Did the WebSocket trigger the exit while we were waiting for the API?
+        // If yes, STOP immediately. Do not run twice.
+        if (botState.positionType === 'EXITING') {
+            console.log("⚠️ Race Condition Avoided: WebSocket triggered exit while Auditor was checking.");
+            return;
+        }
         
         const slOrder = res.data.data.find(o => o.order_id === botState.slOrderId);
 
         if (slOrder && slOrder.status === 'complete') {
             console.log(`👻 GHOST EXIT CONFIRMED! SL ${botState.slOrderId} filled silently.`);
+            
+            // ✅ FIX: Set flag immediately to stop WebSocket from triggering duplicate exit
+            botState.positionType = 'EXITING'; 
+            
             await verifyOrderStatus(botState.slOrderId, 'EXIT_CHECK');
         }
+        
     } catch (e) {
         // Ignore errors, we'll try again next cycle
     }
