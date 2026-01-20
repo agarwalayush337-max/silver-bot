@@ -541,6 +541,7 @@ function pushToDashboard() {
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: pnlData.live,
+        locked: lockedPnL.toFixed(2), // 👈 CRITICAL: This was missing or misplaced
         historicalPnl: pnlData.history,
         stop: hasPosition ? botState.currentStop : 0,
         slID: hasPosition ? botState.slOrderId : null,
