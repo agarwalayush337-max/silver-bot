@@ -528,6 +528,16 @@ function pushToDashboard() {
     const todayLogs = botState.history.filter(t => t.date === todayStr && !t.type.includes('SYSTEM') && t.status !== 'CANCELLED');
     const displayLogs = generateLogHTML(todayLogs);
 
+    // ✅ NEW: Calculate Locked Profit (Projected PnL at SL)
+    let lockedPnL = 0;
+    if (hasPosition && botState.currentStop) {
+        if (botState.positionType === 'LONG') {
+            lockedPnL = (botState.currentStop - botState.entryPrice) * botState.quantity;
+        } else if (botState.positionType === 'SHORT') {
+            lockedPnL = (botState.entryPrice - botState.currentStop) * botState.quantity;
+        }
+    }
+
     const data = JSON.stringify({ 
         price: lastKnownLtp, 
         pnl: pnlData.live,
@@ -1189,7 +1199,7 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
     if (!ACCESS_TOKEN || !isApiAvailable() || !botState.isTradingEnabled) return false;
 
     // 1. Calculate Initial 0.3% Buffer
-    const bufferAmount = ltp * 0.003;
+    const bufferAmount = ltp * 0.0015;
     let limitPrice = type === "BUY" ? Math.round(ltp + bufferAmount) : Math.round(ltp - bufferAmount);
 
     console.log(`🚀 [INTENT] Sending ${type} Order: ${qty} Lot(s) @ ₹${ltp} | Limit: ₹${limitPrice}`);
@@ -1314,9 +1324,10 @@ async function placeOrder(type, qty, ltp, metrics = null) { // ✅ 1. Added metr
     } catch (e) {
         const errorDetail = e.response?.data?.errors?.[0]?.message || e.message;
 
-        // 🛡️ CIRCUIT BREACH AUTO-RECOVERY
-        const highMatch = errorDetail.match(/High Price Range:(\d+\.?\d*)/);
-        const lowMatch = errorDetail.match(/Low Price Range:(\d+\.?\d*)/);
+        // 🛡️ CIRCUIT BREACH AUTO-RECOVERY (Improved Regex for Spaces)
+        // Matches "High Price Range:123" OR "High Price Range : 123"
+        const highMatch = errorDetail.match(/High Price Range\s*:\s*(\d+\.?\d*)/);
+        const lowMatch = errorDetail.match(/Low Price Range\s*:\s*(\d+\.?\d*)/);
 
         if (errorDetail.includes("Circuit breach") && (highMatch || lowMatch)) {
             const circuitLimitPrice = type === "BUY" ? Math.floor(parseFloat(highMatch[1])) : Math.ceil(parseFloat(lowMatch[1]));
@@ -1699,7 +1710,12 @@ app.get('/', (req, res) => {
                     document.getElementById('live-pnl').style.color = parseFloat(d.pnl) >= 0 ? '#4ade80' : '#f87171';
                     document.getElementById('hist-btn-pnl').innerText = 'Total: ₹' + d.historicalPnl;
                     
-                    document.getElementById('live-sl').innerText = '₹' + Math.round(d.stop || 0);
+                    // ✅ LOCKED PROFIT UPDATE
+                    const lockedBox = document.getElementById('locked-pnl');
+                    if(lockedBox) {
+                        lockedBox.innerText = '₹' + d.locked;
+                        lockedBox.style.color = parseFloat(d.locked) >= 0 ? '#4ade80' : '#f87171';
+                    }
                     document.getElementById('exch-sl').innerText = '₹' + Math.round(d.stop || 0);
                     document.getElementById('exch-id').innerText = d.slID || 'NO ORDER';
                     
@@ -1754,7 +1770,10 @@ app.get('/', (req, res) => {
                 </div>
 
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">TRAILING SL</small><br><b id="live-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b></div>
+                    <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;">
+                        <small style="color:#94a3b8;">LOCKED PROFIT</small><br>
+                        <b id="locked-pnl" style="font-size:18px;">₹0.00</b>
+                    </div>
                     <div style="background:#0f172a; padding:10px; text-align:center; border-radius:8px;"><small style="color:#94a3b8;">EXCHANGE SL</small><br><b id="exch-sl" style="color:#f472b6;">₹${botState.currentStop ? botState.currentStop.toFixed(0) : '---'}</b><br><span id="exch-id" style="font-size:10px; color:#64748b;">${botState.slOrderId || 'NO ORDER'}</span></div>
                 </div>
 
