@@ -2228,7 +2228,7 @@ function renderAnalysisHTML(t, analysisText, tradeId) {
                         <div style="text-align:right;">
                             <div style="font-size:12px; color:#cbd5e1;">ACTUAL TOTAL PnL</div>
                             <div style="font-size:24px; font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}">
-                                ${totalPnL>=0?'+':''}₹${parseFloat(totalPnL).toFixed(2)}''}₹${totalPnL}
+                                ${totalPnL>=0?'+':''}₹${parseFloat(totalPnL).toFixed(2)}
                             </div>
                         </div>
                     </div>
