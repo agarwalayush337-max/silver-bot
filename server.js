@@ -118,7 +118,7 @@ const STRATEGY_PARAMS = {
     // 2. Entry Filters
     VOL_MULT_MIN: 1.5,           // Min Volume vs Avg
     VOL_MULT_MAX: 3.5,           // Max Volume vs Avg (Climax protection)
-    TRADE_PAUSE_MIN: 3,          // Cooling period in minutes
+    TRADE_PAUSE_MIN: 2,          // Cooling period in minutes
 
     // 3. Risk Management (Multipliers of ATR)
     SL_ATR_MULT: 1.2,            // Initial Stop Loss width
@@ -1100,6 +1100,7 @@ async function verifyOrderStatus(orderId, context, tempLogId = null) {
                         console.log(`🎥 Post-Trade Watcher Started for ID: ${orderId}`);
 
                         // 🧹 RESET GLOBAL BOT STATE
+                        botState.lastExitTime = Date.now();
                         botState.positionType = null;
                         botState.entryPrice = 0;
                         botState.quantity = 0;
@@ -1499,9 +1500,14 @@ async function runTradingLogic(allowTrade = true) {
                 );
 
                 // Check Cooling Period
+                // Check Cooling Period
                 const msSinceExit = Date.now() - botState.lastExitTime;
-                const inCoolingPeriod = msSinceExit < 0;
-                const waitSec = Math.ceil(((STRATEGY_PARAMS.TRADE_PAUSE_MIN * 60000) - msSinceExit) / 1000);
+                const coolingDuration = STRATEGY_PARAMS.TRADE_PAUSE_MIN * 60000;
+                
+                // FIX: Check if time passed is LESS than 3 mins
+                const inCoolingPeriod = msSinceExit < coolingDuration; 
+                
+                const waitSec = Math.ceil((coolingDuration - msSinceExit) / 1000);
                 
                 // --- 4. SIGNAL EXECUTION BLOCK ---
                 if (isBuySignal || isSellSignal) {
@@ -2222,7 +2228,7 @@ function renderAnalysisHTML(t, analysisText, tradeId) {
                         <div style="text-align:right;">
                             <div style="font-size:12px; color:#cbd5e1;">ACTUAL TOTAL PnL</div>
                             <div style="font-size:24px; font-weight:bold; color:${totalPnL>=0?'#4ade80':'#f87171'}">
-                                ${totalPnL>=0?'+':''}₹${totalPnL}
+                                ${totalPnL>=0?'+':''}₹${parseFloat(totalPnL).toFixed(2)}''}₹${totalPnL}
                             </div>
                         </div>
                     </div>
@@ -2246,11 +2252,11 @@ function renderAnalysisHTML(t, analysisText, tradeId) {
                 <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:15px; text-align:center;">
                     <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
                         <div style="font-size:10px; color:#94a3b8;">MAX RUN-UP (MFE)</div>
-                        <div style="font-weight:bold; color:#4ade80; font-size:14px;">+₹${maxRunUp}</div>
+                        <div style="font-weight:bold; color:#4ade80; font-size:14px;">+₹${parseFloat(maxRunUp).toFixed(2)}</div>
                     </div>
                     <div style="background:#0f172a; padding:10px; border-radius:10px; border:1px solid #334155;">
                         <div style="font-size:10px; color:#94a3b8;">MAX DRAWDOWN (MAE)</div>
-                        <div style="font-weight:bold; color:#f87171; font-size:14px;">-₹${maxDrawdown}</div>
+                        <div style="font-weight:bold; color:#f87171; font-size:14px;">-₹${parseFloat(maxDrawdown).toFixed(2)}</div>
                     </div>
                 </div>
             </div>
