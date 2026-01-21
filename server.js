@@ -1513,6 +1513,27 @@ async function runTradingLogic(allowTrade = true) {
             // 2. DETAILED LOG (Now shows REAL ATR)
             const shortName = botState.contractName.replace("SILVER MIC ", ""); 
             console.log(`📊 [${shortName}] LTP:${lastKnownLtp} E50:${curE50.toFixed(0)} E200:${curE200.toFixed(0)} Vol:${curV} AvgV:${curAvgV.toFixed(0)} ATR:${displayATR} (Used:${globalATR.toFixed(0)}) RSI:${curRSI.toFixed(1)}`);
+
+            // 🚑 VOLUME CPR: The Permanent Fix for "0 Volume"
+            // If Market is Open AND Volume is 0 AND Socket is Connected... Force Upgrade.
+            if (isMarketOpen() && curV === 0 && currentWs && currentWs.readyState === 1) {
+                // Throttle: Only try this once every 15 seconds to avoid spamming
+                const lastFix = botState.lastVolFixTime || 0;
+                if (Date.now() - lastFix > 15000) {
+                    console.log("🚑 Volume is 0! Performing CPR: Resending FULL MODE Subscription...");
+                    
+                    const volumeSub = Buffer.from(JSON.stringify({ 
+                        guid: "vol-fix-" + Date.now(), 
+                        method: "sub", 
+                        data: { mode: "full", instrumentKeys: [botState.activeContract] } 
+                    }));
+                    
+                    try { currentWs.send(volumeSub); } catch(e) { console.error("CPR Failed:", e.message); }
+                    
+                    botState.lastVolFixTime = Date.now();
+                }
+            }
+            
             // ✅ STOP HERE if we are in "Log Only" mode
             if (!allowTrade) return;
             // 3. SIGNAL LOGIC
@@ -1626,6 +1647,20 @@ function startPreciseLoop() {
             
             initWebSocket(); // Resets connection and resends "FULL" command
         }
+
+        if (hour === 9 && minute === 0 && second === 1) {
+            console.log("🔔 MARKET OPEN (9:00:01): Forcing Immediate Full Volume Request...");
+            
+            if (currentWs && currentWs.readyState === 1) {
+                const volumeSub = Buffer.from(JSON.stringify({ 
+                    guid: "market-open-" + Date.now(), 
+                    method: "sub", 
+                    data: { mode: "full", instrumentKeys: [botState.activeContract] } 
+                }));
+                currentWs.send(volumeSub);
+            }
+        }
+
 
         // --- 1. CLEAN LOGGING LOGIC (Only log on switch) ---
         if (isBurstZone && currentScheduleState !== 'BURST') {
